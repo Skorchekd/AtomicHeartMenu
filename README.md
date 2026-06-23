@@ -1,3 +1,15 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Atomic Heart Internal Mod Menu - single-player gameplay sandbox, trainer, and AI control suite" width="100%">
+</p>
+
+<p align="center"><sub><i>yes, this banner is AI-generated. no, we are not fans of AI art either (we know, the irony). if you are an actual artist who wants to make something better, please, save us: open an issue or hop in the Discord.</i></sub></p>
+
+<p align="center">
+  <a href="https://discord.gg/pDC3dnxsfZ"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Join the Discord"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
+  <img src="https://img.shields.io/badge/status-beta-orange" alt="Status: beta">
+</p>
+
 # Atomic Heart - Internal Mod Menu
 
 An **internal** (injected DLL) trainer / mod menu for **Atomic Heart** (single-player,

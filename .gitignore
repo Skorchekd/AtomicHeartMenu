@@ -22,6 +22,8 @@ AtomicHeartMenu.log
 # --- Misc debug screenshots / personal captures ---
 turnstomebutdoesntwalktomeorfollowme.png
 *.png
+# ...except the README banner asset, which we do want committed
+!assets/banner.png
 
 # --- IDE / editor ---
 .vs/
