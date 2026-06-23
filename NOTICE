@@ -1,0 +1,60 @@
+Atomic Heart Menu
+Copyright (C) 2026 Skorchekd
+
+This program is free software licensed under the GNU General Public License,
+version 3 or later (GPL-3.0-or-later). See the LICENSE file for the full text.
+
+============================================================
+ADDITIONAL TERMS UNDER GPLv3 SECTION 7
+============================================================
+
+As permitted by Section 7 of the GNU GPL version 3, the following additional
+terms apply to this program. They exist to keep the project open and to preserve
+credit to its author and to the third-party work it relies on.
+
+(a) Copyleft / same-license. Any copy, modification, fork, or derivative work of
+    this program must be distributed under the GPL-3.0-or-later license and must
+    remain open source. You may not sublicense it or distribute it under more
+    restrictive terms.
+
+(b) Attribution (GPLv3 7(b)). You must preserve, in the source and in the
+    Appropriate Legal Notices of any work that contains this program or a
+    derivative of it, clear attribution to:
+      - the original author: Skorchekd (Atomic Heart Menu)
+      - Dumper-7 by Encryqed (the tool used to obtain the game SDK and offsets)
+      - MinHook by Tsuda Kageyu
+      - Dear ImGui by Omar Cornut (ocornut)
+
+(c) No misrepresentation (GPLv3 7(c) and 7(d)). You may not remove or alter the
+    attributions above, and you may not state or imply that you are the original
+    author of this program or of the third-party components listed below.
+
+The GPL-3.0-or-later license itself always continues to apply to this program and
+to any derivative of it.
+
+============================================================
+THIRD-PARTY COMPONENTS AND CREDITS
+============================================================
+
+This project includes or depends on the following third-party work. Each remains
+under its own license, which is compatible with the GPL.
+
+1. Dear ImGui  -  https://github.com/ocornut/imgui
+   Copyright (c) 2014-2025 Omar Cornut
+   License: MIT  (see deps/imgui/LICENSE.txt)
+   Role: the in-game overlay UI. Vendored under deps/imgui/.
+
+2. MinHook  -  https://github.com/TsudaKageyu/minhook
+   Copyright (C) 2009-2017 Tsuda Kageyu and contributors
+   License: BSD 2-Clause  (see deps/minhook/LICENSE.txt)
+   Role: runtime function hooking. Vendored under deps/minhook/.
+
+3. Dumper-7  -  https://github.com/Encryqed/Dumper-7
+   By Encryqed and contributors.
+   Role: used to dump the Atomic Heart UE4 SDK and the global offsets, which were
+   then transcribed into src/sdk/offsets.h. The dump itself is not redistributed
+   in this repository.
+
+Atomic Heart is a trademark of Mundfish. This project is an unofficial,
+non-commercial fan tool and is not affiliated with, endorsed by, or supported by
+Mundfish.

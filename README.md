@@ -38,6 +38,23 @@ Read this before judging the repo.
 
 The vendored Dear ImGui and MinHook sources keep their own upstream licenses.
 
+### License
+
+This project is licensed under the **GNU General Public License v3.0 or later
+(GPL-3.0-or-later)**, with additional attribution terms under GPLv3 Section 7.
+See [`LICENSE`](LICENSE) for the full license text and [`NOTICE`](NOTICE) for the
+additional terms and the third-party credits.
+
+In short:
+- It stays open source. Use, study, modify, and share it freely.
+- **Copyleft / share-alike**: any fork, modification, or redistribution must stay
+  licensed under the same GPL-3.0-or-later terms and remain open source. You may
+  not close it off or relicense it under more restrictive terms.
+- **Attribution is required**: you must keep credit to the original author
+  (Skorchekd) and to Dumper-7 (Encryqed), MinHook (Tsuda Kageyu), and Dear ImGui
+  (ocornut). The vendored libraries stay under their own permissive licenses,
+  which are GPL-compatible.
+
 > Note: the dumped game SDK (`dumped-sdk/`) is **not** included in this repo. It is
 > large, build-specific, and only needed as reference when adding new features. The
 > menu builds and runs without it. Regenerate it by running Dumper-7 against your own
