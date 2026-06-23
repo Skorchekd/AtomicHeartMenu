@@ -1,0 +1,37 @@
+# --- Build output ---
+/build/
+/bin/
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
+
+# --- Local-only artifacts (logs, crash dumps, debug captures) ---
+/crash_artifacts/
+*.log
+*.dmp
+AtomicHeartMenu.log
+*.zip
+
+# --- Dumped game SDK (regenerate with Dumper-7; not needed to build the menu) ---
+/dumped-sdk/
+
+# --- Misc debug screenshots / personal captures ---
+turnstomebutdoesntwalktomeorfollowme.png
+*.png
+
+# --- IDE / editor ---
+.vs/
+.vscode/
+.idea/
+CMakeSettings.json
+CMakeUserPresets.json
+out/
+
+# --- OS cruft ---
+Thumbs.db
+desktop.ini
+.DS_Store
