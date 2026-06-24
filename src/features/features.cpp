@@ -22,6 +22,7 @@
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <mutex>
 #include <vector>
@@ -1341,7 +1342,8 @@ namespace
     // A single worker scan feeds ESP and the world AI controls. Commands are
     // queued and drained in bounded batches from the render/game thread.
     constexpr float kUnitsPerMetre = 100.0f;
-    constexpr int   kMaxCachedAiActors = 256;
+    constexpr int   kMaxCachedAiActors = 512;
+    constexpr int   kMaxDeepAiTargets = 1024;
     constexpr int   kMaxAiCommandTargets = 96;
     constexpr int   kAiOpsPerFrame = 12;
     constexpr int   kAiAutoOpsPerPass = 8;
@@ -1405,6 +1407,16 @@ namespace
     // work runs on the game thread (never the render thread -- see the pump note),
     // and only one pump is ever in flight so the queue can't pile up and stall.
     std::atomic<bool>          g_aiPumpInFlight{ false };
+
+    // The loaded-level actor arrays are not authoritative for streamed enemies:
+    // some live AHAICharacter instances are absent from every ULevel::Actors array.
+    // Keep a worker-thread-only incremental GObjects discovery set and merge it into
+    // every normal refresh. A full pass completes in under a second while an AI
+    // feature is active, without putting a monolithic object sweep on the game thread.
+    constexpr int                          kGlobalAiObjectsPerRefresh = 100000;
+    size_t                                 g_globalAiScanCursor = 0;
+    uint64_t                               g_globalAiScanGeneration = 0;
+    std::unordered_map<UObject*, uint64_t> g_globalAiSeen;
 
     // THE SQUAD: every AI under our control -- both ones we spawned AND enemies we
     // recruited. All are driven as permanent bodyguards (fight nearby threats +
@@ -1735,6 +1747,16 @@ namespace
         return out;
     }
 
+    std::vector<UObject*> CollectNearbyNonSquadAi(float radiusM, int maxTargets, bool requireTwo = false)
+    {
+        std::vector<UObject*> nearby = CollectNearbyAi(radiusM, maxTargets, false);
+        nearby.erase(std::remove_if(nearby.begin(), nearby.end(),
+            [](UObject* ai) { return IsSquadMember(ai); }), nearby.end());
+        if (requireTwo && nearby.size() < 2)
+            return {};
+        return nearby;
+    }
+
     bool ProcessNoParams(UObject* target, UFunction* fn)
     {
         if (!Mem::IsReadable(target, 0x30) || !Mem::IsReadable(fn, 0x30))
@@ -1805,6 +1827,9 @@ namespace
     //  All writes are 1-byte, guarded by Mem::IsReadable -> crash-safe.
     // =======================================================================
     std::unordered_map<UObject*, uint8_t> g_origTeam; // game-thread/pump only
+    // Fight mode owns only these actors. Squad membership and bodyguard allegiance
+    // are separate state and must survive the fight toggle's falling edge.
+    std::unordered_set<UObject*> g_fightParticipants;
 
     // Read/write the team id through the CHARACTER's own GetGenericTeamId /
     // SetGenericTeamId (the engine IGenericTeamAgentInterface path). This refreshes
@@ -1889,6 +1914,19 @@ namespace
     //     -- no robot is ever parked on your team / made invincible (the old bug).
     // Picked high so it can't collide with a real faction or your (small) team id.
     constexpr uint8_t kFightTeamB = 231;
+
+    // Dedicated ALLY/GUARD team. A squad bodyguard is parked here while it is
+    // ENGAGING a threat. WHY a distinct combat team instead of the player's own
+    // team: dump evidence shows the player is team 0, and team 0 is the game's
+    // DOCILE/civilian faction (animals, pedestrians, Larisa, turrets all sit on it
+    // and target NOTHING). SwitchTeamToMatchCharacterAttitude(player, Friendly) put
+    // guards onto team 0 -- which silently stripped their combat AI (a team-0
+    // character's perception ignores the team-1 robots). kGuardTeam is a normal
+    // combat id (not 0, not the robots' team), so the robots' perception reads it as
+    // hostile and the guard's OWN native combat AI hunts them -- the exact mechanism
+    // that makes "fight each other" work, now applied to bodyguards. Distinct from
+    // kFightTeamB so guards and free brawlers are never accidentally the same side.
+    constexpr uint8_t kGuardTeam = 230;
 
     bool SetAiTargetAlly(UObject* ai, UObject* ally)
     {
@@ -2393,6 +2431,13 @@ namespace
     // ended, then finally followed). Game-thread only (both writers/readers run there).
     std::unordered_map<UObject*, unsigned long long> g_engagedUntilMs;
 
+    // Last time a guard had a live threat in range. Used to HOLD the combat posture for
+    // a short window after the last threat so a single-pump gap in threat selection does
+    // NOT flip the guard back to its docile team (that flip-flop reset the native combat
+    // state every ~200ms, so it never sustained a fight -- the "never engages" bug).
+    std::unordered_map<UObject*, unsigned long long> g_lastThreatMs;
+    constexpr unsigned long long kCombatHoldMs = 1200; // bridge brief threat-selection gaps, then resume follow
+
     // ---- follow-the-player (squad members + spawns) ----
     constexpr float     kFollowKeepM     = 3.5f;  // legacy; clean follow uses State.aiFollowStopM
     constexpr float     kFollowTeleportM = 30.0f; // OPT-IN teleport leash distance (only if aiAllowTeleport; default off -> they WALK)
@@ -2548,50 +2593,83 @@ namespace
         return true;
     }
 
-    // Bodyguard injection: `guard` is put on YOUR team (Friendly to the player, so
-    // it never hits you and is automatically Hostile to the robot team) and, when
-    // a `threat` exists, force-aggro'd onto it. The player target is actively
-    // suppressed every tick by pinning the cached target to the threat / blanking
-    // it, and the ally to the player. Only the player reference drives the team,
-    // so the guard can never get knocked onto a team that turns on you.
+    // Belt-and-suspenders player safety: if a guard's cached aggro target is YOU,
+    // blank it across every layer (raw field + game setter + controller blackboard)
+    // right now. Re-run every pump so even a perception flip after taking damage
+    // can't land a hit on you before the next drive. Crash-safe (guarded reads).
+    void SuppressGuardTargetingPlayer(UObject* guard, UObject* player)
+    {
+        uint8_t* gb = reinterpret_cast<uint8_t*>(guard);
+        if (!Mem::IsReadable(gb + AH::AICh_CachedTargetEnemy, sizeof(void*)))
+            return;
+        UObject* cur = *reinterpret_cast<UObject**>(gb + AH::AICh_CachedTargetEnemy);
+        if (cur != player)
+            return;
+        WriteAiTargetField(guard, nullptr);
+        SetAiTargetEnemy(guard, nullptr, true);
+        if (UObject* ctrl = GetAiController(guard))
+            SetControllerTargetEnemy(ctrl, nullptr, true);
+    }
+
+    // Force a mixed-navigation character (the Twins = AAIMixedNavigationCharacter) onto
+    // GROUND nav so the follow drive can actually move it. WHY: a Twin switches between
+    // ground walk and 3D flight; while flight nav is active it ignores the ground
+    // FollowLocation / Mercuna path, so a recruited Twin just hovers in place ("every
+    // character follows me except the Twin"). SetCanUseAutomaticNavigationTypeSelection(false)
+    // stops it flipping back; ForceNavigationType(Navigation2D=1) pins it to ground.
+    // Best-effort + fully guarded: both functions only exist on the mixed-nav class, so
+    // CachedObjectClassFn returns null for every normal pawn -> this is a no-op for them
+    // and cannot crash. Param buffers are oversized so ProcessEvent never reads past them.
+    void ForceGroundNavIfMixed(UObject* ai)
+    {
+        if (!AiUsable(ai))
+            return;
+        if (UFunction* fn = CachedObjectClassFn(ai, "SetCanUseAutomaticNavigationTypeSelection"))
+            if (Mem::IsReadable(fn, 0x30))
+            { struct { bool v; uint8_t pad[7]; } p{ false, {0} }; ai->ProcessEvent(fn, &p); }
+        if (UFunction* fn = CachedObjectClassFn(ai, "ForceNavigationType"))
+            if (Mem::IsReadable(fn, 0x30))
+            { struct { uint8_t t; uint8_t pad[7]; } p{ 1 /*ENavigationTypeSelector::Navigation2D (ground)*/, {0} }; ai->ProcessEvent(fn, &p); }
+    }
+
+    // Bodyguard injection. THE FIX: a guard fights with the EXACT pipeline that
+    // "enemies fight each other" uses -- it is parked on the dedicated combat ally
+    // team kGuardTeam (NOT the player's docile team 0, which silently strips combat;
+    // see kGuardTeam) and force-aggro'd onto the threat, so its OWN native combat AI
+    // hunts the robots just like a free brawler. It NEVER hits you because (a) while
+    // ENGAGING it is busy on the forced robot target and we blank any player-target
+    // every pump, and (b) while IDLE (no threat) it is dropped back onto the docile
+    // player faction (team 0, Friendly) where it can't acquire you at all. Two states:
+    //   * threat in range  -> kGuardTeam + force attack (fight-each-other logic)
+    //   * no threat        -> Friendly team 0, combat state cleared, follow only
     bool InjectBodyguard(UObject* guard, UObject* player, const FVector& playerLoc, UObject* threat)
     {
         if (!FollowPawnUsable(guard) || !Mem::IsReadable(player, 0x30) || guard == player)
             return false;
 
-        // Non-combat NPCs (Larisa, civilians) are AiUsable but have no combat AI;
-        // treat them as follow-only so we never push them into a combat state.
-        const bool combatCapable = AiUsable(guard) && AiIsCombatCapable(guard);
+        // Drive combat for ANY squad AHAICharacter, NOT just ones the BT-name heuristic
+        // (AiIsCombatCapable) flags "combat". WHY: the heuristic mis-flagged the Twins
+        // (and bosses) as non-combat, so the gate skipped ALL injection -> they stayed on
+        // the NEUTRAL player team 0 and never engaged (log: engaged=0 team=0 with a threat
+        // 19m away). Combat here is the team-split (kGuardTeam) + forced target -- the
+        // SAME perception-driven mechanism "enemies fight each other" uses, which does NOT
+        // depend on that heuristic (fight-each-other already injects every nearby AI this
+        // way). The only call that can fault on a TRUE civilian -- ForceCharacterAggressive
+        // / StopCharacterAggressive -- stays self-gated on AiIsCombatCapable internally, so
+        // this stays crash-safe while letting real combat units (mis-flagged or not) fight.
+        const bool combatCapable = AiUsable(guard);
         InjectState& s = g_inject[guard];
         ULONGLONG nowMs = GetTickCount64();
 
         if (combatCapable)
         {
+            // The player is always the guard's ALLY (never a valid target), and any
+            // stray player-target gets blanked before we decide engage/idle below.
             WriteAiAggressiveFlags(guard, true);
             SetAiTargetAlly(guard, player);
-
-            // *** HARD GUARANTEE: a guard NEVER attacks you, even if YOU shoot it. ***
-            // (1) Re-assert Friendly-to-the-player on a throttle (perception can flip a
-            //     guard hostile when you damage it -- this corrects it within ~1s).
-            if (nowMs - s.lastFriendlyMs > 1000)
-            {
-                SwitchAiTeamFriendlyTo(guard, player);
-                s.lastFriendlyMs = nowMs;
-            }
-            // (2) If the guard's cached aggro target is YOU, blank it immediately, every
-            //     tick -- so even mid-retaliation it can't land a hit on you.
-            uint8_t* gb = reinterpret_cast<uint8_t*>(guard);
-            if (Mem::IsReadable(gb + AH::AICh_CachedTargetEnemy, sizeof(void*)))
-            {
-                UObject* cur = *reinterpret_cast<UObject**>(gb + AH::AICh_CachedTargetEnemy);
-                if (cur == player)
-                {
-                    WriteAiTargetField(guard, nullptr);
-                    SetAiTargetEnemy(guard, nullptr, true);
-                    if (UObject* ctrl = GetAiController(guard))
-                        SetControllerTargetEnemy(ctrl, nullptr, true);
-                }
-            }
+            if (UObject* ctrl = GetAiController(guard))
+                SetControllerTargetAlly(ctrl, player);
+            SuppressGuardTargetingPlayer(guard, player);
         }
 
         // Engage a threat that is near YOU (defend me) OR near the guard itself
@@ -2616,25 +2694,52 @@ namespace
             busyFighting = engage && (threatToGuard <= 8.0f); // standing in melee
         }
 
+        // HOLD the combat posture for a short window after the last in-range threat.
+        // Without this, a single-pump gap in threat selection flipped the guard back to
+        // its docile team every ~200ms -- which RESET the native combat state before it
+        // could ever sustain a fight (the "moved to us but never attacked / never
+        // engaged" bug). While holding we keep it armed and let its OWN combat AI run.
+        if (engage)
+            g_lastThreatMs[guard] = nowMs;
+        bool combatHold = false;
+        {
+            auto it = g_lastThreatMs.find(guard);
+            combatHold = combatCapable && it != g_lastThreatMs.end() && (nowMs - it->second < kCombatHoldMs);
+        }
+
         if (combatCapable && engage)
         {
-            // EXACT same injection "Enemies fight each other" uses (which works
-            // 100%): the guard joins YOUR team (Friendly => hostile to the robot
-            // team), and the proven raw-target + team-split + native attack-state
-            // pipeline drives it onto the threat. This is the copy you asked for.
-            InjectAttack(guard, threat, player, 0 /*Friendly => your side*/);
-            // Tell the per-frame follow drive to leave this guard alone briefly so it can
-            // CLOSE ON + fight the threat instead of being tugged back to you. Short bridge
-            // (~just over a pump) so the moment the fight ends it un-freezes and follows --
-            // a long stamp was why a guard stood swinging after its target died.
-            g_engagedUntilMs[guard] = nowMs + 800;
+            // *** THE COPY YOU ASKED FOR: drive the guard with the EXACT "enemies fight
+            // each other" injection and then GET OUT OF ITS WAY. forceTeamId = kGuardTeam
+            // parks it on a real COMBAT team the robots read as hostile; we force the
+            // first target + native attack-state kick, then its OWN combat AI moves it to
+            // the enemy and attacks -- exactly like a released brawler (which is the ONLY
+            // mode that ever worked, incl. for the Twins). Crucially we do NOT pin it
+            // friendly or reset its team anywhere in the combat path; that per-pump reset
+            // was why it never engaged. Player safety: it's busy on the forced robot
+            // target, on a non-player team, and we re-blank any player-target every pump.
+            InjectAttack(guard, threat, nullptr, 0, (int)kGuardTeam);
+            SuppressGuardTargetingPlayer(guard, player);
+            // Leave this guard alone in the per-frame follow drive long enough to actually
+            // fight -- the follow tug-of-war (FollowLocation back to you every 50ms) was
+            // half of why it stalled. The combat-hold re-stamps this through brief gaps.
+            g_engagedUntilMs[guard] = nowMs + 1500;
+            s.target = threat;
+        }
+        else if (combatCapable && combatHold)
+        {
+            // Recently fought, no fresh target THIS pump: HOLD. Stay on the combat team
+            // (do NOT flip friendly), keep the engaged stamp so the follow drive keeps
+            // its hands off, and let the guard's own perception keep hunting nearby
+            // robots. Don't wipe its target -- let it finish what it's chasing.
+            g_engagedUntilMs[guard] = nowMs + 600;
         }
         else if (combatCapable)
         {
-            // No live threat: drop combat so the guard sticks with you and never targets
-            // you, clear the BT attack state, and UN-ENGAGE immediately so the follow
-            // drive resumes (the fix for "stuck fighting the same spot after the enemy
-            // dies" -- incl. when YOU killed it).
+            // Genuinely safe (no threat for kCombatHoldMs): stand down to docile follow.
+            // Clear the BT attack state and drop onto the DOCILE player faction (team 0,
+            // Friendly) so an idle guard can NEVER acquire you while there's nothing to
+            // fight -- the hard never-hit-you guarantee for the idle case.
             WriteAiTargetField(guard, nullptr);
             SetAiTargetEnemy(guard, nullptr, true);
             if (UObject* ctrl = GetAiController(guard))
@@ -2646,7 +2751,13 @@ namespace
             if (s.target != player)   // first idle pump after a fight -> exit combat cleanly
             {
                 StopCharacterAggressive(guard); // un-latch the attack state machine
-                SwitchAiTeamAttitude(guard, player, 0 /*Friendly*/);
+                SwitchAiTeamFriendlyTo(guard, player);
+                s.lastFriendlyMs = nowMs;
+            }
+            else if (nowMs - s.lastFriendlyMs > 750)
+            {
+                SwitchAiTeamFriendlyTo(guard, player);
+                s.lastFriendlyMs = nowMs;
             }
             s.target = player;
         }
@@ -2655,8 +2766,9 @@ namespace
             s.target = player;
         }
 
-        // Stick to you closely and constantly (also drives the walk animation).
-        bool followOk = DriveFollow(guard, player, playerLoc, busyFighting);
+        // Follow only when NOT in a combat posture -- while engaged/holding, leave its
+        // own combat locomotion alone so it can chase + attack (matches fight-each-other).
+        bool followOk = DriveFollow(guard, player, playerLoc, busyFighting || combatHold);
         return followOk || combatCapable;
     }
 
@@ -2699,20 +2811,22 @@ namespace
         if (!AiUsable(ai))
             return false;
 
-        // *** THE FIX for "released bodyguards are stuck in godmode / unkillable". ***
-        // Recruiting a guard makes it Friendly to the player; friendly-fire damage is
-        // zeroed, so while friendly it takes no player damage (intended). On release we
-        // must undo that THROUGH THE ENGINE so the attitude/perception solver refreshes.
-        // The old code only restored a raw controller team BYTE, which never refreshed
-        // that solver -> the unit stayed friendly -> you couldn't kill it. We now make
-        // it HOSTILE to the player via the game's OWN SwitchTeamToMatchCharacterAttitude
-        // (the proven inverse of the friendly conversion), which guarantees your hits
-        // land again. Fallback to the recorded original team only if no player ref.
+        // *** Release => put the unit back EXACTLY as it was, so it behaves naturally. ***
+        // Recruiting tracks the unit's real team (g_origTeam) before we ever touch it.
+        // On release we restore that real robot team THROUGH THE ENGINE (SetGenericTeamId
+        // refreshes the attitude/perception solver, unlike the old raw byte poke that
+        // left it friendly+unkillable). Restoring the REAL team is strictly better than
+        // the old "force Hostile-to-player": a real team-1 robot is already killable by
+        // you (different team => your hits land) AND, with "fight each other" on, the
+        // fight pump re-splits it so it rejoins the brawl. Forcing it Hostile-to-player
+        // was exactly why a JUST-released unit spun around and attacked YOU instead of
+        // going back to fighting the other enemies. Fallback to a hostile switch only if
+        // we somehow never recorded an original team (guarantees it stays killable).
         UObject* player = GetLocalPawn();
-        if (Mem::IsReadable(player, 0x30) && ai != player)
-            SwitchAiTeamAttitude(ai, player, 2 /*ETeamAttitude::Hostile*/);
-        else
-            RestoreOriginalTeam(ai);
+        if (g_origTeam.count(ai))
+            RestoreOriginalTeam(ai);                       // back to its real team; also erases the record
+        else if (Mem::IsReadable(player, 0x30) && ai != player)
+            SwitchAiTeamAttitude(ai, player, 2 /*ETeamAttitude::Hostile => guaranteed killable*/);
         g_origTeam.erase(ai); // it's a normal enemy now -- forget our team bookkeeping
 
         bool ok = SetActorTimeDilation(ai, 1.0f); // undo freeze (safe write)
@@ -2748,10 +2862,13 @@ namespace
         if (!FollowPawnUsable(ai) || !Mem::IsReadable(player, 0x30) || ai == player)
             return false;
 
-        // Baseline convert: friendly to the player (so it stops hitting you and
-        // its own perception now treats the robot team as hostile) + ally =
-        // player. The persistent "Bodyguard mode" toggle layers explicit threat
-        // targeting on top of this; the one-shot button just does the convert.
+        // Baseline convert: friendly to the player (team 0, so it stops hitting you)
+        // + ally = player, and record its real team so release can restore it. This
+        // is only the DOCILE resting state -- team 0 does NOT make it hunt the robots
+        // (team 0 is the game's passive/civilian faction). The per-frame squad pump
+        // (InjectBodyguard) is what arms it: when a threat is near it parks the guard
+        // on kGuardTeam (a combat team the robots read as hostile) and force-engages,
+        // exactly like "enemies fight each other". The button just seeds the convert.
         bool ok = false;
         if (AiUsable(ai))
         {
@@ -2767,6 +2884,9 @@ namespace
                 SetControllerTargetEnemy(ctrl, nullptr, true);
                 SetControllerAggressive(ctrl, false);
             }
+            // Pin mixed-nav members (Twins) to GROUND nav at recruit so they follow
+            // instead of hovering (no-op for normal pawns; the pump re-asserts it).
+            ForceGroundNavIfMixed(ai);
         }
 
         // Follow closely + constantly. Some callers pass an empty hint (e.g. the
@@ -2788,9 +2908,17 @@ namespace
     // because the state-machine kick sticks; the continuous toggle re-asserts it.
     bool ApplyAiFight(UObject* ai, UObject* enemy, UObject* player, bool teamA)
     {
+        // Fight-each-other is crowd control for NON-SQUAD enemies only. Letting this
+        // path touch a guard overwrites its friendly team/target state and makes the
+        // guard turn on the player when fight mode is later disabled.
+        if (IsSquadMember(ai) || IsSquadMember(enemy))
+            return false;
         // teamA -> leave team untouched (real robot team); else -> sentinel team B.
-        return teamA ? InjectAttack(ai, enemy, nullptr, 0, -1)
-                     : InjectAttack(ai, enemy, nullptr, 0, kFightTeamB);
+        bool ok = teamA ? InjectAttack(ai, enemy, nullptr, 0, -1)
+                        : InjectAttack(ai, enemy, nullptr, 0, kFightTeamB);
+        if (ok)
+            g_fightParticipants.insert(ai);
+        return ok;
     }
 
     // Ragdoll-launch an enemy skyward (spectacle). ACharacter::LaunchCharacter is
@@ -2988,6 +3116,72 @@ namespace
         }
     }
 
+    // Incrementally discover AHAICharacter instances from the authoritative global
+    // object array. Newly seen enemies become available immediately; stale entries
+    // are pruned after each completed generation. `forceFull` is used by first-use
+    // discovery so the initial scanner frame is complete rather than level-only.
+    void RefreshGlobalAiDiscovery(UClass* cls, bool forceFull)
+    {
+        if (!Mem::IsReadable(cls, 0x30))
+            return;
+        int total = NumObjects();
+        if (total <= 0)
+            return;
+
+        static UClass* memoForClass = nullptr;
+        static std::unordered_map<UClass*, bool> classMemo;
+        if (memoForClass != cls)
+        {
+            classMemo.clear();
+            memoForClass = cls;
+            g_globalAiSeen.clear();
+            g_globalAiScanCursor = 0;
+            g_globalAiScanGeneration = 0;
+        }
+
+        if (forceFull)
+            g_globalAiScanCursor = 0;
+        if (g_globalAiScanCursor == 0)
+            ++g_globalAiScanGeneration;
+
+        size_t start = g_globalAiScanCursor;
+        size_t budget = forceFull ? (size_t)total : (size_t)kGlobalAiObjectsPerRefresh;
+        size_t end = (std::min)((size_t)total, start + budget);
+        for (size_t i = start; i < end; ++i)
+        {
+            UObject* o = GetObjectByIndex((int)i);
+            if (!Mem::IsReadable(o, 0x30))
+                continue;
+            UClass* objectClass = static_cast<UClass*>(o->Class());
+            if (!Mem::IsReadable(objectClass, 0x30))
+                continue;
+            bool isAi = false;
+            auto it = classMemo.find(objectClass);
+            if (it != classMemo.end())
+                isAi = it->second;
+            else
+            {
+                try { isAi = o->IsA(cls); } catch (...) { isAi = false; }
+                classMemo[objectClass] = isAi;
+            }
+            if (isAi)
+                g_globalAiSeen[o] = g_globalAiScanGeneration;
+        }
+
+        g_globalAiScanCursor = end;
+        if (g_globalAiScanCursor >= (size_t)total)
+        {
+            for (auto it = g_globalAiSeen.begin(); it != g_globalAiSeen.end(); )
+            {
+                if (it->second != g_globalAiScanGeneration || !Mem::IsReadable(it->first, 0x30))
+                    it = g_globalAiSeen.erase(it);
+                else
+                    ++it;
+            }
+            g_globalAiScanCursor = 0;
+        }
+    }
+
     const char* AiKindName(AiQueuedKind kind)
     {
         switch (kind)
@@ -3099,11 +3293,23 @@ namespace
                     break;
                 case AiQueuedKind::FightEachOther:
                 {
+                    if (IsSquadMember(ai))
+                        break;
                     // Pair each AI with a neighbour; the deep injection handles the
                     // team split + attack-state kick so the pair genuinely brawls.
                     // Alternate which team each joins so pairs are cross-team.
-                    UObject* enemy = local.targets[(i + 1) % local.targets.size()];
-                    ok = ApplyAiFight(ai, enemy, local.player, (i % 2 == 0));
+                    UObject* enemy = nullptr;
+                    for (size_t step = 1; step < local.targets.size(); ++step)
+                    {
+                        UObject* candidate = local.targets[(i + step) % local.targets.size()];
+                        if (candidate != ai && !IsSquadMember(candidate))
+                        {
+                            enemy = candidate;
+                            break;
+                        }
+                    }
+                    if (enemy)
+                        ok = ApplyAiFight(ai, enemy, local.player, (i % 2 == 0));
                     break;
                 }
                 case AiQueuedKind::Release:
@@ -3159,7 +3365,9 @@ namespace
 
         AiQueuedKind kind = (AiQueuedKind)kindRaw;
         bool requireTwo = (kind == AiQueuedKind::FightEachOther);
-        std::vector<UObject*> targets = CollectNearbyAi(Features::Get().aiRadius, kMaxAiCommandTargets, requireTwo);
+        std::vector<UObject*> targets = requireTwo
+            ? CollectNearbyNonSquadAi(Features::Get().aiRadius, kMaxAiCommandTargets, true)
+            : CollectNearbyAi(Features::Get().aiRadius, kMaxAiCommandTargets, false);
         if (targets.empty())
             return; // cached enemies exist but none in radius yet -- keep waiting until TTL
 
@@ -3254,24 +3462,39 @@ namespace
         return best;
     }
 
-    void ReleaseNearbyInjected(float radiusM, const char* why)
+    void ReleaseFightParticipants(const char* why)
     {
-        std::vector<UObject*> all = CollectNearbyAi(radiusM, kMaxAiCommandTargets);
         int n = 0;
-        for (UObject* ai : all)
-            if (AiUsable(ai) && ApplyAiRelease(ai)) ++n;
-        // Also release EVERY enemy we ever re-teamed that has since left the radius,
-        // so nothing is ever stranded friendly/invincible. ApplyAiRelease force-makes
-        // each hostile to the player again and erases its own tracking entry, so copy
-        // the keys first (we mutate g_origTeam while iterating).
-        std::vector<UObject*> tracked;
-        tracked.reserve(g_origTeam.size());
-        for (auto& kv : g_origTeam) tracked.push_back(kv.first);
-        for (UObject* ai : tracked)
-            if (AiUsable(ai) && ApplyAiRelease(ai)) ++n;
-        g_origTeam.clear();
-        g_inject.clear();
-        LOG("AI %s: released %d nearby enemy(ies)", why, n);
+        std::vector<UObject*> participants(g_fightParticipants.begin(), g_fightParticipants.end());
+        g_fightParticipants.clear();
+        for (UObject* ai : participants)
+        {
+            if (!AiUsable(ai))
+            {
+                g_origTeam.erase(ai);
+                g_inject.erase(ai);
+                continue;
+            }
+            if (IsSquadMember(ai))
+                continue; // bodyguard ownership wins unconditionally
+
+            // Restore the exact pre-fight team instead of forcing a generic hostile
+            // state, then clear only fight-owned target/aggression state.
+            RestoreOriginalTeam(ai);
+            SetAiPassive(ai, false);
+            SetAiTargetAlly(ai, nullptr);
+            SetAiTargetEnemy(ai, nullptr, true);
+            WriteAiTargetField(ai, nullptr);
+            StopCharacterAggressive(ai);
+            if (UObject* ctrl = GetAiController(ai))
+            {
+                SetControllerTargetEnemy(ctrl, nullptr, true);
+                SetControllerAggressive(ctrl, false);
+            }
+            g_inject.erase(ai);
+            ++n;
+        }
+        LOG("AI %s: restored %d fight participant(s); squad untouched", why, n);
     }
 
     void UpdateAiCombatInjection()
@@ -3282,7 +3505,7 @@ namespace
         // auto-recruit is gone -- the squad roster replaces it; squad members are
         // driven by DriveSpawnedAllies, released explicitly via the roster.)
         static bool wasFight = false;
-        if (wasFight && !st.aiFightEachOther) ReleaseNearbyInjected(st.aiRadius, "fight injection off");
+        if (wasFight && !st.aiFightEachOther) ReleaseFightParticipants("fight injection off");
         wasFight = st.aiFightEachOther;
 
         if (!st.aiFightEachOther)
@@ -3305,7 +3528,7 @@ namespace
             return;
 
         {
-            std::vector<UObject*> set = CollectNearbyAi(st.aiRadius, kMaxAiCommandTargets, true);
+            std::vector<UObject*> set = CollectNearbyNonSquadAi(st.aiRadius, kMaxAiCommandTargets, true);
             if (set.size() < 2)
                 return;
 
@@ -3406,6 +3629,8 @@ namespace
         BuildInjNodes(threatSrc, threats);
 
         const bool invincible = Features::Get().aiInvincibleAllies;
+        const bool squadAggr  = Features::Get().aiSquadAggressive;
+        int dbgDriven = 0, dbgEngaged = 0; float dbgNearThreat = -1.0f; uint8_t dbgTeam = 255;
         for (UObject* ally : squad)
         {
             if (!FollowPawnUsable(ally) || ally == player)
@@ -3413,14 +3638,61 @@ namespace
             FVector loc{};
             if (!ReadActorLocationFast(ally, loc))
                 continue;
-            UObject* threat = NearestNode(threats, loc, player, -1, nullptr);
+            ++dbgDriven;
+            // Keep mixed-nav members (Twins) pinned to GROUND nav so the follow drive can
+            // move them. Re-asserted on a slow per-member timer (no-op for normal pawns).
+            {
+                static std::unordered_map<UObject*, ULONGLONG> groundNavMs; // game thread
+                ULONGLONG& gnm = groundNavMs[ally];
+                if (now - gnm > 1500) { gnm = now; ForceGroundNavIfMixed(ally); }
+                if (groundNavMs.size() > 64)
+                    for (auto it = groundNavMs.begin(); it != groundNavMs.end(); )
+                    { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = groundNavMs.erase(it); }
+            }
+            // Defence priority: an enemy currently targeting the player always wins.
+            // Otherwise choose the nearest threat to the guard as before.
+            UObject* threat = nullptr;
+            float bestAttackerD = 3.4e38f;
+            for (const InjNode& candidate : threats)
+            {
+                if (!candidate.ok || candidate.actor == ally || candidate.actor == player)
+                    continue;
+                uint8_t* cb = reinterpret_cast<uint8_t*>(candidate.actor);
+                bool attacksPlayer =
+                    Mem::IsReadable(cb + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
+                    *reinterpret_cast<UObject**>(cb + AH::AICh_CachedTargetEnemy) == player;
+                if (!attacksPlayer)
+                    continue;
+                float d = DistanceMetres(candidate.loc, playerLoc);
+                if (d < bestAttackerD) { bestAttackerD = d; threat = candidate.actor; }
+            }
+            if (!threat)
+                threat = NearestNode(threats, loc, player, -1, nullptr);
+            // Diagnostics: nearest threat distance to this guard + whether it's engaged.
+            if (threat)
+            {
+                FVector tl{};
+                if (ReadActorLocationFast(threat, tl))
+                {
+                    float td = DistanceMetres(loc, tl);
+                    if (dbgNearThreat < 0.0f || td < dbgNearThreat) dbgNearThreat = td;
+                }
+            }
+            {
+                auto eit = g_engagedUntilMs.find(ally);
+                if (eit != g_engagedUntilMs.end() && eit->second > now) ++dbgEngaged;
+                // Read team only for the first driven member (one ProcessEvent/pump, diag only).
+                if (dbgTeam == 255) { uint8_t tid = 0; if (ReadAiTeamId(ally, tid)) dbgTeam = tid; }
+            }
             try
             {
                 InjectBodyguard(ally, player, playerLoc, threat);
                 if (invincible && AiUsable(ally)) SetCharacterHealthFull(ally); // keep combat AI alive
-                // Obliterate: combat-capable guards deal massively boosted damage so they
-                // shred the robots attacking you (non-combat NPCs are skipped -- harmless).
-                if (AiUsable(ally) && AiIsCombatCapable(ally)) SetCharacterInstigatedDamage(ally, 100.0f);
+                // Obliterate: guards deal massively boosted damage so they shred the robots
+                // attacking you. Applied to ANY usable squad member (raw attribute write,
+                // crash-safe) -- gating this on the BT heuristic skipped mis-flagged combat
+                // units like the Twins; a true civilian that never swings just never uses it.
+                if (AiUsable(ally)) SetCharacterInstigatedDamage(ally, 100.0f);
 
                 // ASSIST-KILL (user request: "trigger a kill event on the enemy it's
                 // targeting, for speed"). A guard's own swings are slow/unreliable, so when
@@ -3440,23 +3712,33 @@ namespace
                     if (closed || attackingPlayer)
                     {
                         ApplyAiKill(threat);
-                        // The target is dead -> drop the guard's combat state and un-engage
-                        // it THIS instant, so it doesn't keep swinging at the corpse / freeze
-                        // in place. It re-engages a LIVE threat or resumes follow next tick.
+                        // Target is dead -> only clear the guard's stale pointer to it so it
+                        // re-acquires a FRESH threat next pump. KEEP IT ARMED: do NOT switch
+                        // it friendly / mark idle / drop the engaged stamp here. Doing that
+                        // every pump (whenever any attacker was in range) is exactly what
+                        // reset its combat state before it could sustain a fight -- the
+                        // "never engages" bug. The combat-hold carries it to the next enemy.
                         WriteAiTargetField(ally, nullptr);
                         SetAiTargetEnemy(ally, nullptr, true);
-                        StopCharacterAggressive(ally); // un-latch the attack state machine
                         if (UObject* ctrl = GetAiController(ally))
-                        {
                             SetControllerTargetEnemy(ctrl, nullptr, true);
-                            SetControllerAggressive(ctrl, false);
-                        }
-                        g_engagedUntilMs.erase(ally);
-                        g_inject[ally].target = player; // mark idle so InjectBodyguard doesn't re-stop next pump
                     }
                 }
             }
             catch (...) {} // one stale member must not abort the rest
+        }
+
+        // Throttled combat heartbeat so the fight state is observable in the log:
+        // engaged>0 + team=230 = a guard is actively fighting on the guard team. If
+        // engaged stays 0 while threats are near, aiSquadAggressive is probably OFF
+        // (the "Squad fights for you" checkbox) or no live threat is within kGuardEngageM.
+        static ULONGLONG lastCombatLog = 0;
+        if (now - lastCombatLog > 3000)
+        {
+            lastCombatLog = now;
+            LOG("SquadCombat(GT): driven=%d engaged=%d squadAggr=%d nearestThreat=%.1fm threats=%d team=%d",
+                dbgDriven, dbgEngaged, squadAggr ? 1 : 0,
+                dbgNearThreat, (int)threats.size(), (int)dbgTeam);
         }
     }
 
@@ -3967,8 +4249,9 @@ namespace
 
         int n = NumObjects();
         std::vector<UObject*> targets;
+        targets.reserve(128);
         std::unordered_map<UClass*, bool> memo; // isAi by class (one IsA per distinct class)
-        for (int i = 0; i < n && (int)targets.size() < kMaxCachedAiActors; ++i)
+        for (int i = 0; i < n && (int)targets.size() < kMaxDeepAiTargets; ++i)
         {
             UObject* o = GetObjectByIndex(i);
             if (!Mem::IsReadable(o, 0x30) || o == player)
@@ -4256,16 +4539,27 @@ namespace
         FVector playerLoc{};
         bool havePlayerLoc = ReadActorLocationFast(GetLocalPawn(), playerLoc);
 
-        // Instant enumeration: walk the loaded levels' actor lists, not GObjects.
+        // Fast path: loaded-level actor arrays. Authoritative fallback: an
+        // incremental GObjects pass merged below catches streamed enemies omitted
+        // from those arrays (the exact ESP/Kill-All blind spot).
         std::vector<UObject*> actors;
         actors.reserve(2048);
         try { CollectLevelActors(actors); }
         catch (...) { return; }
+        static bool globalDiscoveryPrimed = false;
+        bool forceGlobal = !globalDiscoveryPrimed;
+        try { RefreshGlobalAiDiscovery(cls, forceGlobal); }
+        catch (...) {}
+        globalDiscoveryPrimed = true;
+        for (const auto& seen : g_globalAiSeen)
+            if (Mem::IsReadable(seen.first, 0x30))
+                actors.push_back(seen.first);
 
         ULONGLONG scanStartMs = GetTickCount64();
         std::vector<AiCachedActor> rebuilt;
         rebuilt.reserve(64);
         std::unordered_map<UObject*, bool> classCache; // isAi by UClass* (cached per rebuild)
+        std::unordered_set<UObject*> visited;
         int aiHits = 0;
         int scanExceptions = 0;
 
@@ -4273,6 +4567,8 @@ namespace
         {
             try
             {
+                if (!visited.insert(o).second)
+                    continue;
                 UObject* objectClass = o->Class();
                 if (!Mem::IsReadable(objectClass, 0x30))
                     continue;
@@ -4313,8 +4609,9 @@ namespace
         if (elapsedMs > 40 || now - lastLogMs > 5000)
         {
             lastLogMs = now;
-            LOG("AI refresh (levels): actors=%d aiHits=%d cached=%d exceptions=%d time=%llums",
-                (int)actors.size(), aiHits, g_aiCachedCount.load(), scanExceptions, elapsedMs);
+            LOG("AI refresh (levels+global): candidates=%d global=%d aiHits=%d cached=%d exceptions=%d time=%llums",
+                (int)actors.size(), (int)g_globalAiSeen.size(), aiHits,
+                g_aiCachedCount.load(), scanExceptions, elapsedMs);
         }
     }
 
@@ -4573,15 +4870,6 @@ namespace
     UObject* g_weaponRgbParent = nullptr;
     std::vector<WeaponRgbSlotState> g_weaponRgbSlots;
     std::vector<UObject*> g_weaponRgbMeshes;
-
-    // PERF CACHE for weapon RGB: enumerating the weapon's mesh components and reading
-    // each material's real vector-param NAMES is the expensive part -- doing it every
-    // tick (plus spraying ~19 guessed names) is what halved FPS on multi-part weapons.
-    // We resolve mesh+names ONCE per weapon and then per-tick only push the colour to
-    // those known real params. Rebuilt only when the equipped weapon pointer changes.
-    struct WeaponRgbMeshCache { UObject* mesh = nullptr; std::vector<UE::FName> names; };
-    std::vector<WeaponRgbMeshCache> g_wrgbCache;   // game-thread only
-    UObject*                        g_wrgbWeapon = nullptr;
 
     const char* kWeaponRgbColorParams[] = {
         "EmissiveColor", "Emissive_Color", "Emissive Color",
@@ -4959,10 +5247,17 @@ namespace
 
         RestoreWeaponRgbMaterials();
 
+        std::vector<UE::FName> guessedColorParams, ignoredScalarParams;
+        ResolveWeaponRgbParamNames(guessedColorParams, ignoredScalarParams);
+        constexpr size_t kMaxWeaponRgbSlots = 16;
+        constexpr size_t kMaxWeaponRgbParamsPerSlot = 6;
+
         std::vector<WeaponRgbSlotState> slots;
         slots.reserve(meshes.size() * 2);
         for (UObject* mesh : meshes)
         {
+            if (slots.size() >= kMaxWeaponRgbSlots)
+                break;
             if (!Mem::IsReadable(mesh, 0x30))
                 continue;
 
@@ -4972,6 +5267,8 @@ namespace
 
             for (int32_t i = 0; i < count; ++i)
             {
+                if (slots.size() >= kMaxWeaponRgbSlots)
+                    break;
                 UObject* original = GetMeshMaterialSlot(mesh, i);
                 if (!Mem::IsReadable(original, 0x30))
                     continue;
@@ -4992,6 +5289,13 @@ namespace
                 {
                     try { CollectMaterialVectorParamNames(mid, realColorParams); } catch (...) {}
                 }
+                // Set parameters on this slot's MID directly. Real instance names
+                // take priority; a small guessed fallback covers parent parameters
+                // that are not present in the instance override array.
+                for (const UE::FName& name : guessedColorParams)
+                    PushUniqueFName(realColorParams, name);
+                if (realColorParams.size() > kMaxWeaponRgbParamsPerSlot)
+                    realColorParams.resize(kMaxWeaponRgbParamsPerSlot);
 
                 WeaponRgbSlotState slot{};
                 slot.mesh = mesh;
@@ -5206,46 +5510,37 @@ namespace
 
     UObject* GetCurrentWeaponObject(UObject* pawn); // fwd: defined later, used by weapon RGB
 
-    // RGB / recolour the EQUIPPED weapon. SAFE PARAM-SPRAY PATH (the exact call
-    // chams uses, proven crash-free): drive the weapon mesh's materials with
-    // SetVectorParameterValueOnMaterials using the material's OWN parameter names
-    // (read live) plus the common guessed names, and an emissive glow.
-    //
-    // *** WHY THE OLD CODE CRASHED (AV fault=0x40 every frame, in game code) ***
-    // It built dynamic material instances and, for texture-locked slots, forced an
-    // Engine "BasicShapeMaterial" parent via CreateAndSetMaterialInstanceDynamic-
-    // FromMaterial on the weapon's SKELETAL mesh. That native call AV'd inside the
-    // engine (a skeletal-mesh vertex factory has no valid resource for that parent
-    // material) and repeated every frame. MID creation / forced parent is GONE.
-    // Reset a cached weapon's meshes to white and drop the cache.
-    void ClearWeaponRgbCache()
-    {
-        FVector white{ 1.0f, 1.0f, 1.0f };
-        for (const WeaponRgbMeshCache& m : g_wrgbCache)
-        {
-            if (!Mem::IsReadable(m.mesh, 0x30)) continue;
-            for (const UE::FName& n : m.names) { try { SetMeshVectorParam(m.mesh, n, white); } catch (...) {} }
-        }
-        g_wrgbCache.clear();
-        g_wrgbWeapon = nullptr;
-    }
-
+    // RGB / recolour the equipped weapon with one MID per material slot. Setup is
+    // paid only when the weapon changes; colour updates address each MID directly.
+    // This avoids MeshComponent.SetVectorParameterValueOnMaterials, whose nested
+    // mesh x parameter x material loops caused severe frame-time jitter on the AK
+    // and shotgun. Exact original material pointers are retained and restored.
     void ApplyWeaponRgb()
     {
         auto& st = Features::Get();
         static bool was = false;
+        static bool haveAppliedColor = false;
+        static FVector lastAppliedColor{};
+        static UObject* appliedWeapon = nullptr;
 
         if (!st.weaponRgb)
         {
-            if (was) { ClearWeaponRgbCache(); was = false; }
+            if (was)
+            {
+                RestoreWeaponRgbMaterials();
+                was = false;
+                haveAppliedColor = false;
+                appliedWeapon = nullptr;
+            }
             return;
         }
         was = true;
 
-        // ~20Hz is a smooth rainbow and, with the per-weapon cache below, cheap.
+        // 12 Hz is visually smooth enough for a rainbow while keeping game-thread
+        // ProcessEvent traffic bounded on multi-material firearms.
         static ULONGLONG lastMs = 0;
         ULONGLONG now = GetTickCount64();
-        if (now - lastMs < 50) return;
+        if (now - lastMs < 85) return;
         lastMs = now;
 
         UObject* pawn = GetLocalPawn();
@@ -5253,60 +5548,31 @@ namespace
         if (!Mem::IsReadable(weapon, 0x30))
             return; // holstered / scripted state -> nothing to recolour this tick
 
-        // EXPENSIVE WORK ONCE PER WEAPON: enumerate mesh components and read each
-        // material's REAL vector-param names. (This + the old per-tick guessed-name
-        // spray was the FPS-halving cost on multi-part weapons.) Cache it; rebuild only
-        // when the equipped weapon changes.
-        if (weapon != g_wrgbWeapon)
+        if (weapon != g_weaponRgbWeapon || g_weaponRgbSlots.empty())
         {
-            ClearWeaponRgbCache();
-            g_wrgbWeapon = weapon;
             std::vector<UObject*> meshes;
             try { CollectWeaponRgbMeshComponents(weapon, meshes); } catch (...) {}
-            // The guessed common colour names (BaseColor/Color/Tint/EmissiveColor/...),
-            // resolved ONCE. The material INSTANCE's own override array (CollectMesh...
-            // below) usually does NOT contain the parent material's main colour param,
-            // so these guessed names are what actually recolours most weapons -- dropping
-            // them (the previous perf pass) is what broke RGB. We still cache them per
-            // weapon (not re-resolved per tick) and bound the count, so it's far cheaper
-            // than the old every-tick enumerate-and-spray.
-            std::vector<UE::FName> guessColor, guessScalar;
-            ResolveWeaponRgbParamNames(guessColor, guessScalar);
-            constexpr size_t kMaxWrgbMeshes = 8;    // bound per-tick cost on multi-part weapons
-            constexpr size_t kMaxWrgbParams = 24;   // real instance params + guessed colour names
-            for (UObject* mesh : meshes)
-            {
-                if (g_wrgbCache.size() >= kMaxWrgbMeshes) break;
-                if (!Mem::IsReadable(mesh, 0x30)) continue;
-                WeaponRgbMeshCache entry; entry.mesh = mesh;
-                try { CollectMeshVectorParamNames(mesh, entry.names); } catch (...) {}
-                for (const UE::FName& g : guessColor)
-                {
-                    bool dup = false;
-                    for (const UE::FName& n : entry.names)
-                        if (n.ComparisonIndex == g.ComparisonIndex) { dup = true; break; }
-                    if (!dup) entry.names.push_back(g);
-                }
-                if (entry.names.size() > kMaxWrgbParams) entry.names.resize(kMaxWrgbParams);
-                if (!entry.names.empty())
-                    g_wrgbCache.push_back(std::move(entry));
-            }
-            size_t totalParams = 0; for (const auto& m : g_wrgbCache) totalParams += m.names.size();
-            LOG("WeaponRGB: cached weapon=%p meshes=%zu params=%zu (per-tick = colour push only)",
-                (void*)weapon, g_wrgbCache.size(), totalParams);
+            if (!EnsureWeaponRgbMaterialOverride(weapon, meshes, nullptr))
+                return;
+            haveAppliedColor = false;
+            appliedWeapon = weapon;
         }
 
         FVector color{ st.weaponRgbColor[0], st.weaponRgbColor[1], st.weaponRgbColor[2] };
         if (st.weaponRgbRainbow)
             HueToRgb((float)(now % 3000) / 3000.0f, color.X, color.Y, color.Z);
 
-        // CHEAP per-tick: push the colour to the cached param-name list (real instance
-        // params + guessed colour names, resolved once at cache time). No per-tick mesh
-        // enumeration, no material re-reads, no custom depth -- that was the FPS cost.
-        for (const WeaponRgbMeshCache& m : g_wrgbCache)
+        if (!st.weaponRgbRainbow && haveAppliedColor && appliedWeapon == weapon &&
+            fabsf(color.X - lastAppliedColor.X) < 0.001f &&
+            fabsf(color.Y - lastAppliedColor.Y) < 0.001f &&
+            fabsf(color.Z - lastAppliedColor.Z) < 0.001f)
+            return; // fixed colour already applied; zero recurring game-thread work
+
+        if (ApplyWeaponRgbOverrideColor(color))
         {
-            if (!Mem::IsReadable(m.mesh, 0x30)) continue;
-            for (const UE::FName& n : m.names) { try { SetMeshVectorParam(m.mesh, n, color); } catch (...) {} }
+            lastAppliedColor = color;
+            haveAppliedColor = true;
+            appliedWeapon = weapon;
         }
     }
 
@@ -8484,7 +8750,7 @@ int Features::AiQueueFollowPlayer()
 int Features::AiQueueFightEachOther()
 {
     if (!G::sdkReady.load()) return 0;
-    try { return QueueAiOperation(AiQueuedKind::FightEachOther, CollectNearbyAi(g_state.aiRadius, kMaxAiCommandTargets, true)); }
+    try { return QueueAiOperation(AiQueuedKind::FightEachOther, CollectNearbyNonSquadAi(g_state.aiRadius, kMaxAiCommandTargets, true)); }
     catch (...) { LOG("AiQueueFightEachOther: exception (ignored)"); return 0; }
 }
 
@@ -8498,7 +8764,15 @@ int Features::AiQueueReleaseNearby()
 int Features::AiQueueKillAll()
 {
     if (!G::sdkReady.load()) return 0;
-    try { return QueueAiOperation(AiQueuedKind::Kill, CollectAllCachedAi(kMaxCachedAiActors)); }
+    try
+    {
+        InstallProcessEventHook();
+        g_deepKillRequested = true; // ordinary KILL ALL must include scanner-missed streamed enemies
+        RequestAiDiscovery();
+        int queued = QueueAiOperation(AiQueuedKind::Kill, CollectAllCachedAi(kMaxCachedAiActors));
+        LOG("AiQueueKillAll: queued cached=%d and requested authoritative deep sweep", queued);
+        return queued;
+    }
     catch (...) { LOG("AiQueueKillAll: exception (ignored)"); return 0; }
 }
 
@@ -9752,6 +10026,9 @@ void DriveSquadVelocityGameThread()
     if (g_engagedUntilMs.size() > 64)
         for (auto it = g_engagedUntilMs.begin(); it != g_engagedUntilMs.end(); )
         { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_engagedUntilMs.erase(it); }
+    if (g_lastThreatMs.size() > 64)
+        for (auto it = g_lastThreatMs.begin(); it != g_lastThreatMs.end(); )
+        { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_lastThreatMs.erase(it); }
 
     static ULONGLONG lastLog = 0;
     if (nowm - lastLog > 3000)
