@@ -125,6 +125,17 @@ namespace Features
         bool  weaponRgbRainbow= true;
         float weaponRgbColor[3] = { 1.0f, 0.2f, 0.05f };
 
+        // --- Horde Rounds (arena survival) ----------------------------------
+        // A self-contained survival mode: optionally teleport to an arena
+        // "location", spawn waves of HOSTILE robots that hunt you (they are NOT
+        // invincible -- fully killable, unlike the squad), block the game from
+        // saving while you're inside, and on death/stop restore you cleanly.
+        // Buttons drive Start/Stop (see the Features API); these are the settings.
+        bool  hordeActive      = false;  // read-only mirror of a running run (UI status)
+        int   hordeLocation    = 0;      // 0 = "Here" (fight in place), >0 = a saved arena
+        int   hordePerRound    = 6;      // robots in wave 1 (each wave adds more)
+        bool  hordeAutoAdvance = true;   // auto-start the next wave once the arena is cleared
+
         // Misc/debug helpers
         bool  instantPuzzleResolve = false;
         bool  debugLiveDump = false; // Debug tab: stream togglelogsN snapshots + ProcessEvent trace
@@ -254,6 +265,30 @@ namespace Features
     void DebugSetTraceTarget(const char* nameSubstr);
     const char* DebugTraceTargetName();  // currently latched target's full name ("" if none)
     const char* DebugLastDumpDir();
+
+    // ---- Horde Rounds (arena survival) -------------------------------------
+    // A wave survival mode independent of the squad: HordeStart teleports you to
+    // the selected location (if not "Here"), blocks the game from saving, and
+    // begins spawning hostile, killable robots that hunt you. Each cleared wave
+    // (when auto-advance is on) ramps up the next. HordeStop -- and an automatic
+    // halt if you DIE -- clears every spawned robot, re-enables saving, and
+    // restores your original position. Everything runs on the game-thread AI pump.
+    void HordeStart();            // begin a run at the selected location
+    void HordeStop();             // end the run: clear robots, restore position, re-enable saving
+    bool HordeIsActive();
+    int  HordeRound();            // current wave number (0 when idle)
+    int  HordeAliveCount();       // live horde robots remaining this wave
+    int  HordeKillCount();        // robots you've killed this run
+    int  HordePendingCount();     // robots still queued to spawn this wave
+    const char* HordeStatusText();// short human-readable state line for the menu
+
+    // Arena "locations". Index 0 is always "Here" (fight in place, no teleport);
+    // higher indices are user-saved spots captured from your current position and
+    // persisted to AtomicHeartMenu_arenas.json so they survive restarts.
+    int  HordeLocationCount();              // total (always >= 1, includes "Here")
+    const char* HordeLocationName(int i);
+    void HordeSaveLocationHere(const char* name); // capture current pawn position as a new arena
+    void HordeDeleteLocation(int i);              // delete a saved arena (i >= 1; "Here" can't be deleted)
 
     void MaxWeaponUpgrades();     // BaseWeapon::FullUpgrade on the current weapon
     void RunConsoleCommand(const char* command); // queue a console command to the game thread

@@ -385,6 +385,147 @@ namespace
         }
         ImGui::EndChild();
     }
+
+    // ===================================================================
+    //  HORDE ROUNDS tab -- arena wave survival vs HOSTILE, killable robots.
+    // ===================================================================
+    void DrawHordeTab(Features::State& f)
+    {
+        const bool active = Features::HordeIsActive();
+
+        // --- status strip ---------------------------------------------------
+        if (active)
+            ImGui::TextColored(ImVec4(0.40f, 0.95f, 0.55f, 1.0f), "%s", Features::HordeStatusText());
+        else
+            ImGui::TextColored(kAccent, "%s", Features::HordeStatusText());
+        if (active)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f),
+                               "Run live -- the game is BLOCKED from saving. If you die, it auto-halts.");
+        }
+        ImGui::Spacing();
+
+        // --- LOCATION -------------------------------------------------------
+        ImGui::SeparatorText("Location  (where the round is fought)");
+        BeginCard("hordeloc", 0);
+        {
+            int locCount = Features::HordeLocationCount();
+            if (f.hordeLocation < 0 || f.hordeLocation >= locCount) f.hordeLocation = 0;
+            const char* preview = Features::HordeLocationName(f.hordeLocation);
+
+            ImGui::BeginDisabled(active); // don't change the destination mid-run
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##hordeloc", preview))
+            {
+                for (int i = 0; i < locCount; ++i)
+                {
+                    bool sel = (f.hordeLocation == i);
+                    if (ImGui::Selectable(Features::HordeLocationName(i), sel))
+                        f.hordeLocation = i;
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("\"Here\" fights where you stand (no teleport). A saved arena teleports\n"
+                                  "you there for the run and teleports you back when it ends. While a run\n"
+                                  "is active the game NEVER saves, so the arena never overwrites progress.");
+
+            static char arenaName[64] = "";
+            ImGui::SetNextItemWidth(-110.0f);
+            ImGui::InputTextWithHint("##arenaname", "name this spot (optional)", arenaName, sizeof(arenaName));
+            ImGui::SameLine();
+            if (ImGui::Button("Save here", ImVec2(-FLT_MIN, 0)))
+            {
+                Features::HordeSaveLocationHere(arenaName);
+                arenaName[0] = '\0';
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Captures your CURRENT position as a reusable arena. Stand somewhere\n"
+                                  "open (no story triggers) and save it, then pick it above.");
+
+            if (f.hordeLocation >= 1)
+            {
+                ImGui::BeginDisabled(active);
+                if (ImGui::SmallButton("Delete selected location"))
+                {
+                    Features::HordeDeleteLocation(f.hordeLocation);
+                    f.hordeLocation = 0;
+                }
+                ImGui::EndDisabled();
+            }
+        }
+        ImGui::EndChild();
+
+        // --- ROUND SETTINGS -------------------------------------------------
+        ImGui::SeparatorText("Round settings");
+        BeginCard("hordeset", 0);
+        {
+            ImGui::BeginDisabled(active);
+            ImGui::SetNextItemWidth(-140.0f);
+            ImGui::SliderInt("Robots in wave 1", &f.hordePerRound, 1, 24);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How many robots the first wave spawns. Each later wave adds more.\n"
+                                  "They stream in a few at a time so it never hitches.");
+            LogCheckbox("Auto-advance waves (endless)", &f.hordeAutoAdvance, "hordeAutoAdvance");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("On: clear a wave and the next (bigger) one starts automatically.\n"
+                                  "Off: clear a wave then press 'Next wave' yourself.");
+            ImGui::TextDisabled("Robots are HOSTILE and fully killable (not invincible like the squad).");
+            ImGui::TextDisabled("Tip: be near some robots first so their type is loaded to spawn from.");
+        }
+        ImGui::EndChild();
+
+        // --- CONTROL --------------------------------------------------------
+        ImGui::SeparatorText("Control");
+        BeginCard("hordectl", 0);
+        {
+            if (!active)
+            {
+                if (AccentButton("START ROUND", 38.0f))
+                {
+                    LOG("UI: horde start");
+                    Features::HordeStart();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Teleports to the chosen location (if not 'Here'), blocks saving,\n"
+                                      "and spawns the first wave of robots to hunt you.");
+            }
+            else
+            {
+                float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+                if (ImGui::Button(f.hordeAutoAdvance ? "Spawn extra wave" : "Next wave", ImVec2(half, 38.0f)))
+                {
+                    LOG("UI: horde next wave");
+                    Features::HordeStart(); // while active, this pushes the next wave
+                }
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.18f, 0.18f, 1.0f));
+                if (ImGui::Button("STOP & RESTORE", ImVec2(-FLT_MIN, 38.0f)))
+                {
+                    LOG("UI: horde stop");
+                    Features::HordeStop();
+                }
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Ends the run: deletes every spawned robot, re-enables saving,\n"
+                                      "and teleports you back to where you started.");
+            }
+            ImGui::Spacing();
+            ImGui::TextColored(kAccent, "Wave %d", Features::HordeRound());
+            ImGui::SameLine(0, 16); ImGui::Text("Alive: %d", Features::HordeAliveCount());
+            ImGui::SameLine(0, 16); ImGui::Text("Queued: %d", Features::HordePendingCount());
+            ImGui::SameLine(0, 16); ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "Kills: %d", Features::HordeKillCount());
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("Want to survive? Turn on God mode in the Player tab -- the robots stay\n"
+                            "killable either way. With God mode off, dying instantly halts the run.");
+    }
 }
 
 void Menu::Render()
@@ -523,6 +664,12 @@ void Menu::Render()
         if (ImGui::BeginTabItem("AI / Squad"))
         {
             DrawAiTab(f);
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Horde Rounds"))
+        {
+            DrawHordeTab(f);
             ImGui::EndTabItem();
         }
 

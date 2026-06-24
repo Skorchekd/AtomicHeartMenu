@@ -44,6 +44,13 @@ namespace AH = Offsets::AH;
 // one definition. Per-frame, game-thread squad walk (RequestDirectMove emulation).
 void DriveSquadVelocityGameThread();
 
+// Mercuna MoveToActor (the game's REAL pather). Defined far below, but the Twin combat
+// brain (in the anonymous namespace above its definition) needs it -- forward-declare so
+// both callers bind to the one definition. The Twin (unlike regular robots) HAS a
+// MercunaNavigationComponent, so this is what actually walks her to a target.
+static bool MercunaMoveToPlayer(UObject* ai, UObject* target, float endDistU, float speed);
+static bool MercunaStop(UObject* ai); // cancel her current Mercuna move (so she cleanly holds / stops stacking)
+
 namespace
 {
     Features::State g_state;
@@ -96,8 +103,21 @@ namespace
     // DriveSquadVelocityGameThread.
     std::unordered_map<UObject*, UObject*> g_stashedSchedule;
 
+    // ---- No-save guard (Horde Rounds arena) --------------------------------
+    // While a horde run is active we must guarantee the game NEVER checkpoints --
+    // otherwise the arena teleport / fight could be written over the player's real
+    // progress. We swallow the game's save UFunctions right here in ProcessEvent:
+    // g_blockSaves arms the guard; the three atomics hold the resolved save-fn
+    // pointers (filled by the horde code on the game thread via CachedFn). The hook
+    // only ever does a few cheap pointer compares, so it costs nothing when idle.
+    std::atomic<bool>   g_blockSaves{ false };
+    std::atomic<void*>  g_fnSaveProgress{ nullptr };
+    std::atomic<void*>  g_fnSavePersistentData{ nullptr };
+    std::atomic<void*>  g_fnCheckpointSaveProgress{ nullptr };
+
     void DiagnosticTraceProcessEvent(void* obj, void* fn, void* params);
     void RunConsoleCommandImpl(const std::string& cmd); // defined later; used by the spawn anim-safety fix
+    void RefreshFlyStreaming(UObject* pawn, bool force); // defined later; horde restore re-streams the original area
 
     // True when the engine is dispatching a UFunction ON an enemy AI character or
     // AI controller -- i.e. it is mid-AI-logic, so this callsite is NOT safe to
@@ -161,6 +181,23 @@ namespace
         ++t_peDepth;
         // Always restore the depth, even if oProcessEvent unwinds.
         struct DepthGuard { ~DepthGuard() { --t_peDepth; } } depthGuard;
+
+        // No-save guard: while a Horde Rounds arena is active, swallow the game's
+        // save UFunctions so it can NEVER checkpoint over the player's real progress.
+        // Pure pointer compares; we return WITHOUT calling the original (the saves are
+        // fire-and-forget triggers with no return value the engine consumes mid-frame).
+        if (g_blockSaves.load(std::memory_order_relaxed) && fn)
+        {
+            if (fn == g_fnSaveProgress.load(std::memory_order_relaxed) ||
+                fn == g_fnSavePersistentData.load(std::memory_order_relaxed) ||
+                fn == g_fnCheckpointSaveProgress.load(std::memory_order_relaxed))
+            {
+                static ULONGLONG lastBlockLogMs = 0;
+                ULONGLONG nowB = GetTickCount64();
+                if (nowB - lastBlockLogMs > 1000) { lastBlockLogMs = nowB; LOG("Horde: swallowed a game save (arena active)"); }
+                return; // depthGuard restores t_peDepth
+            }
+        }
 
         // Drain deferred game-thread work only at a proven-safe callsite (see the
         // header comment): outermost dispatch, on the game thread, not on an AI
@@ -2163,6 +2200,18 @@ namespace
         return true;
     }
 
+    // Drop the controller's focus actor so the pawn faces its TRAVEL direction again
+    // (its AnimBP orients to velocity) instead of being pinned to stare at a focus
+    // target. Used by the Twin follow so a moving Twin turns naturally like her native
+    // locomotion, then re-focuses you when she stops. No-op + crash-safe if unresolved.
+    bool ClearControllerFocus(UObject* ctrl)
+    {
+        UFunction* fn = CachedObjectClassFn(ctrl, "K2_ClearFocus");
+        if (!ctrl || !fn)
+            return false;
+        return ProcessNoParams(ctrl, fn);
+    }
+
     bool SetCharacterHealthZero(UObject* ai)
     {
         uint8_t* base = reinterpret_cast<uint8_t*>(ai);
@@ -2438,6 +2487,46 @@ namespace
     std::unordered_map<UObject*, unsigned long long> g_lastThreatMs;
     constexpr unsigned long long kCombatHoldMs = 1200; // bridge brief threat-selection gaps, then resume follow
 
+    // =======================================================================
+    //  TWIN  --  the flagship "super bodyguard" (separate from the squad drive)
+    // -----------------------------------------------------------------------
+    //  The Twin (AAIMixedNavigationCharacter) is driven by her OWN dedicated path,
+    //  NOT the normal squad bodyguard code (DriveSpawnedAllies / the per-frame squad
+    //  follow). The goal: recreate her native AI -- real attack montages, flight, smooth
+    //  locomotion -- but fully under our control. Her native captures (released, chasing
+    //  the player) show the recipe: target + IsAggressive + her own BT/path-following move
+    //  + attack her smoothly, on 2D nav by default, briefly flying (movement_mode 5) at
+    //  close range. So we SEED combat like a native enemy and otherwise GET OUT OF HER WAY,
+    //  instead of the per-frame key-hammering / nav-pinning / state-machine re-kicking that
+    //  the normal squad drive does (that fought her flight and restarted her montages).
+    //  All state here is GAME-THREAD ONLY (the combat brain + per-frame follow both run there).
+    struct TwinState
+    {
+        UObject*  target        = nullptr; // current engaged threat
+        ULONGLONG engagedUntilMs = 0;      // per-frame follow leaves her alone until this (she's fighting)
+        ULONGLONG lastThreatMs   = 0;      // last in-range threat -> combat hold across brief gaps
+        ULONGLONG lastKickMs     = 0;      // last native attack-state kick (throttled -> montage-safe)
+        ULONGLONG lastTeamMs     = 0;      // last team write (SetGenericTeamId re-triggers perception)
+        ULONGLONG lastFriendlyMs = 0;      // last friendly re-assert while idle
+        int       combatPhase    = -1;     // -1 init, 0 idle/follow, 1 engaged
+        // follow smoothing (per-frame)
+        bool      moving        = false;   // hysteresis: currently driving a move-to
+        int       followState   = 0;       // 0 init, 1 moving, 2 holding (transition detection)
+        ULONGLONG lastGoalMs    = 0;       // last Mercuna MoveToActor re-target
+        ULONGLONG lastFlushMs   = 0;       // last standalone Mercuna Stop (flush stacked path requests; own pump)
+        int       mercCount     = 0;       // diag: total MoveToActor issues
+        // stuck/stairs traversal: FORCE flight to cross, then ground her ONCE back on flat
+        float     closeBestM    = -1.0f;   // smallest follow distance reached since last progress
+        ULONGLONG closeBestMs   = 0;       // when she last made progress closing on you
+        bool      traverse3D    = false;   // true = forced to FLIGHT to cross stairs/gap (grounds ONCE on recovery)
+    };
+    std::unordered_map<UObject*, TwinState> g_twin; // game thread only
+
+    constexpr float              kTwinEngageM         = 40.0f; // engage the nearest threat within this of you OR her (= kGuardEngageM)
+    constexpr unsigned long long kTwinCombatHoldMs    = 1500;  // hold the combat posture across brief threat-selection gaps
+    constexpr unsigned long long kTwinKickHeartbeatMs = 1500;  // re-kick the attack state while IN melee range (sustained swings, but not every pump)
+    constexpr float              kTwinFollowBandM     = 1.5f;  // hysteresis: start moving only when this far BEYOND the stop ring
+
     // ---- follow-the-player (squad members + spawns) ----
     constexpr float     kFollowKeepM     = 3.5f;  // legacy; clean follow uses State.aiFollowStopM
     constexpr float     kFollowTeleportM = 30.0f; // OPT-IN teleport leash distance (only if aiAllowTeleport; default off -> they WALK)
@@ -2624,12 +2713,104 @@ namespace
     {
         if (!AiUsable(ai))
             return;
+        bool okAuto = false, okType = false, exAuto = false, exType = false;
         if (UFunction* fn = CachedObjectClassFn(ai, "SetCanUseAutomaticNavigationTypeSelection"))
             if (Mem::IsReadable(fn, 0x30))
-            { struct { bool v; uint8_t pad[7]; } p{ false, {0} }; ai->ProcessEvent(fn, &p); }
+            { struct { bool v; uint8_t pad[7]; } p{ false, {0} }; try { ai->ProcessEvent(fn, &p); okAuto = true; } catch (...) { exAuto = true; } }
         if (UFunction* fn = CachedObjectClassFn(ai, "ForceNavigationType"))
             if (Mem::IsReadable(fn, 0x30))
-            { struct { uint8_t t; uint8_t pad[7]; } p{ 1 /*ENavigationTypeSelector::Navigation2D (ground)*/, {0} }; ai->ProcessEvent(fn, &p); }
+            { struct { uint8_t t; uint8_t pad[7]; } p{ 1 /*ENavigationTypeSelector::Navigation2D (ground)*/, {0} }; try { ai->ProcessEvent(fn, &p); okType = true; } catch (...) { exType = true; } }
+        // Throttled so the 1.5s re-pin doesn't flood, but exceptions always print.
+        static ULONGLONG lastLog = 0; ULONGLONG nowL = GetTickCount64();
+        if (exAuto || exType || nowL - lastLog > 3000)
+        { lastLog = nowL; LOG("Twin nav -> GROUND(2D): setAuto(false)=%d forceType(1)=%d exAuto=%d exType=%d ai=%p", okAuto, okType, exAuto, exType, (void*)ai); }
+    }
+
+    // Is this a mixed-navigation character (the Twins = AAIMixedNavigationCharacter)?
+    // ONLY that class exposes ForceNavigationType / SetCanUseAutomaticNavigationTypeSelection,
+    // so a resolvable ForceNavigationType is a precise, crash-free "this is a Twin" test that
+    // returns false for every normal pawn. Memoised per UClass (the result is per type), so
+    // CachedObjectClassFn (which logs a one-time miss) runs at most once per class. This is the
+    // gate that routes Twins into their OWN dedicated drive, fully separate from the normal squad.
+    bool IsMixedNavCharacter(UObject* ai)
+    {
+        if (!AiUsable(ai))
+            return false;
+        UClass* cls = ai->Class();
+        if (!Mem::IsReadable(cls, 0x30))
+            return false;
+        thread_local std::unordered_map<UClass*, unsigned char> memo;
+        auto it = memo.find(cls);
+        if (it != memo.end())
+            return it->second != 0;
+        bool mixed = (CachedObjectClassFn(ai, "ForceNavigationType") != nullptr);
+        memo[cls] = mixed ? 1u : 0u;
+        return mixed;
+    }
+
+    // Hand navigation-type control BACK to a Twin's own AI (the inverse of the ground pin
+    // in ForceGroundNavIfMixed). We call this when she ENGAGES so her native combat AI can
+    // transition to flight (movement_mode 5) on its own -- exactly like her released captures,
+    // which fly briefly at close range while otherwise staying on 2D nav. Re-pinning to ground
+    // every frame is what interrupted that transition mid-air ("flying bugs her out").
+    void AllowMixedNavAuto(UObject* ai)
+    {
+        if (!AiUsable(ai))
+            return;
+        if (UFunction* fn = CachedObjectClassFn(ai, "SetCanUseAutomaticNavigationTypeSelection"))
+            if (Mem::IsReadable(fn, 0x30))
+            { struct { bool v; uint8_t pad[7]; } p{ true, {0} }; ai->ProcessEvent(fn, &p); }
+    }
+
+    // Force a mixed-nav Twin into FLIGHT (3D) nav so Mercuna paths her THROUGH THE AIR across
+    // stairs/gaps the ground (2D) path can't cross. Called ONCE on entering the stuck/traversal
+    // state (NOT on a timer). Verbose-logged so we can confirm the game accepts the command.
+    void ForceFlightNavIfMixed(UObject* ai)
+    {
+        if (!AiUsable(ai))
+            return;
+        bool okAuto = false, okType = false, exAuto = false, exType = false;
+        if (UFunction* fn = CachedObjectClassFn(ai, "SetCanUseAutomaticNavigationTypeSelection"))
+            if (Mem::IsReadable(fn, 0x30))
+            { struct { bool v; uint8_t pad[7]; } p{ false, {0} }; try { ai->ProcessEvent(fn, &p); okAuto = true; } catch (...) { exAuto = true; } }
+        if (UFunction* fn = CachedObjectClassFn(ai, "ForceNavigationType"))
+            if (Mem::IsReadable(fn, 0x30))
+            { struct { uint8_t t; uint8_t pad[7]; } p{ 2 /*ENavigationTypeSelector::Navigation3D (flight)*/, {0} }; try { ai->ProcessEvent(fn, &p); okType = true; } catch (...) { exType = true; } }
+        LOG("Twin nav -> FLIGHT(3D): setAuto(false)=%d forceType(2)=%d exAuto=%d exType=%d ai=%p", okAuto, okType, exAuto, exType, (void*)ai);
+    }
+
+    // Is this character currently airborne (movement_mode == Flying)? Crash-safe raw read.
+    bool TwinIsAirborne(UObject* ai)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (!Mem::IsReadable(base + AH::Char_CharacterMovement, sizeof(void*)))
+            return false;
+        uint8_t* mv = *reinterpret_cast<uint8_t**>(base + AH::Char_CharacterMovement);
+        return Mem::IsReadable(mv + AH::Move_MovementMode, 1) &&
+               *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode) == AH::MOVE_Flying;
+    }
+
+    // Clear any idle/pedestrian SCHEDULE pinning her, so her BT falls through to its FOLLOW
+    // branch instead of a schedule branch that ignores our follow keys (the "moving=1 but
+    // vel=0 / turns to me but doesn't walk" stall). The schedule system re-applies the asset,
+    // so we stash the original ONCE (ApplyAiRelease restores it) and null it every call. Also
+    // clears the passive gate. Crash-safe raw writes. FOLLOW-only -- never run while she's
+    // fighting (her combat AI owns her then, and this would be needless churn).
+    void UnpinTwinSchedule(UObject* twin)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(twin);
+        if (Mem::IsReadable(base + AH::AICh_bIsPassive, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive) = false;
+        if (Mem::IsReadable(base + AH::AICh_Schedule, sizeof(void*)))
+        {
+            UObject** slot = reinterpret_cast<UObject**>(base + AH::AICh_Schedule);
+            if (*slot)
+            {
+                if (g_stashedSchedule.find(twin) == g_stashedSchedule.end())
+                    g_stashedSchedule[twin] = *slot; // remember the real schedule once (for restore)
+                *slot = nullptr;
+            }
+        }
     }
 
     // Bodyguard injection. THE FIX: a guard fights with the EXACT pipeline that
@@ -2854,6 +3035,12 @@ namespace
                 g_stashedSchedule.erase(its);
             }
         }
+        // Twin: hand nav-type control back to her own AI (we pinned her to ground while she
+        // followed as a bodyguard) and forget her dedicated controller state, so a released
+        // Twin reverts to fully-native behaviour.
+        if (IsMixedNavCharacter(ai))
+            AllowMixedNavAuto(ai);
+        g_twin.erase(ai);
         return ok;
     }
 
@@ -2884,9 +3071,13 @@ namespace
                 SetControllerTargetEnemy(ctrl, nullptr, true);
                 SetControllerAggressive(ctrl, false);
             }
-            // Pin mixed-nav members (Twins) to GROUND nav at recruit so they follow
-            // instead of hovering (no-op for normal pawns; the pump re-asserts it).
+            // Ground her ONCE at recruit so she follows on flat ground. We do NOT re-pin on a
+            // timer (the REPEATED re-pin was what froze her animations) -- the per-frame follow
+            // only re-grounds her once when she lands back on flat after a flight traversal.
             ForceGroundNavIfMixed(ai);
+            // Start her dedicated Twin state fresh (clears any stale phase from a prior
+            // recruit/release cycle; the brain + per-frame follow re-seed it).
+            g_twin.erase(ai);
         }
 
         // Follow closely + constantly. Some callers pass an empty hint (e.g. the
@@ -3586,9 +3777,10 @@ namespace
                 std::remove_if(g_spawnedAllies.begin(), g_spawnedAllies.end(),
                     [](UObject* a)
                     {
-                        if (!Mem::IsReadable(a, 0x30)) { miss.erase(a); return true; } // truly gone
+                        if (!Mem::IsReadable(a, 0x30)) { miss.erase(a); LOG("Squad prune: member %p gone (unreadable) -> dropped", (void*)a); return true; } // truly gone
                         if (FollowPawnUsable(a)) { miss.erase(a); return false; }       // healthy -> keep
-                        return ++miss[a] >= 30; // ~30 consecutive misses (~several s) -> give up; else KEEP
+                        if (++miss[a] >= 30) { LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
+                        return false; // ~30 consecutive misses (~several s) -> give up; else KEEP
                     }),
                 g_spawnedAllies.end());
             g_spawnedAllyCount = (int)g_spawnedAllies.size();
@@ -3634,6 +3826,11 @@ namespace
         for (UObject* ally : squad)
         {
             if (!FollowPawnUsable(ally) || ally == player)
+                continue;
+            // Twins are driven by their OWN dedicated brain (DriveTwinCombat) + per-frame
+            // follow -- never the normal squad combat/follow path. Keep her completely
+            // separate (no ground-nav hammering, no InjectBodyguard, no assist-kill here).
+            if (IsMixedNavCharacter(ally))
                 continue;
             FVector loc{};
             if (!ReadActorLocationFast(ally, loc))
@@ -3740,6 +3937,234 @@ namespace
                 dbgDriven, dbgEngaged, squadAggr ? 1 : 0,
                 dbgNearThreat, (int)threats.size(), (int)dbgTeam);
         }
+    }
+
+    // =======================================================================
+    //  TWIN COMBAT BRAIN  --  ~5 Hz, game thread (called from the AI pump)
+    // -----------------------------------------------------------------------
+    //  The "decide + seed" half of the Twin super-bodyguard. Picks a threat, seeds
+    //  combat exactly like a native enemy (target + aggressive + combat team), kicks
+    //  the attack state machine ONLY on a target change or a slow heartbeat (re-kicking
+    //  every pump is what looped her montages), hands nav control back so she can fly,
+    //  then stamps engagedUntil so the per-frame follow LEAVES HER ALONE to fight with
+    //  her own smooth locomotion + montages. When safe she stands down to a docile follow.
+    //  She NEVER targets you (blanked every pump, both here and in the per-frame drive).
+    void DriveTwinCombat()
+    {
+        if (g_spawnedAllyCount.load() <= 0)
+            return;
+
+        static ULONGLONG lastMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastMs < kAiInjectIntervalMs) // ~5 Hz, same cadence as the squad pump
+            return;
+        lastMs = now;
+
+        std::vector<UObject*> squad;
+        { std::lock_guard<std::mutex> lk(g_squadMutex); squad = g_spawnedAllies; }
+
+        std::vector<UObject*> twins;
+        for (UObject* a : squad)
+            if (Mem::IsReadable(a, 0x30) && IsMixedNavCharacter(a))
+                twins.push_back(a);
+        if (twins.empty())
+            return;
+
+        UObject* player = nullptr;
+        FVector  playerLoc{};
+        if (!ReadLocalPawnLocationFast(playerLoc, &player) || !Mem::IsReadable(player, 0x30))
+            return;
+
+        const bool squadAggr = Features::Get().aiSquadAggressive;
+        const bool invincible = Features::Get().aiInvincibleAllies;
+
+        // Live, non-squad, COMBAT threats (same definition the squad pump uses). Built once
+        // for all Twins. Skipped entirely when "squad fights for you" is off -> peaceful Twin.
+        std::vector<UObject*> threats;
+        if (squadAggr)
+        {
+            std::vector<UObject*> allAi = CollectAllCachedAi(kMaxCachedAiActors);
+            threats.reserve(allAi.size());
+            for (UObject* a : allAi)
+            {
+                if (!Mem::IsReadable(a, 0x30) || !AiUsable(a) || !AiIsCombatCapable(a))
+                    continue;
+                bool member = false;
+                for (UObject* s : squad) if (s == a) { member = true; break; }
+                if (member)
+                    continue;
+                float cur = 0.0f, mx = 0.0f;
+                if (ReadCharacterHealth(a, cur, mx) && mx > 0.001f && cur <= 0.0f)
+                    continue; // dead/dying -> not a threat
+                threats.push_back(a);
+            }
+        }
+
+        float dbgDist = -1.0f, dbgThreatDist = -1.0f, dbgNearestAny = -1.0f;
+        int   dbgEngage = 0, dbgPhase = -9, dbgAir = 0, dbgMerc = -1, dbgMercCount = -1;
+        for (UObject* twin : twins)
+        {
+            if (!FollowPawnUsable(twin) || twin == player)
+                continue;
+            TwinState& s = g_twin[twin];
+            FVector twinLoc{};
+            if (!ReadActorLocationFast(twin, twinLoc))
+                continue;
+
+            // Keep her alive + her REAL hits lethal (so her own attack montage one-shots a
+            // robot -> smooth kills, no instant-kill that would cut the animation short).
+            EnsureFollowerCanMove(twin);
+            if (invincible && AiUsable(twin)) SetCharacterHealthFull(twin);
+            if (AiUsable(twin))               SetCharacterInstigatedDamage(twin, 100.0f);
+            // (No ground-nav pinning -- her own AI decides nav type. Mercuna does the moving.)
+
+            // HARD never-attack-you: she is always your ally; blank any aggro on you.
+            WriteAiAggressiveFlags(twin, true);
+            SetAiTargetAlly(twin, player);
+            if (UObject* ctrl = GetAiController(twin))
+                SetControllerTargetAlly(ctrl, player);
+            SuppressGuardTargetingPlayer(twin, player);
+
+            // Threat selection: prefer an enemy attacking YOU, else the nearest to HER, and
+            // only within engage range of you OR her. (A distant fight is ignored so she keeps
+            // following instead of running off.)
+            UObject* threat = nullptr;
+            float best = 3.4e38f;
+            float selDist = -1.0f;       // distance (m) twin->selected threat (diag)
+            float nearestAnyM = -1.0f;   // nearest combat AI to her at ALL (diag: why no engage)
+            for (UObject* c : threats)
+            {
+                if (c == twin || c == player)
+                    continue;
+                FVector cl{};
+                if (!ReadActorLocationFast(c, cl))
+                    continue;
+                float dYou = DistanceMetres(playerLoc, cl);
+                float dHer = DistanceMetres(twinLoc, cl);
+                if (nearestAnyM < 0.0f || dHer < nearestAnyM) nearestAnyM = dHer;
+                if (dYou > kTwinEngageM && dHer > kTwinEngageM)
+                    continue;
+                uint8_t* cb = reinterpret_cast<uint8_t*>(c);
+                bool atkYou = Mem::IsReadable(cb + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
+                              *reinterpret_cast<UObject**>(cb + AH::AICh_CachedTargetEnemy) == player;
+                float score = dHer - (atkYou ? 1.0e4f : 0.0f); // attackers of you win
+                if (score < best) { best = score; threat = c; selDist = dHer; }
+            }
+
+            bool engage = (threat != nullptr);
+            // Diagnostics for the LAST twin this pump (usually the only one).
+            dbgDist       = DistanceMetres(twinLoc, playerLoc);
+            dbgEngage     = engage ? 1 : 0;
+            dbgThreatDist = selDist;
+            dbgNearestAny = nearestAnyM;
+            dbgPhase      = s.combatPhase;
+            dbgAir        = TwinIsAirborne(twin) ? 1 : 0;
+            dbgMercCount  = s.mercCount;
+            if (engage)
+                s.lastThreatMs = now;
+            bool combatHold = (now - s.lastThreatMs) < kTwinCombatHoldMs;
+
+            if (engage)
+            {
+                bool targetChanged = (s.target != threat);
+                // (Nav is left to her own AI now -- no ground pinning. Mercuna moves her to the
+                //  threat below; her AI picks ground vs flight.)
+                // Seed combat like a native enemy: raw target (every pump, keeps her locked on)
+                // + game/blackboard target + aggressive branch.
+                WriteAiTargetField(twin, threat);
+                SetAiTargetEnemy(twin, threat, true);
+                if (UObject* ctrl = GetAiController(twin))
+                {
+                    SetControllerTargetEnemy(ctrl, threat, true);
+                    SetControllerAggressive(ctrl, true);
+                }
+                // Combat team: SetGenericTeamId re-triggers perception, so throttle it.
+                if (targetChanged || now - s.lastTeamMs > 1500)
+                {
+                    SetAiTeamIdTracked(twin, kGuardTeam);
+                    s.lastTeamMs = now;
+                }
+                // *** MOVE her to the threat with Mercuna. ***
+                // Her boss BT's own combat locomotion does NOT move her under our injection (she
+                // just stood "engaged" = frozen). Frequent MoveToActor re-targeting is what moves
+                // her; a single order doesn't sustain her. MoveToActor STACKS path requests over
+                // time (lag grows -> stall), so every few seconds we FLUSH with a STANDALONE Stop
+                // on its own pump -- NOT in the same pump as a Move (Stop+Move together cancels
+                // the move and she freezes, confirmed). Between flushes we re-target on a timer.
+                if (now - s.lastFlushMs > 3000)
+                {
+                    MercunaStop(twin);          // flush accumulated path requests (own pump)
+                    s.lastFlushMs = now;
+                }
+                else if (now - s.lastGoalMs > 400)
+                {
+                    dbgMerc = MercunaMoveToPlayer(twin, threat, 250.0f /*~2.5m, melee range*/, 600.0f) ? 1 : 0;
+                    s.lastGoalMs = now; ++s.mercCount;
+                }
+                // ATTACK kick: on target change, then re-assert only while she's IN melee range
+                // so she actually swings -- throttled so the montage isn't restarted every pump
+                // (that restart was the looping-animation bug). No kick while merely approaching.
+                bool inRange = (selDist >= 0.0f && selDist <= 5.0f);
+                if (targetChanged || (inRange && now - s.lastKickMs > kTwinKickHeartbeatMs))
+                {
+                    ForceCharacterAggressive(twin, threat);
+                    s.lastKickMs = now;
+                }
+                SuppressGuardTargetingPlayer(twin, player);
+                s.engagedUntilMs = now + 1200; // per-frame follow keeps its hands off while she fights
+                s.target = threat;
+                s.combatPhase = 1;
+            }
+            else if (combatHold && s.combatPhase == 1)
+            {
+                // Brief gap with no fresh target: HOLD (stay armed, don't reset team/state every
+                // pump -- that flip-flop is what stopped a guard ever sustaining a fight). Let her
+                // own perception keep hunting; just keep the follow drive off her for a moment.
+                s.engagedUntilMs = now + 400;
+            }
+            else
+            {
+                // Genuinely safe -> stand down to a docile, smooth follow. Un-latch the attack
+                // state ONCE on the transition, drop onto the player's friendly team, and let the
+                // per-frame follow take over (engagedUntil cleared).
+                if (s.combatPhase != 0)
+                {
+                    StopCharacterAggressive(twin);
+                    MercunaStop(twin); // clear her combat move so the follow can re-issue cleanly
+                    WriteAiTargetField(twin, nullptr);
+                    SetAiTargetEnemy(twin, nullptr, true);
+                    if (UObject* ctrl = GetAiController(twin))
+                    {
+                        SetControllerTargetEnemy(ctrl, nullptr, true);
+                        SetControllerAggressive(ctrl, false);
+                    }
+                    SwitchAiTeamFriendlyTo(twin, player);
+                    s.lastFriendlyMs = now;
+                    s.combatPhase = 0;
+                }
+                else if (now - s.lastFriendlyMs > 1000)
+                {
+                    SwitchAiTeamFriendlyTo(twin, player);
+                    s.lastFriendlyMs = now;
+                }
+                s.target = nullptr;
+                s.engagedUntilMs = 0;
+            }
+        }
+
+        static ULONGLONG lastTwinLog = 0;
+        if (now - lastTwinLog > 3000)
+        {
+            lastTwinLog = now;
+            LOG("TwinCombat: twins=%zu threats=%zu dist=%.1fm engage=%d threatDist=%.1fm nearestAny=%.1fm phase=%d air=%d merc=%d issues=%d aggr=%d",
+                twins.size(), threats.size(), dbgDist, dbgEngage, dbgThreatDist, dbgNearestAny,
+                dbgPhase, dbgAir, dbgMerc, dbgMercCount, squadAggr ? 1 : 0);
+        }
+
+        // Prune dead Twins from the state map (bounded).
+        if (g_twin.size() > 32)
+            for (auto it = g_twin.begin(); it != g_twin.end(); )
+            { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_twin.erase(it); }
     }
 
     // Register a freshly spawned ally into the squad (locked, dedup + cap).
@@ -4438,6 +4863,434 @@ namespace
     }
 
     // =======================================================================
+    //  HORDE ROUNDS  --  arena wave survival (HOSTILE, killable robots)
+    // -----------------------------------------------------------------------
+    //  This is a SEPARATE system from the squad/bodyguard code. It reuses the
+    //  same proven spawn primitive (AIBlueprintHelperLibrary.SpawnAIFromClass,
+    //  exactly as SpawnAndRegisterAlly uses it -- read, not modified), but where
+    //  the bodyguard path registers the spawn as a friendly, invincible ally,
+    //  the horde path does the OPPOSITE: it parks the robot Hostile to the player
+    //  and force-aggros it onto you, and it NEVER joins the squad -- so the squad's
+    //  "keep allies topped to full health" logic can't touch it and it stays fully
+    //  killable (the "not in godmode" requirement). All of the live state below is
+    //  GAME-THREAD ONLY (driven from the AI pump), guarded by atomics the menu reads.
+    // =======================================================================
+
+    // --- robot roster (the live wave) -------------------------------------
+    std::vector<UObject*> g_hordeEnemies;       // game-thread only (the AI pump)
+    std::atomic<bool>     g_hordeActive{ false };
+    std::atomic<int>      g_hordeAlive{ 0 };
+    std::atomic<int>      g_hordeKills{ 0 };
+    std::atomic<int>      g_hordeRound{ 0 };
+    std::atomic<int>      g_hordePending{ 0 };   // robots still to spawn this wave
+
+    constexpr int      kMaxHordeAlive   = 18;    // perf cap on concurrent live robots
+    constexpr int      kMaxHordePerWave = 40;    // hard cap on a single wave's budget
+    constexpr ULONGLONG kHordeSpawnMs   = 450;   // stream one robot per this window (never a hitch)
+    constexpr ULONGLONG kHordeAggroMs   = 700;   // re-assert each robot's player aggro at most this often
+    constexpr float    kHordeSpawnMinU  = 850.0f;// spawn ring: closest robots appear ~8.5m out
+    constexpr float    kHordeSpawnMaxU  = 1600.0f;//            farthest ~16m out
+
+    // Return point captured at run start so Stop / death can restore you exactly.
+    FVector   g_hordeReturnLoc{};
+    FRotator  g_hordeReturnRot{};
+    bool      g_hordeTeleported = false;         // did this run teleport (location != "Here")?
+    bool      g_hordeHaveReturn = false;
+
+    // Tiny self-contained RNG (avoids pulling in <cstdlib> / global rand state).
+    uint32_t HordeRand()
+    {
+        static uint32_t s = 0x9E3779B9u ^ (uint32_t)GetTickCount64();
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return s;
+    }
+    float HordeRandRange(float lo, float hi)
+    {
+        return lo + (hi - lo) * ((float)(HordeRand() & 0xFFFFFF) / (float)0x1000000);
+    }
+
+    // Resolve + cache the three save UFunctions so hkProcessEvent can swallow them by
+    // pointer while a run is active. Game thread (CachedFn walks GObjects on first use).
+    void ResolveSaveBlockFns()
+    {
+        if (!g_fnSaveProgress.load())
+            g_fnSaveProgress.store(CachedFn(AH::Fn_AHGameInstance_SaveProgress));
+        if (!g_fnSavePersistentData.load())
+            g_fnSavePersistentData.store(CachedFn(AH::Fn_AHGameInstance_SavePersistentData));
+        if (!g_fnCheckpointSaveProgress.load())
+            g_fnCheckpointSaveProgress.store(CachedFn(AH::Fn_CheckpointObject_SaveProgress));
+    }
+
+    // --- arena "locations" DB (persisted to AtomicHeartMenu_arenas.json) ----
+    // Index 0 is the implicit "Here" (no teleport); the vector holds the user-saved
+    // spots only. Each is a captured pawn position + control rotation.
+    struct ArenaLocation { std::string name; FVector loc{}; FRotator rot{}; };
+    std::vector<ArenaLocation> g_arenas;            // guarded by g_arenasMutex
+    std::mutex                 g_arenasMutex;
+    bool                       g_arenasLoaded = false;
+
+    bool BuildArenaDbPath(char out[MAX_PATH])
+    {
+        char exePath[MAX_PATH]{};
+        DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH)
+            return false;
+        strcpy_s(out, MAX_PATH, exePath);
+        char* slash  = strrchr(out, '\\');
+        char* slash2 = strrchr(out, '/');
+        if (slash2 && (!slash || slash2 > slash)) slash = slash2;
+        if (!slash)
+            return false;
+        slash[1] = '\0';
+        strcat_s(out, MAX_PATH, "AtomicHeartMenu_arenas.json");
+        return true;
+    }
+
+    // Caller MUST hold g_arenasMutex. Loads once; missing file => empty list.
+    void LoadArenas()
+    {
+        if (g_arenasLoaded)
+            return;
+        g_arenasLoaded = true;
+        char path[MAX_PATH]{};
+        if (!BuildArenaDbPath(path))
+            return;
+        std::ifstream f(path, std::ios::binary);
+        if (!f)
+            return;
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+        size_t pos = 0;
+        std::string name, coords;
+        while (NextKeyString(text, pos, "name", name) && NextKeyString(text, pos, "pos", coords))
+        {
+            ArenaLocation a; a.name = name;
+            // "pos" is "X Y Z Yaw" -- a compact, human-editable record.
+            float yaw = 0.0f;
+            if (sscanf_s(coords.c_str(), "%f %f %f %f", &a.loc.X, &a.loc.Y, &a.loc.Z, &yaw) >= 3)
+            {
+                a.rot.Yaw = yaw;
+                g_arenas.push_back(a);
+            }
+        }
+        LOG("Arena DB: loaded %d location(s)", (int)g_arenas.size());
+    }
+
+    // Caller MUST hold g_arenasMutex.
+    void SaveArenas()
+    {
+        char path[MAX_PATH]{};
+        if (!BuildArenaDbPath(path))
+            return;
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f)
+        {
+            LOG("Arena DB: cannot open %s for write", path);
+            return;
+        }
+        f << "{\n  \"arenas\": [\n";
+        for (size_t i = 0; i < g_arenas.size(); ++i)
+        {
+            char coords[96];
+            sprintf_s(coords, "%.1f %.1f %.1f %.1f",
+                      g_arenas[i].loc.X, g_arenas[i].loc.Y, g_arenas[i].loc.Z, g_arenas[i].rot.Yaw);
+            f << "    { \"name\": \"" << JsonEscape(g_arenas[i].name)
+              << "\", \"pos\": \"" << coords << "\" }"
+              << (i + 1 < g_arenas.size() ? "," : "") << "\n";
+        }
+        f << "  ]\n}\n";
+        f.close();
+        LOG("Arena DB: wrote %d location(s)", (int)g_arenas.size());
+    }
+
+    // Pick a robot class to spawn: a LOADED, combat-capable enemy type from the AI
+    // discovery cache (same safety guarantee as the spawn dropdown -- only ever a
+    // live, fully-configured class, never a bare native template). Prefers obvious
+    // robot/enemy names and skips bosses (Twins) so a wave is rank-and-file robots.
+    // Returns null if nothing suitable is loaded (caller tells the player to move
+    // near some robots so their type streams in). Game thread.
+    UClass* PickHordeRobotClass()
+    {
+        std::vector<AiCachedActor> snap = CopyAiSnapshot();
+        std::vector<UClass*> preferred; // robot-named combat classes
+        std::vector<UClass*> anyCombat;  // any combat-capable class (fallback)
+        static const char* kBossSkip[]  = { "twin", "boss", "natasha", "plyush", "hlebozavod" };
+        static const char* kRobotHint[] = { "robot", "vov", "pchela", "belyash", "gatling",
+                                            "hedgie", "ezhik", "mendel", "lutsh", "soldier",
+                                            "rotorobot", "fryer", "suslik", "laser" };
+        for (const AiCachedActor& e : snap)
+        {
+            if (!AiUsable(e.actor) || e.healthFrac == 0.0f) continue;
+            if (!AiIsCombatCapable(e.actor)) continue;
+            UClass* c = e.actor->Class();
+            if (!Mem::IsReadable(c, 0x30)) continue;
+            std::string n = c->GetName();
+            for (char& ch : n) ch = (char)std::tolower((unsigned char)ch);
+            bool boss = false;
+            for (const char* k : kBossSkip) if (n.find(k) != std::string::npos) { boss = true; break; }
+            if (boss) continue;
+            // dedupe within each bucket
+            auto has = [](const std::vector<UClass*>& v, UClass* x){ for (UClass* q : v) if (q == x) return true; return false; };
+            if (!has(anyCombat, c)) anyCombat.push_back(c);
+            bool robot = false;
+            for (const char* k : kRobotHint) if (n.find(k) != std::string::npos) { robot = true; break; }
+            if (robot && !has(preferred, c)) preferred.push_back(c);
+        }
+        const std::vector<UClass*>& pool = !preferred.empty() ? preferred : anyCombat;
+        if (pool.empty())
+            return nullptr;
+        return pool[HordeRand() % (uint32_t)pool.size()];
+    }
+
+    // Spawn ONE hostile robot around the player and force it to hunt you. Mirrors
+    // SpawnAndRegisterAlly's use of SpawnAIFromClass but: rings the spawn around you,
+    // does NOT add to the squad, and seeds combat AGAINST the player. Game thread.
+    bool SpawnHordeEnemy(UClass* cls)
+    {
+        if (!Mem::IsReadable(cls, 0x30))
+            return false;
+        UObject* lib = CachedObject(AH::Obj_AIBlueprintHelper);
+        UFunction* fn = CachedClassFn(AH::Cls_AIBlueprintHelper, "SpawnAIFromClass");
+        if (!Mem::IsReadable(lib, 0x30) || !fn)
+            return false;
+
+        UObject* player = nullptr;
+        FVector playerLoc{};
+        if (!ReadLocalPawnLocationFast(playerLoc, &player) || !Mem::IsReadable(player, 0x30))
+            return false;
+        UObject* world = GetWorld();
+        if (!Mem::IsReadable(world, 0x30))
+            return false;
+
+        // Ring placement: a random bearing + radius so a wave surrounds you instead
+        // of stacking on one spot. Z lifted so SnapCapsuleToGround drops it to the floor.
+        float ang    = HordeRandRange(0.0f, 6.2831853f);
+        float radius = HordeRandRange(kHordeSpawnMinU, kHordeSpawnMaxU);
+        FVector spawnLoc = playerLoc;
+        spawnLoc.X += cosf(ang) * radius;
+        spawnLoc.Y += sinf(ang) * radius;
+        spawnLoc.Z += 110.0f;
+        float faceYaw = (ang + 3.1415927f) * 57.29577951f; // face back toward the player
+
+        P_SpawnAIFromClass p{};
+        p.WorldContextObject = world;
+        p.PawnClass = cls;
+        p.BehaviorTree = nullptr;
+        p.Location = spawnLoc;
+        p.Rotation = { 0.0f, faceYaw, 0.0f };
+        p.bNoCollisionFail = true;
+        p.Owner = nullptr; // an ENEMY -- not owned by the player
+
+        lib->ProcessEvent(fn, &p);
+        UObject* robot = static_cast<UObject*>(p.ReturnValue);
+        if (!Mem::IsReadable(robot, 0x30))
+        {
+            LOG("SpawnHordeEnemy: SpawnAIFromClass returned null");
+            return false;
+        }
+
+        g_hordeEnemies.push_back(robot);
+        g_hordeAlive = (int)g_hordeEnemies.size();
+
+        try
+        {
+            ForceActorVisible(robot);
+            SnapAiToGround(robot);
+            // Seed combat AGAINST the player: target = player, aggressive, team forced
+            // Hostile-to-player. The per-pump UpdateHorde keeps re-asserting it.
+            InjectAttack(robot, player, player, 2 /*ETeamAttitude::Hostile*/, -1);
+        }
+        catch (...) { LOG("SpawnHordeEnemy: fixup threw (ignored)"); }
+        RequestAiDiscovery();
+        LOG("SpawnHordeEnemy: spawned hostile robot=%p (alive=%d)", (void*)robot, g_hordeAlive.load());
+        return true;
+    }
+
+    // Remove every roster robot. destroy=true deletes them from the world outright
+    // (clean arena teardown); destroy=false just forgets them (used when the level is
+    // already tearing down, e.g. after a death-reload, so we never poke a dying actor).
+    void HordeClearEnemies(bool destroy)
+    {
+        UFunction* destroyFn = destroy ? CachedFn(AH::Fn_K2DestroyActor) : nullptr;
+        for (UObject* r : g_hordeEnemies)
+        {
+            if (!Mem::IsReadable(r, 0x30)) continue;
+            try
+            {
+                if (destroy && destroyFn)
+                {
+                    uint8_t noParams = 0;
+                    r->ProcessEvent(destroyFn, &noParams);
+                }
+                else
+                {
+                    SetCharacterHealthZero(r); // safe direct write
+                }
+            }
+            catch (...) {}
+            g_inject.erase(r);
+            g_engagedUntilMs.erase(r);
+            g_lastThreatMs.erase(r);
+            g_origTeam.erase(r);
+        }
+        g_hordeEnemies.clear();
+        g_hordeAlive = 0;
+    }
+
+    // Begin a wave: set the spawn budget (it streams in over UpdateHorde ticks).
+    void HordeStartWave(int round)
+    {
+        g_hordeRound = round;
+        int budget = g_state.hordePerRound + (round - 1) * 2; // each wave adds 2 robots
+        if (budget < 1) budget = 1;
+        if (budget > kMaxHordePerWave) budget = kMaxHordePerWave;
+        g_hordePending = budget;
+        LOG("Horde: wave %d begins (budget=%d)", round, budget);
+    }
+
+    // Tear the run down cleanly. restorePos teleports you back to the run-start point
+    // (used by Stop); on a death we skip the teleport and let the game's own death /
+    // reload flow run, but we ALWAYS clear robots and re-enable saving.
+    void HordeEndRun(bool restorePos, bool destroyEnemies, const char* why)
+    {
+        LOG("Horde: ending run (%s) restorePos=%d", why ? why : "?", restorePos);
+        g_hordeActive = false;
+        g_hordePending = 0;
+        g_hordeRound = 0;
+        HordeClearEnemies(destroyEnemies);
+
+        // Re-enable saving FIRST so the game can checkpoint normally again.
+        g_blockSaves = false;
+
+        if (restorePos && g_hordeHaveReturn && g_hordeTeleported)
+        {
+            UObject* pawn = GetLocalPawn();
+            if (Mem::IsReadable(pawn, 0x30))
+            {
+                SetActorLocation(pawn, g_hordeReturnLoc, true);
+                RefreshFlyStreaming(pawn, true); // make the original area stream back in
+                LOG("Horde: restored player to %.0f %.0f %.0f",
+                    g_hordeReturnLoc.X, g_hordeReturnLoc.Y, g_hordeReturnLoc.Z);
+            }
+        }
+        g_hordeTeleported = false;
+        g_hordeHaveReturn = false;
+        g_state.hordeActive = false;
+    }
+
+    // The per-pump heartbeat (game thread, from DrainAiGameThreadWork). Spawns the
+    // wave gradually, keeps every robot aggro'd on you, prunes the dead, advances
+    // waves, and -- the safety rail -- HALTS the instant you die.
+    void UpdateHorde()
+    {
+        if (!g_hordeActive.load())
+            return;
+
+        UObject* player = nullptr;
+        FVector playerLoc{};
+        if (!ReadLocalPawnLocationFast(playerLoc, &player) || !Mem::IsReadable(player, 0x30))
+            return; // pawn transiently gone (loading) -- try again next pump
+
+        // --- DEATH HALT: if you're dead, stop everything and clean up immediately.
+        bool dead = false;
+        float cur = 0.0f, mx = 0.0f;
+        if (ReadCharacterHealth(player, cur, mx) && mx > 0.001f && cur <= 0.0f)
+            dead = true;
+        uint8_t* pb = reinterpret_cast<uint8_t*>(player);
+        if (!dead && Mem::IsReadable(pb + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(pb + AH::Char_bIsDead))
+            dead = true;
+        if (dead)
+        {
+            LOG("Horde: PLAYER DIED -- halting run + cleaning up");
+            // Don't teleport a dying/reloading pawn; just forget robots (the level may
+            // be reloading) and re-enable saving so the game recovers normally.
+            HordeEndRun(false /*restorePos*/, false /*destroyEnemies*/, "player death");
+            return;
+        }
+
+        // --- prune dead robots, count kills ---------------------------------
+        ULONGLONG now = GetTickCount64();
+        std::vector<UObject*> survivors;
+        survivors.reserve(g_hordeEnemies.size());
+        for (UObject* r : g_hordeEnemies)
+        {
+            bool aliveRobot = false;
+            if (Mem::IsReadable(r, 0x30) && AiUsable(r))
+            {
+                float rc = 0.0f, rm = 0.0f;
+                if (ReadCharacterHealth(r, rc, rm))
+                    aliveRobot = (rm <= 0.001f) ? true : (rc > 0.0f); // unknown max -> assume alive
+                else
+                    aliveRobot = true;
+            }
+            if (aliveRobot)
+            {
+                survivors.push_back(r);
+            }
+            else
+            {
+                g_hordeKills = g_hordeKills.load() + 1;
+                g_inject.erase(r);
+                g_engagedUntilMs.erase(r);
+                g_lastThreatMs.erase(r);
+                g_origTeam.erase(r);
+            }
+        }
+        if (survivors.size() != g_hordeEnemies.size())
+            g_hordeEnemies.swap(survivors);
+        g_hordeAlive = (int)g_hordeEnemies.size();
+
+        // --- keep every survivor hunting YOU (throttled re-aggro) -----------
+        for (UObject* r : g_hordeEnemies)
+        {
+            if (!Mem::IsReadable(r, 0x30)) continue;
+            InjectState& s = g_inject[r];
+            if (s.target != player || now - s.lastHeavyMs > kHordeAggroMs)
+            {
+                try { InjectAttack(r, player, player, 2 /*Hostile*/, -1); } catch (...) {}
+            }
+        }
+
+        // --- stream the wave in (one robot per window, respecting the cap) --
+        static ULONGLONG lastSpawnMs = 0;
+        if (g_hordePending.load() > 0 && g_hordeAlive.load() < kMaxHordeAlive &&
+            now - lastSpawnMs >= kHordeSpawnMs)
+        {
+            lastSpawnMs = now;
+            UClass* cls = PickHordeRobotClass();
+            if (cls)
+            {
+                if (SpawnHordeEnemy(cls))
+                    g_hordePending = g_hordePending.load() - 1;
+            }
+            else
+            {
+                static ULONGLONG lastWarnMs = 0;
+                if (now - lastWarnMs > 3000)
+                {
+                    lastWarnMs = now;
+                    LOG("Horde: no robot models loaded -- move near some robots so their type streams in");
+                }
+            }
+        }
+
+        // --- wave clear -> advance (or idle until the player starts the next) ---
+        if (g_hordePending.load() == 0 && g_hordeAlive.load() == 0)
+        {
+            if (g_state.hordeAutoAdvance)
+            {
+                static ULONGLONG clearedAtMs = 0;
+                if (clearedAtMs == 0) clearedAtMs = now;
+                if (now - clearedAtMs > 2500) // brief breather between waves
+                {
+                    clearedAtMs = 0;
+                    HordeStartWave(g_hordeRound.load() + 1);
+                }
+            }
+        }
+    }
+
+    // =======================================================================
     //  GAME-THREAD AI PUMP  --  why every AI ProcessEvent runs here
     // -----------------------------------------------------------------------
     //  UE4's ProcessEvent and the behaviour tree / blackboard are NOT thread
@@ -4461,6 +5314,8 @@ namespace
         UpdateAiAutoControls();    // auto follow / freeze
         UpdateAiCombatInjection(); // continuous fight / bodyguard injection
         DriveSpawnedAllies();      // spawned allies = permanent bodyguards
+        DriveTwinCombat();         // the Twin runs a SEPARATE, fully-controlled combat brain
+        UpdateHorde();             // horde rounds: spawn waves, re-aggro, prune, death-halt
     }
 
     // Render thread: keep at most one bounded AI pump in flight on the game
@@ -4473,6 +5328,7 @@ namespace
 
         bool aiActive = st.aiFightEachOther || st.aiFreezeNearby ||
                         g_spawnedAllyCount.load() > 0 ||   // squad members need driving
+                        g_hordeActive.load() ||            // a horde run drives waves every pump
                         g_aiPendingCount.load() > 0 ||
                         g_spawnQueueCount.load() > 0 ||
                         g_aiDeferredKind.load() != (int)AiQueuedKind::None;
@@ -4516,7 +5372,8 @@ namespace
         const auto& st = Features::Get();
         bool discoveryRequested = g_aiDiscoveryRequested.exchange(false);
         bool featuresWantAi = st.espEnabled || st.aiFreezeNearby || st.aiFightEachOther ||
-                              g_spawnedAllyCount.load() > 0;   // squad needs the cache fresh
+                              g_spawnedAllyCount.load() > 0 ||  // squad needs the cache fresh
+                              g_hordeActive.load();             // horde picks robot classes from the cache
         bool pendingWork = g_aiPendingCount.load() > 0 || g_aiDeferredKind.load() != (int)AiQueuedKind::None;
         bool wantsScan = featuresWantAi || pendingWork || discoveryRequested;
         if (!wantsScan)
@@ -9032,6 +9889,163 @@ int Features::AiSpawnedAllyCount()
 }
 
 // =======================================================================
+//  HORDE ROUNDS  --  public API (the Horde Rounds tab calls these)
+// -----------------------------------------------------------------------
+//  Start/Stop marshal onto the game thread (they teleport / spawn / touch the
+//  no-save guard); the count getters are plain atomic reads for the menu. The
+//  location DB calls run on the calling (render) thread under their own mutex,
+//  exactly like the saved-character DB.
+// =======================================================================
+void Features::HordeStart()
+{
+    if (!G::sdkReady.load()) { LOG("HordeStart: SDK not ready"); return; }
+    if (!InstallProcessEventHook())
+    {
+        LOG("HordeStart: ProcessEvent hook unavailable (try again once in-game)");
+        return;
+    }
+
+    // Resolve the selected location on THIS thread (don't touch the DB from the
+    // game thread). loc 0 = "Here" (no teleport); >0 = a saved arena.
+    bool teleport = false;
+    FVector dest{};
+    int loc = g_state.hordeLocation;
+    if (loc > 0)
+    {
+        std::lock_guard<std::mutex> lk(g_arenasMutex);
+        LoadArenas();
+        int idx = loc - 1;
+        if (idx >= 0 && idx < (int)g_arenas.size())
+        { dest = g_arenas[idx].loc; teleport = true; }
+    }
+
+    bool advanceWave = g_hordeActive.load(); // already running -> just push the next wave
+
+    QueueGameThread([teleport, dest, advanceWave]()
+    {
+        try
+        {
+            ResolveSaveBlockFns();
+
+            if (advanceWave)
+            {
+                HordeStartWave(g_hordeRound.load() + 1);
+                return;
+            }
+
+            // Fresh run: capture the return point, optionally teleport into the arena,
+            // arm the no-save guard, and begin wave 1.
+            UObject* player = nullptr; FVector ploc{};
+            ReadLocalPawnLocationFast(ploc, &player);
+            g_hordeReturnLoc = ploc;
+            FRotator rr{}; if (GetControlRotation(rr)) g_hordeReturnRot = rr;
+            g_hordeHaveReturn = Mem::IsReadable(player, 0x30);
+            g_hordeTeleported = false;
+            g_hordeKills = 0;
+
+            if (teleport && Mem::IsReadable(player, 0x30))
+            {
+                if (SetActorLocation(player, dest, true))
+                {
+                    g_hordeTeleported = true;
+                    RefreshFlyStreaming(player, true);
+                    LOG("Horde: teleported to arena %.0f %.0f %.0f", dest.X, dest.Y, dest.Z);
+                }
+            }
+
+            g_blockSaves = true;          // arm the no-save guard (hkProcessEvent swallows saves)
+            g_hordeActive = true;
+            g_state.hordeActive = true;
+            HordeStartWave(1);
+            LOG("Horde: run STARTED (saves blocked)");
+        }
+        catch (...) { LOG("HordeStart: exception (ignored)"); }
+    });
+}
+
+void Features::HordeStop()
+{
+    InstallProcessEventHook();
+    QueueGameThread([]()
+    {
+        // Always safe to call -- restores position, kills robots, re-enables saving.
+        try { HordeEndRun(true /*restorePos*/, true /*destroyEnemies*/, "user stop"); }
+        catch (...) { LOG("HordeStop: exception (ignored)"); }
+    });
+}
+
+bool Features::HordeIsActive()    { return g_hordeActive.load(); }
+int  Features::HordeRound()       { return g_hordeRound.load(); }
+int  Features::HordeAliveCount()  { return g_hordeAlive.load(); }
+int  Features::HordeKillCount()   { return g_hordeKills.load(); }
+int  Features::HordePendingCount(){ return g_hordePending.load(); }
+
+const char* Features::HordeStatusText()
+{
+    static char buf[176];
+    if (!g_hordeActive.load())
+    {
+        snprintf(buf, sizeof(buf), "Idle -- pick a location and start a run.");
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "Wave %d   alive %d   queued %d   kills %d   [SAVES BLOCKED]",
+             g_hordeRound.load(), g_hordeAlive.load(), g_hordePending.load(), g_hordeKills.load());
+    return buf;
+}
+
+int Features::HordeLocationCount()
+{
+    std::lock_guard<std::mutex> lk(g_arenasMutex);
+    LoadArenas();
+    return 1 + (int)g_arenas.size(); // index 0 is the implicit "Here"
+}
+
+const char* Features::HordeLocationName(int i)
+{
+    static thread_local std::string s;
+    if (i == 0) { s = "Here (fight in place)"; return s.c_str(); }
+    std::lock_guard<std::mutex> lk(g_arenasMutex);
+    LoadArenas();
+    int idx = i - 1;
+    if (idx < 0 || idx >= (int)g_arenas.size()) { s = "?"; return s.c_str(); }
+    s = g_arenas[idx].name.empty() ? "(unnamed arena)" : g_arenas[idx].name;
+    return s.c_str();
+}
+
+void Features::HordeSaveLocationHere(const char* name)
+{
+    if (!G::sdkReady.load()) { LOG("HordeSaveLocationHere: SDK not ready"); return; }
+    UObject* pawn = GetLocalPawn();
+    FVector loc{};
+    if (!Mem::IsReadable(pawn, 0x30) || !ReadActorLocation(pawn, loc))
+    {
+        LOG("HordeSaveLocationHere: no pawn / location");
+        return;
+    }
+    ArenaLocation a;
+    a.name = (name && *name) ? name : "Arena";
+    a.loc = loc;
+    FRotator rot{}; if (GetControlRotation(rot)) a.rot = rot;
+    std::lock_guard<std::mutex> lk(g_arenasMutex);
+    LoadArenas();
+    g_arenas.push_back(a);
+    SaveArenas();
+    LOG("HordeSaveLocationHere: saved '%s' @ %.0f %.0f %.0f", a.name.c_str(), loc.X, loc.Y, loc.Z);
+}
+
+void Features::HordeDeleteLocation(int i)
+{
+    if (i < 1) return; // index 0 ("Here") can't be deleted
+    std::lock_guard<std::mutex> lk(g_arenasMutex);
+    LoadArenas();
+    int idx = i - 1;
+    if (idx < 0 || idx >= (int)g_arenas.size()) return;
+    LOG("HordeDeleteLocation: removed '%s'", g_arenas[idx].name.c_str());
+    g_arenas.erase(g_arenas.begin() + idx);
+    SaveArenas();
+}
+
+// =======================================================================
 //  SQUAD / SELECTION / DISPATCH  --  the AI-control core
 // =======================================================================
 int Features::AiSquadCount() { return g_spawnedAllyCount.load(); }
@@ -9840,13 +10854,37 @@ static bool MercunaMoveToPlayer(UObject* ai, UObject* player, float endDistU, fl
     UObject* nav = GetMercunaNavComp(ai);
     UFunction* fn = CachedFn(AH::Fn_Mercuna_MoveToActor);
     if (!Mem::IsReadable(nav, 0x30) || !fn || !Mem::IsReadable(player, 0x30))
+    {
+        static ULONGLONG lg = 0; ULONGLONG n = GetTickCount64();
+        if (n - lg > 2000) { lg = n; LOG("Mercuna MoveToActor SKIP: nav=%p fn=%p target=%p (game can't accept the move)", (void*)nav, (void*)fn, (void*)player); }
         return false;
+    }
     struct { void* Actor; float EndDistance; float Speed; bool UsePartialPath; uint8_t pad[7]; } p{};
     p.Actor = player;
     p.EndDistance = endDistU;
     p.Speed = speed;
     p.UsePartialPath = true;
-    try { nav->ProcessEvent(fn, &p); } catch (...) { return false; }
+    try { nav->ProcessEvent(fn, &p); }
+    catch (...) { LOG("Mercuna MoveToActor EXCEPTION: nav=%p target=%p endDist=%.0f", (void*)nav, (void*)player, endDistU); return false; }
+    return true;
+}
+
+// Cancel a pawn's current Mercuna move. Mercuna MoveToActor is a CONTINUOUS "follow this
+// actor" order, so re-issuing it every pump stacks path requests (lag grows linearly until
+// she stalls). We issue MoveToActor once and call this to cleanly END the move when she
+// should hold or stand down. Game thread; crash-safe (guarded, /EHa-wrapped).
+static bool MercunaStop(UObject* ai)
+{
+    UObject* nav = GetMercunaNavComp(ai);
+    UFunction* fn = CachedFn(AH::Fn_Mercuna_Stop);
+    if (!Mem::IsReadable(nav, 0x30) || !fn)
+    {
+        static ULONGLONG lg = 0; ULONGLONG n = GetTickCount64();
+        if (n - lg > 2000) { lg = n; LOG("Mercuna Stop SKIP: nav=%p fn=%p", (void*)nav, (void*)fn); }
+        return false;
+    }
+    uint8_t noParams = 0;
+    try { nav->ProcessEvent(fn, &noParams); } catch (...) { LOG("Mercuna Stop EXCEPTION: nav=%p", (void*)nav); return false; }
     return true;
 }
 
@@ -9879,6 +10917,175 @@ static std::unordered_map<UObject*, unsigned long long> g_navReissueMs;
 //  Result: she uses her own walk/run animation + obstacle avoidance to come to you.
 //  Game-thread only (these are ProcessEvent dispatches). Crash-safe: AiUsable-gated,
 //  IsReadable-guarded, every setter blackboard-gated, /EHa-wrapped caller.
+// =======================================================================
+//  TWIN FOLLOW  --  per-frame, game thread (the smooth, controlled locomotion)
+// -----------------------------------------------------------------------
+//  The "move" half of the Twin super-bodyguard, run every frame right after the normal
+//  squad follow (which SKIPS Twins). It recreates the smoothness of her native follow:
+//   * While she's FIGHTING (engagedUntilMs stamped by the brain) or AIRBORNE (movement_mode
+//     5, mid ability/flight) we DON'T touch her -- her own combat AI moves + attacks +
+//     lands cleanly. Yanking her here was half the jank, and re-pinning nav mid-flight was
+//     the "flying bugs out".
+//   * Otherwise we drive a STABLE ring-follow: pin to ground nav ONCE (so FollowLocation
+//     works and she doesn't hover), and move her with hysteresis + a throttled goal so the
+//     destination doesn't jitter every frame (that per-frame goal swing + ForceFollow toggle
+//     was the start/stop/twitch). She faces her travel direction while moving (focus cleared)
+//     and turns to watch you when she stops -- exactly like her native locomotion.
+//  Game-thread only. Crash-safe: every read IsReadable-guarded, every setter blackboard-gated.
+static void DriveTwinsFollowGameThread()
+{
+    using namespace UE;
+    UObject* player = nullptr;
+    FVector  playerLoc{};
+    if (!ReadLocalPawnLocationFast(playerLoc, &player) || !Mem::IsReadable(player, 0x30))
+        return;
+
+    std::vector<UObject*> squad;
+    { std::lock_guard<std::mutex> lk(g_squadMutex); squad = g_spawnedAllies; }
+
+    float stopM = Features::Get().aiFollowStopM;
+    if (stopM < 0.5f) stopM = 0.5f;
+    if (stopM > 15.0f) stopM = 15.0f;
+    const float stopU  = stopM * kUnitsPerMetre;
+    const float startU = stopU + kTwinFollowBandM * kUnitsPerMetre; // hysteresis outer ring
+    ULONGLONG now = GetTickCount64();
+
+    float dbgDist = -1.0f, dbgVel = -1.0f; int dbgMoving = -1, dbgMode = -1, dbgMerc = -1, dbgMercCount = -1, dbgT3d = -1; const char* dbgSkip = "none";
+    bool dbgAny = false;
+
+    for (UObject* twin : squad)
+    {
+        if (!Mem::IsReadable(twin, 0x30) || twin == player) continue;
+        if (!IsMixedNavCharacter(twin) || !FollowPawnUsable(twin)) continue;
+        TwinState& s = g_twin[twin];
+        dbgAny = true;
+
+        // Never attack you, at the fast per-frame rate (raw, crash-safe).
+        {
+            uint8_t* gb = reinterpret_cast<uint8_t*>(twin);
+            if (Mem::IsReadable(gb + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
+                *reinterpret_cast<UObject**>(gb + AH::AICh_CachedTargetEnemy) == player)
+                *reinterpret_cast<UObject**>(gb + AH::AICh_CachedTargetEnemy) = nullptr;
+        }
+
+        // Fighting -> leave her to her own combat AI (movement + montages + flight).
+        if (s.engagedUntilMs > now) { s.followState = 0; dbgSkip = "engaged"; continue; }
+
+        // Airborne / mid-flight -> do NOT drive a ground follow into her; wait until she lands.
+        // (Re-pinning nav or overwriting move keys mid-air is what bugged her flight.)
+        uint8_t* base = reinterpret_cast<uint8_t*>(twin);
+        uint8_t* mv = Mem::IsReadable(base + AH::Char_CharacterMovement, sizeof(void*))
+            ? *reinterpret_cast<uint8_t**>(base + AH::Char_CharacterMovement) : nullptr;
+        if (Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+            dbgMode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
+        // If she's flying on her OWN (not our forced traversal), leave her be. While WE force
+        // flight to cross stairs (traverse3D), keep driving her with Mercuna.
+        if (dbgMode == AH::MOVE_Flying && !s.traverse3D)
+        { s.followState = 0; dbgSkip = "flying"; continue; }
+        if (Mem::IsReadable(mv + 0xE4, sizeof(FVector)))
+        { FVector v = *reinterpret_cast<FVector*>(mv + 0xE4); dbgVel = sqrtf(v.X*v.X + v.Y*v.Y + v.Z*v.Z); }
+
+        // (tick + brisk walk speed + GROUND-nav pin are maintained by the 5 Hz brain.)
+        // UNPIN her idle schedule so the BT actually runs the follow branch -- without this she
+        // runs the schedule branch and ignores the follow keys (moving=1 but vel=0).
+        UnpinTwinSchedule(twin);
+
+        FVector twinLoc{};
+        if (!ReadActorLocationFast(twin, twinLoc)) continue;
+        FVector to{ playerLoc.X - twinLoc.X, playerLoc.Y - twinLoc.Y, playerLoc.Z - twinLoc.Z };
+        float dist = sqrtf(to.X * to.X + to.Y * to.Y + to.Z * to.Z);
+
+        UObject* ctrl = GetAiController(twin);
+        if (!ctrl) continue;
+        SetControllerTargetAlly(ctrl, player);
+
+        // Hysteresis: start moving only when BEYOND the outer band, stop when inside the ring.
+        // This stable band (not a per-frame "dist > ring" flip) kills the start/stop twitch.
+        if (s.moving) { if (dist <= stopU)  s.moving = false; }
+        else          { if (dist >  startU) s.moving = true;  }
+
+        dbgDist = dist / kUnitsPerMetre; dbgMoving = s.moving ? 1 : 0; dbgSkip = "drive"; dbgMercCount = s.mercCount; dbgT3d = s.traverse3D ? 1 : 0;
+
+        // ForceFollowLocation = constant within each state (hysteresis), so no toggle jank.
+        SetControllerForceFollow(ctrl, s.moving);
+
+        if (s.moving)
+        {
+            // STUCK / STAIRS: track whether she's CLOSING distance. If she stalls (vel~0) while
+            // still far, the ground path can't reach you (down stairs / across a gap) -> FORCE
+            // FLIGHT so Mercuna paths her through the air. Once she's caught up, ground her ONCE
+            // (single re-pin on landing -- the REPEATED re-pin is what froze her animations).
+            if (s.closeBestM < 0.0f || dbgDist < s.closeBestM - 0.5f)
+            { s.closeBestM = dbgDist; s.closeBestMs = now; }
+            bool stuck = (now - s.closeBestMs > 3000) && dbgDist > 10.0f && dbgVel >= 0.0f && dbgVel < 50.0f;
+            if (stuck && !s.traverse3D)
+            { s.traverse3D = true; ForceFlightNavIfMixed(twin); s.lastGoalMs = 0;
+              LOG("TwinFollow: STUCK %.1fm vel=%.0f -> FORCE FLIGHT", dbgDist, dbgVel); }
+            else if (s.traverse3D && dbgDist <= (stopM + kTwinFollowBandM))
+            { s.traverse3D = false; ForceGroundNavIfMixed(twin); s.lastGoalMs = 0;   // ground ONCE on recovery
+              LOG("TwinFollow: recovered %.1fm -> GROUND once", dbgDist); }
+
+            // *** THE ACTUAL MOVER: Mercuna MoveToActor, re-targeted frequently. ***
+            // The Twin (unlike regular robots) HAS a MercunaNavigationComponent; Mercuna is the
+            // game's real pather. Frequent MoveToActor re-targeting is what moves her (a single
+            // order doesn't sustain her). MoveToActor STACKS path requests over time (lag grows
+            // linearly -> she stalls), so every few seconds FLUSH with a STANDALONE Stop on its
+            // own pump -- NEVER in the same pump as a Move (Stop+Move together cancels the move
+            // and she freezes, confirmed by the vel=0 logs). Between flushes, re-target on a timer.
+            if (now - s.lastFlushMs > 4000)
+            {
+                MercunaStop(twin);          // flush accumulated path requests (own pump, no Move)
+                s.lastFlushMs = now;
+            }
+            else if (now - s.lastGoalMs > 300)
+            {
+                dbgMerc = MercunaMoveToPlayer(twin, player, stopU, 600.0f) ? 1 : 0;
+                s.lastGoalMs = now; ++s.mercCount;
+            }
+            // Belt-and-braces BT follow keys (harmless if her BT ignores them).
+            float inv = dist > 1.0f ? 1.0f / dist : 0.0f;
+            FVector goal{ playerLoc.X - to.X * inv * stopU,
+                          playerLoc.Y - to.Y * inv * stopU,
+                          playerLoc.Z - to.Z * inv * stopU };
+            SetControllerFollowLocation(ctrl, goal);
+            SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal);
+            SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
+            SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
+            if (s.followState != 1)
+            {
+                ClearControllerFocus(ctrl);   // face travel direction while moving (natural)
+                SetControllerFollowSpeed(ctrl);
+                s.followState = 1;
+            }
+        }
+        else
+        {
+            // Within the ring -> STOP her Mercuna move (she should actually stop here) and watch
+            // you (guard stance). Set once on the transition. If she arrived while force-flying,
+            // ground her ONCE so she lands.
+            if (s.traverse3D)
+            { s.traverse3D = false; ForceGroundNavIfMixed(twin); LOG("TwinFollow: reached you while flying -> GROUND once"); }
+            if (s.followState != 2)
+            {
+                MercunaStop(twin);
+                FocusControllerOnActor(ctrl, player);
+                s.followState = 2;
+            }
+            s.closeBestM = -1.0f;
+        }
+    }
+
+    if (dbgAny)
+    {
+        static ULONGLONG lastFollowLog = 0;
+        if (now - lastFollowLog > 3000)
+        {
+            lastFollowLog = now;
+            LOG("TwinFollow: skip=%s dist=%.1fm moving=%d mode=%d vel=%.0f merc=%d issues=%d t3d=%d", dbgSkip, dbgDist, dbgMoving, dbgMode, dbgVel, dbgMerc, dbgMercCount, dbgT3d);
+        }
+    }
+}
+
 void DriveSquadVelocityGameThread()
 {
     using namespace UE;
@@ -9907,6 +11114,7 @@ void DriveSquadVelocityGameThread()
     {
         if (!Mem::IsReadable(ai, 0x30) || ai == player) continue;
         if (!AiUsable(ai)) continue; // AHAICharacter
+        if (IsMixedNavCharacter(ai)) continue; // Twins use their OWN per-frame follow (DriveTwinsFollowGameThread)
 
         // *** HARD never-attack-you guard, at the FAST 20Hz rate (the 5Hz pump alone
         // wasn't fast enough -- a guard you shot got a few hits in first). If its cached
@@ -10038,6 +11246,9 @@ void DriveSquadVelocityGameThread()
             followed, mercuna, unpinned, squad.size(),
             nearest >= 0.0f ? nearest / kUnitsPerMetre : -1.0f, nearVel, nearSched.c_str());
     }
+
+    // The Twin follows on her OWN dedicated, smooth path (the normal loop above skips her).
+    DriveTwinsFollowGameThread();
 }
 
 static void TickImpl()

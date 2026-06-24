@@ -280,6 +280,15 @@ namespace Offsets
         constexpr const char* Fn_Debug_PromoteAllActiveQuests  = "Function /Script/AtomicHeart.DebugSubsystem.PromoteAllActiveQuests";
         constexpr const char* Fn_Debug_CompleteAllActiveQuests = "Function /Script/AtomicHeart.DebugSubsystem.CompleteAllActiveQuests";
 
+        // Save triggers, swallowed in the ProcessEvent hook while a Horde Rounds
+        // arena run is active so the game NEVER writes a checkpoint mid-arena. The
+        // game saves through AHGameInstance.SaveProgress / SavePersistentData and
+        // CheckpointObject.SaveProgress; blocking all three covers checkpoint
+        // autosaves and the persistent-data write. Re-enabled the instant a run ends.
+        constexpr const char* Fn_AHGameInstance_SaveProgress       = "Function /Script/AtomicHeart.AHGameInstance.SaveProgress";
+        constexpr const char* Fn_AHGameInstance_SavePersistentData = "Function /Script/AtomicHeart.AHGameInstance.SavePersistentData";
+        constexpr const char* Fn_CheckpointObject_SaveProgress     = "Function /Script/AtomicHeart.CheckpointObject.SaveProgress";
+
         // BPC_MiniGameBase_C: the component that drives the interactive puzzle
         // minigames the DebugSubsystem trio does NOT cover (button grids, the
         // tri-way electric lockpick, radial/beam dials, etc.). Every puzzle
