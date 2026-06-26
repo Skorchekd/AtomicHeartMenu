@@ -12142,6 +12142,7 @@ struct HookNativeFollowState
     ULONGLONG lastTransitionMs = 0;
     ULONGLONG lastFocusClearMs = 0;
     ULONGLONG lastNativeMoveMs = 0;
+    ULONGLONG lastRecoveryMs = 0;
     bool mercuna = false;
     bool mixed = false;
     bool moving = false;
@@ -12149,11 +12150,15 @@ struct HookNativeFollowState
     bool restartPending = false;
     bool wasEngaged = false;
     bool mixedRecovery3D = false;
+    bool velocityFallback = false;
     uint8_t navigationMode = 0;
     ULONGLONG modeEnteredMs = 0;
     ULONGLONG mixedFallbackUntilMs = 0;
     uint32_t issues = 0;
     uint32_t restarts = 0;
+    uint32_t directInputs = 0;
+    uint32_t velocityWrites = 0;
+    uint32_t recoveries = 0;
 };
 static std::unordered_map<UObject*, HookNativeFollowState> g_hookNativeFollow;
 
@@ -12198,6 +12203,11 @@ static void YieldHookMovement(UObject* guard, HookNativeFollowState& s, bool sto
         SetHookControllerOwned(guard, false);
     }
     if (s.mixed) AiMovementHooks::SetMixedAutomatic(guard, true);
+    if (s.velocityFallback)
+    {
+        WriteHookFollowVelocity(guard, FVector{}, 0.0f);
+        s.velocityFallback = false;
+    }
     s.commandActive = false;
     s.restartPending = false;
     s.moving = false;
@@ -12296,17 +12306,53 @@ static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
             s.restartPending=false;
         }
         s.commandActive=status==3;
+        float speed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
+        bool directInput=false, velocityWrite=false, recoveredMovement=false;
+        float planar=sqrtf(delta.X*delta.X+delta.Y*delta.Y);
+        if(planar>1.0f)
+        {
+            FVector dir{delta.X/planar,delta.Y/planar,0.0f};
+            directInput=AddPawnMovementInput(guard,dir,1.0f);
+            if(directInput)
+            {
+                ++s.directInputs;
+                g_hookDirectMoveInputs.fetch_add(1,std::memory_order_relaxed);
+            }
+            if(speed<1.0f&&now-s.lastRecoveryMs>=750)
+            {
+                s.lastRecoveryMs=now;
+                recoveredMovement=RecoverHookFollowerMovement(guard,ctrl);
+                if(recoveredMovement)
+                {
+                    ++s.recoveries;
+                    g_hookMovementRecoveries.fetch_add(1,std::memory_order_relaxed);
+                }
+            }
+            if(s.velocityFallback||(s.commandActive&&speed<1.0f&&now-s.lastNativeMoveMs>=900))
+            {
+                if(!s.velocityFallback)
+                {
+                    s.velocityFallback=true;
+                    g_hookVelocityFallbacks.fetch_add(1,std::memory_order_relaxed);
+                    LOG("[AI-MOVE] Hook Twin combat velocity fallback armed guard=%p target=%p dist=%.1fm status=%u",
+                        (void*)guard,(void*)target,distance/kUnitsPerMetre,(unsigned)status);
+                }
+                velocityWrite=WriteHookFollowVelocity(guard,dir,650.0f);
+                if(velocityWrite)++s.velocityWrites;
+            }
+        }
         static ULONGLONG lastCombatChainLog=0;
         if(now-lastCombatChainLog>=2000)
         {
             lastCombatChainLog=now;
-            float speed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
-            LOG("[AI-CHAIN] TwinCombat guard=%p target=%p status=%u accepted=%d simple=%d pfc=%p move=%p cmc=%p nav=%p bind=%d mode=%u vel=%.1f",
-                (void*)guard,(void*)target,(unsigned)status,accepted?1:0,simpleFallback?1:0,(void*)chain.pathFollower,
+            LOG("[AI-CHAIN] TwinCombat guard=%p target=%p status=%u accepted=%d simple=%d direct=%d velWrite=%d recover=%d pfc=%p move=%p cmc=%p nav=%p bind=%d mode=%u vel=%.1f fallback=%d totals=%u/%u/%u",
+                (void*)guard,(void*)target,(unsigned)status,accepted?1:0,simpleFallback?1:0,
+                directInput?1:0,velocityWrite?1:0,recoveredMovement?1:0,(void*)chain.pathFollower,
                 (void*)chain.boundMovement,(void*)chain.characterMovement,(void*)chain.navData,
-                chain.boundMovement==chain.characterMovement?1:0,(unsigned)chain.movementMode,speed);
+                chain.boundMovement==chain.characterMovement?1:0,(unsigned)chain.movementMode,speed,
+                s.velocityFallback?1:0,s.directInputs,s.velocityWrites,s.recoveries);
         }
-        return s.commandActive;
+        return s.commandActive||directInput||velocityWrite;
     }
 
     // Robots: owned native MoveToActor (protected from game override).
@@ -12509,6 +12555,11 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
                 if (wasMoving) FocusControllerOnActor(ctrl, player);
                 s.commandActive = false;
+                if (s.velocityFallback)
+                {
+                    WriteHookFollowVelocity(guard, FVector{}, 0.0f);
+                    s.velocityFallback = false;
+                }
                 s.restartPending = false;
                 s.lastNativeMoveMs = 0;
                 static ULONGLONG lastHoldFailureLog = 0;
@@ -12525,16 +12576,19 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
             ++moving;
 
             bool restarting = false;
+            bool nativeIssueAllowed = true;
             if (s.restartPending)
             {
-                if (now < s.restartAtMs) continue;
-                s.restartPending = false;
-                s.lastIssueMs = 0;
-                s.lastNativeMoveMs = 0;
-                s.sampleMs = 0;
-                s.lastProgressMs = now;
-                restarting = true;
-                EnsureHookTwinGroundPathChain(guard, ctrl, true, chain);
+                if (now < s.restartAtMs) nativeIssueAllowed = false;
+                else
+                {
+                    s.restartPending = false;
+                    s.lastIssueMs = 0;
+                    s.lastNativeMoveMs = 0;
+                    s.sampleMs = 0;
+                    restarting = true;
+                    EnsureHookTwinGroundPathChain(guard, ctrl, true, chain);
+                }
             }
 
             float inv = planar > 1.0f ? 1.0f / planar : 0.0f;
@@ -12564,7 +12618,7 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
             bool nativeAccepted = false;
             bool simpleFallback = false;
             moveStatus = DirectControllerMoveStatus(ctrl);
-            if (moveStatus != 3 && now - s.lastNativeMoveMs >= 750)
+            if (nativeIssueAllowed && moveStatus != 3 && now - s.lastNativeMoveMs >= 750)
             {
                 s.lastNativeMoveMs = now;
                 nativeAccepted = MoveControllerToActor(ctrl, guard, player,
@@ -12577,6 +12631,47 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 }
             }
             s.commandActive = moveStatus == 3;
+            float chainSpeed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
+            bool directInput=false, velocityWrite=false, recoveredMovement=false;
+            float goalDx=goal.X-guardLoc.X, goalDy=goal.Y-guardLoc.Y;
+            float goalPlanar=sqrtf(goalDx*goalDx+goalDy*goalDy);
+            if(goalPlanar>1.0f)
+            {
+                FVector directDir{goalDx/goalPlanar,goalDy/goalPlanar,0.0f};
+                directInput=AddPawnMovementInput(guard,directDir,1.0f);
+                if(directInput)
+                {
+                    ++s.directInputs;
+                    g_hookDirectMoveInputs.fetch_add(1,std::memory_order_relaxed);
+                }
+
+                const bool hasSample=s.lastProgressMs!=0;
+                const bool noProgress=hasSample&&now-s.lastProgressMs>=900;
+                const bool nativeDead=hasSample&&s.commandActive&&chainSpeed<1.0f&&now-s.lastProgressMs>=650;
+                if((noProgress||nativeDead||stalled)&&now-s.lastRecoveryMs>=750)
+                {
+                    s.lastRecoveryMs=now;
+                    recoveredMovement=RecoverHookFollowerMovement(guard,ctrl);
+                    if(recoveredMovement)
+                    {
+                        ++s.recoveries;
+                        g_hookMovementRecoveries.fetch_add(1,std::memory_order_relaxed);
+                    }
+                }
+
+                if(s.velocityFallback||noProgress||stalled)
+                {
+                    if(!s.velocityFallback)
+                    {
+                        s.velocityFallback=true;
+                        g_hookVelocityFallbacks.fetch_add(1,std::memory_order_relaxed);
+                        LOG("[AI-MOVE] Hook Twin velocity fallback armed guard=%p dist=%.1fm status=%u nativeVel=%.1f restarts=%u",
+                            (void*)guard,distanceM,(unsigned)moveStatus,chainSpeed,s.restarts);
+                    }
+                    velocityWrite=WriteHookFollowVelocity(guard,directDir,650.0f);
+                    if(velocityWrite)++s.velocityWrites;
+                }
+            }
 
             if (stalled && s.commandActive)
             {
@@ -12591,16 +12686,15 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 s.lastProgressMs = now;
                 ++s.restarts;
                 g_hookMovementRecoveries.fetch_add(1, std::memory_order_relaxed);
-                LOG("[AI-MOVE] Hook Twin route stalled -> stop/reissue guard=%p dist=%.1fm navMode=%u restart=%u",
-                    (void*)guard, distanceM, (unsigned)navigationMode, s.restarts);
-                continue;
+                LOG("[AI-MOVE] Hook Twin native route stalled -> direct fallback + reissue guard=%p dist=%.1fm navMode=%u restart=%u direct=%d vel=%d",
+                    (void*)guard, distanceM, (unsigned)navigationMode, s.restarts,
+                    directInput?1:0, velocityWrite?1:0);
             }
 
             static ULONGLONG lastTwinHookLog = 0;
             if (now - lastTwinHookLog >= 3000)
             {
                 lastTwinHookLog = now;
-                float chainSpeed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
                 bool rbForce=false, rbReach=false, rbAggressive=false, rbUses3D=false, rbCan2D=false, rbCan3D=false;
                 bool okRbForce=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_ForceFollowLoc, rbForce);
                 bool okRbReach=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, rbReach);
@@ -12610,22 +12704,25 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 bool okRbCan3D=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, rbCan3D);
                 AiMovementHooks::Status hookDiag = AiMovementHooks::GetStatus();
                 UObject* cachedTarget = ReadAiTargetField(guard);
-                LOG("[AI-MOVE] HookTwinFollow(GT): guard=%p dist=%.1fm moving=1 navMode=%u ground=%d status=%u nativeAccepted=%d simple=%d keys[loc=%d force=%d reach=%d aggr=%d 2d=%d can2d=%d no3d=%d radius=%d speed=%d] chain[pfc=%p move=%p cmc=%p nav=%p bind=%d repaired=%d active=%d mode=%u vel=%.1f] restarts=%u",
+                LOG("[AI-MOVE] HookTwinFollow(GT): guard=%p dist=%.1fm moving=1 navMode=%u ground=%d status=%u nativeAccepted=%d simple=%d direct=%d velWrite=%d recover=%d keys[loc=%d force=%d reach=%d aggr=%d 2d=%d can2d=%d no3d=%d radius=%d speed=%d] chain[pfc=%p move=%p cmc=%p nav=%p bind=%d repaired=%d active=%d mode=%u vel=%.1f] fallback=%d totals=%u/%u/%u restarts=%u",
                     (void*)guard, distanceM, (unsigned)navigationMode, groundPinned?1:0,
-                    (unsigned)moveStatus, nativeAccepted?1:0, simpleFallback?1:0, locationOk?1:0, forceOk?1:0,
-                    reachOk?1:0, aggressiveOk?1:0, uses2D?1:0, canReach2D?1:0,
+                    (unsigned)moveStatus, nativeAccepted?1:0, simpleFallback?1:0,
+                    directInput?1:0, velocityWrite?1:0, recoveredMovement?1:0,
+                    locationOk?1:0, forceOk?1:0, reachOk?1:0, aggressiveOk?1:0, uses2D?1:0, canReach2D?1:0,
                     reject3D?1:0, radiusOk?1:0, speedOk?1:0,(void*)chain.pathFollower,
                     (void*)chain.boundMovement,(void*)chain.characterMovement,(void*)chain.navData,
                     chain.boundMovement==chain.characterMovement?1:0,chain.repairedBinding?1:0,
-                    chain.reactivated?1:0,(unsigned)chain.movementMode,chainSpeed,s.restarts);
-                LOG("[AI-MOVE] HookTwinFollowBB: guard=%p target=%p read[force=%d/%d reach=%d/%d aggr=%d/%d uses3d=%d/%d can2d=%d/%d can3d=%d/%d] hooks[orig=%llu/%llu fallback=%llu/%llu canStart=%llu/%llu pathReq=%llu abort=%llu]",
+                    chain.reactivated?1:0,(unsigned)chain.movementMode,chainSpeed,
+                    s.velocityFallback?1:0,s.directInputs,s.velocityWrites,s.recoveries,s.restarts);
+                LOG("[AI-MOVE] HookTwinFollowBB: guard=%p target=%p read[force=%d/%d reach=%d/%d aggr=%d/%d uses3d=%d/%d can2d=%d/%d can3d=%d/%d] hooks[orig=%llu/%llu fallback=%llu/%llu canStart=%llu/%llu pathReq=%llu abort=%llu] directTotals=%u/%u/%u",
                     (void*)guard,(void*)cachedTarget,okRbForce?1:0,rbForce?1:0,okRbReach?1:0,rbReach?1:0,
                     okRbAggressive?1:0,rbAggressive?1:0,okRbUses3D?1:0,rbUses3D?1:0,
                     okRbCan2D?1:0,rbCan2D?1:0,okRbCan3D?1:0,rbCan3D?1:0,
                     (unsigned long long)hookDiag.twinOriginalMoveAccepted,(unsigned long long)hookDiag.twinOriginalMoveAttempts,
                     (unsigned long long)hookDiag.twinGenericFallbackAccepted,(unsigned long long)hookDiag.twinGenericFallbacks,
                     (unsigned long long)hookDiag.movementCanStartCalls,(unsigned long long)hookDiag.movementCanStartForced,
-                    (unsigned long long)hookDiag.pathRequests,(unsigned long long)hookDiag.pathAborts);
+                    (unsigned long long)hookDiag.pathRequests,(unsigned long long)hookDiag.pathAborts,
+                    s.directInputs,s.velocityWrites,s.recoveries);
             }
             continue;
         }
