@@ -2926,8 +2926,11 @@ namespace
         ULONGLONG lastProgressMs = 0;
         ULONGLONG lastFriendlyMs = 0; // last time we re-asserted Friendly-to-player (throttled)
         UObject*  hitTarget = nullptr;
+        UObject*  lastClearedTarget = nullptr;
         float     lastTargetHealth = -1.0f;
         ULONGLONG targetArmedMs = 0;
+        ULONGLONG lastClearMs = 0;
+        ULONGLONG lastClearHeavyMs = 0;
         bool      followMoving = false;
         ULONGLONG lastFollowGoalMs = 0;
         ULONGLONG lastMoveRecoveryMs = 0;
@@ -3311,6 +3314,8 @@ namespace
             s.lastHeavyMs = now;
         }
         s.target = enemy;
+        s.lastClearedTarget = nullptr;
+        s.lastClearMs = 0;
         return true;
     }
 
@@ -3336,32 +3341,43 @@ namespace
     {
         InjectState& s = g_inject[guard];
         UObject* cached = ReadAiTargetField(guard);
-        bool hadCombatTarget = (s.target && s.target != player) || (cached && cached != player);
+        UObject* clearTarget = nullptr;
+        if (s.target && s.target != player) clearTarget = s.target;
+        else if (cached && cached != player) clearTarget = cached;
+        ULONGLONG now = GetTickCount64();
+        bool duplicateClear = clearTarget && s.lastClearedTarget == clearTarget && now - s.lastClearMs < 2500;
 
-        // Transition-only teardown. Re-sending the native target/aggression/team
-        // setters every 200 ms while already idle restarts the AI state machine and
-        // eventually leaves CharacterMovement accepting input but consuming none.
-        if (hadCombatTarget)
-        {
+        // Always remove the raw cached target; the game can rehydrate this from blackboard
+        // after death. Only the first clear of a target runs the expensive AI state reset.
+        if (clearTarget)
             WriteAiTargetField(guard, nullptr);
+
+        if (clearTarget && (!duplicateClear || now - s.lastClearHeavyMs >= 1000))
+        {
             SetAiTargetEnemy(guard, nullptr, true);
             if (UObject* ctrl = GetAiController(guard))
-            {
                 SetControllerTargetEnemy(ctrl, nullptr, true);
+            s.lastClearHeavyMs = now;
+        }
+
+        if (clearTarget && !duplicateClear)
+        {
+            if (UObject* ctrl = GetAiController(guard))
                 SetControllerAggressive(ctrl, false);
-            }
             StopCharacterAggressive(guard);
             SwitchAiTeamFriendlyTo(guard, player);
-            s.lastFriendlyMs = GetTickCount64();
+            s.lastFriendlyMs = now;
+            g_hookStaleTargetsCleared.fetch_add(1, std::memory_order_relaxed);
+            LOG("[AI-HOOK] combat target cleared immediately: guard=%p target=%p reason=%s",
+                (void*)guard, (void*)clearTarget, reason ? reason : "stand-down");
         }
         ClearAiAggressiveLatch(guard);
         g_engagedUntilMs.erase(guard);
         g_lastThreatMs.erase(guard);
-        if (hadCombatTarget)
+        if (clearTarget)
         {
-            g_hookStaleTargetsCleared.fetch_add(1, std::memory_order_relaxed);
-            LOG("[AI-HOOK] combat target cleared immediately: guard=%p target=%p reason=%s",
-                (void*)guard, (void*)(s.target ? s.target : cached), reason ? reason : "stand-down");
+            s.lastClearedTarget = clearTarget;
+            s.lastClearMs = now;
         }
         s.target = nullptr;
         s.hitTarget = nullptr;
@@ -12494,40 +12510,36 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
             if (Mem::IsReadable(mv + AH::Move_Velocity, sizeof(FVector)))
             { FVector v = *reinterpret_cast<FVector*>(mv + AH::Move_Velocity); moveSpeed = sqrtf(v.X*v.X + v.Y*v.Y + v.Z*v.Z); }
 
-            if (mode == AH::MOVE_Flying && !s.traverse3D)
-            {
-                s.followState = 0;
-                ++mixed3D;
-                static ULONGLONG lastFlyingLog = 0;
-                if (now - lastFlyingLog >= 2000)
-                {
-                    lastFlyingLog = now;
-                    LOG("[AI-MOVE] HookTwinMercuna skip=flying guard=%p dist=%.1fm nav=%p vel=%.1f",
-                        (void*)guard, distanceM, (void*)nav, moveSpeed);
-                }
-                continue;
-            }
+            const bool currentlyFlying = mode == AH::MOVE_Flying;
+            if (currentlyFlying) ++mixed3D;
 
             UnpinTwinSchedule(guard);
-            if (!s.traverse3D && now - s.lastTransitionMs >= 1500)
+            bool autoNavOk = false;
+            if (s.moving && now - s.lastTransitionMs >= 1500)
             {
-                ForceGroundNavIfMixed(guard);
+                AllowMixedNavAuto(guard);
                 s.lastTransitionMs = now;
-                ++s.groundPins;
+                autoNavOk = true;
             }
             s.navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
 
             const bool forceOk = SetControllerForceFollow(ctrl, s.moving);
+            const bool aggressiveOk = SetControllerAggressive(ctrl, false);
+            ClearAiAggressiveLatch(guard);
+            bool uses3DOk = false, can3DOk = false;
             if (!s.moving)
             {
                 bool stopped = false;
-                if (s.traverse3D)
+                if (s.traverse3D || currentlyFlying || s.navigationMode == 2)
                 {
                     s.traverse3D = false;
                     ForceGroundNavIfMixed(guard);
                     ++s.groundPins;
-                    LOG("[AI-MOVE] HookTwinMercuna reached ring while flying -> GROUND once guard=%p", (void*)guard);
+                    LOG("[AI-MOVE] HookTwinMercuna hold -> GROUND once guard=%p mode=%u navMode=%u",
+                        (void*)guard, (unsigned)mode, (unsigned)s.navigationMode);
                 }
+                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_Uses3DNavigation, false);
+                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, false);
                 if (s.followState != 2)
                 {
                     stopped = MercunaStop(guard);
@@ -12555,6 +12567,8 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 s.closeBestMs = now;
                 s.lastProgressMs = now;
             }
+            uses3DOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_Uses3DNavigation, true);
+            can3DOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, true);
             bool stuck = (now - s.closeBestMs > 3000) && distanceM > 10.0f && moveSpeed >= 0.0f && moveSpeed < 50.0f;
             if (stuck && !s.traverse3D)
             {
@@ -12569,10 +12583,9 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
             else if (s.traverse3D && distanceM <= (kHookFollowStopM + kTwinFollowBandM))
             {
                 s.traverse3D = false;
-                ForceGroundNavIfMixed(guard);
+                AllowMixedNavAuto(guard);
                 s.lastMercunaMoveMs = 0;
-                ++s.groundPins;
-                LOG("[AI-MOVE] HookTwinMercuna recovered %.1fm -> GROUND once guard=%p", distanceM, (void*)guard);
+                LOG("[AI-MOVE] HookTwinMercuna recovered %.1fm -> AUTO mixed nav guard=%p", distanceM, (void*)guard);
             }
 
             bool mercMove = false, mercStop = false;
@@ -12602,12 +12615,12 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
             bool speedOk = true;
             if (s.followState != 1)
             {
+                StopCharacterAggressive(guard);
                 ClearControllerFocus(ctrl);
                 EnsureFollowerCanMove(guard);
                 speedOk = SetControllerFollowSpeed(ctrl);
                 s.followState = 1;
             }
-            const bool aggressiveOk = SetControllerAggressive(ctrl, true);
 
             static ULONGLONG lastTwinHookLog = 0;
             if (now - lastTwinHookLog >= 3000)
@@ -12622,11 +12635,11 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 bool okRbCan3D=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, rbCan3D);
                 AiMovementHooks::Status hookDiag = AiMovementHooks::GetStatus();
                 UObject* cachedTarget = ReadAiTargetField(guard);
-                LOG("[AI-MOVE] HookTwinMercuna(GT): guard=%p dist=%.1fm moving=1 nav=%p navReady=%d mode=%u navMode=%u vel=%.1f move=%d stop=%d stuck=%d t3d=%d keys[loc=%d force=%d reach=%d aggr=%d speed=%d] totals[move=%u stop=%u ground=%u flight=%u restart=%u]",
+                LOG("[AI-MOVE] HookTwinMercuna(GT): guard=%p dist=%.1fm moving=1 nav=%p navReady=%d mode=%u navMode=%u vel=%.1f move=%d stop=%d stuck=%d t3d=%d auto=%d keys[loc=%d force=%d reach=%d aggrSet=%d speed=%d use3d=%d can3d=%d] totals[move=%u stop=%u ground=%u flight=%u restart=%u]",
                     (void*)guard, distanceM, (void*)nav, navReady?1:0, (unsigned)mode,
                     (unsigned)s.navigationMode, moveSpeed, mercMove?1:0, mercStop?1:0,
-                    stuck?1:0, s.traverse3D?1:0, locationOk?1:0, forceOk?1:0,
-                    reachOk?1:0, aggressiveOk?1:0, speedOk?1:0,
+                    stuck?1:0, s.traverse3D?1:0, autoNavOk?1:0, locationOk?1:0, forceOk?1:0,
+                    reachOk?1:0, aggressiveOk?1:0, speedOk?1:0, uses3DOk?1:0, can3DOk?1:0,
                     s.mercunaIssues, s.mercunaStops, s.groundPins, s.flightPins, s.restarts);
                 LOG("[AI-MOVE] HookTwinMercunaBB: guard=%p target=%p read[force=%d/%d reach=%d/%d aggr=%d/%d uses3d=%d/%d can2d=%d/%d can3d=%d/%d] hooks[mercDetour=%d helper=%d mixed=%d ctrlCalls=%llu pathReq=%llu abort=%llu]",
                     (void*)guard,(void*)cachedTarget,okRbForce?1:0,rbForce?1:0,okRbReach?1:0,rbReach?1:0,
@@ -12637,7 +12650,8 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                     (unsigned long long)hookDiag.pathAborts);
             }
             continue;
-        }        // ---- ROBOTS (generic AIController, clean +0x790 one-shot move): owned native MoveToActor ----
+        }
+        // ---- ROBOTS (generic AIController, clean +0x790 one-shot move): owned native MoveToActor ----
         UObject* ctrl = GetAiController(guard);
         if (!ControllerPathFollowingReady(ctrl, guard))
         {
