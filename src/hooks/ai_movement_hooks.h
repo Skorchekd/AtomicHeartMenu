@@ -18,9 +18,10 @@ namespace AiMovementHooks
         std::uint64_t controllerMovesBlocked = 0, controllerStopsBlocked = 0;
         std::uint64_t controllerMovesIssued = 0, controllerStopsIssued = 0;
         std::uint64_t controllerMoveCalls = 0, controllerPathCommits = 0, controllerPathBuilds = 0;
+        std::uint64_t controllerMoveFaults = 0;
         std::uint64_t pathRequests = 0, pathAborts = 0;
         std::uint64_t twinGenericBypasses = 0, twinOriginalMoveAttempts = 0, twinOriginalMoveAccepted = 0;
-        std::uint64_t twinGenericFallbacks = 0, twinGenericFallbackAccepted = 0;
+        std::uint64_t twinGenericFallbacks = 0, twinGenericFallbackAccepted = 0, twinDirectGenericAccepted = 0;
         std::uint64_t movementCanStartCalls = 0, movementCanStartForced = 0;
         std::uint64_t mixedTransitions = 0;
         int registeredComponents = 0, ownedComponents = 0, registeredPathFollowers = 0;
