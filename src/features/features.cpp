@@ -12123,11 +12123,10 @@ static bool MercunaStop(UObject* ai)
     return true;
 }
 
-// Hook Diagnostics has its own movement controller. It does not enter the normal
-// squad blackboard/AddMovementInput/velocity loop. Mercuna units receive native
-// location requests through the ReVa-derived helper; non-Mercuna units receive a
-// single AIController native move request whose replacement/cancellation is then
-// blocked by hkProcessEvent until combat or release yields ownership.
+// Hook Diagnostics has its own movement controller. Hook-owned Twins now mirror the
+// proven normal Twin mover: reflected Mercuna MoveToActor retargeting plus standalone
+// stop flushes, with the native hook layer registered for diagnostics only. Generic
+// robots still use the protected AIController request path below.
 struct HookNativeFollowState
 {
     UObject* nav = nullptr;
@@ -12143,6 +12142,8 @@ struct HookNativeFollowState
     ULONGLONG lastFocusClearMs = 0;
     ULONGLONG lastNativeMoveMs = 0;
     ULONGLONG lastRecoveryMs = 0;
+    ULONGLONG lastMercunaMoveMs = 0;
+    ULONGLONG lastMercunaFlushMs = 0;
     bool mercuna = false;
     bool mixed = false;
     bool moving = false;
@@ -12152,13 +12153,21 @@ struct HookNativeFollowState
     bool mixedRecovery3D = false;
     bool velocityFallback = false;
     uint8_t navigationMode = 0;
+    int followState = 0;
+    float closeBestM = -1.0f;
+    ULONGLONG closeBestMs = 0;
     ULONGLONG modeEnteredMs = 0;
     ULONGLONG mixedFallbackUntilMs = 0;
+    bool traverse3D = false;
     uint32_t issues = 0;
     uint32_t restarts = 0;
     uint32_t directInputs = 0;
     uint32_t velocityWrites = 0;
     uint32_t recoveries = 0;
+    uint32_t mercunaIssues = 0;
+    uint32_t mercunaStops = 0;
+    uint32_t groundPins = 0;
+    uint32_t flightPins = 0;
 };
 static std::unordered_map<UObject*, HookNativeFollowState> g_hookNativeFollow;
 
@@ -12169,9 +12178,10 @@ static void SetHookControllerOwned(UObject* guard, bool owned)
     else g_hookControllerOwned.erase(guard);
 }
 
-// Kept for a future vertical-traversal flight fallback. Ground follow no longer uses Mercuna
-// (the Twin walks via AIController + Recast; see DriveHookBodyguardsNativeGameThread).
-[[maybe_unused]] static UObject* HookMercunaComponent(UObject* guard, bool mixed)
+// Hook Diagnostics Twin follow uses the same Mercuna component path as the normal Twin follower.
+// Registering it with the native hook layer gives diagnostics/detour coverage, but ownership stays
+// open so the reflected Mercuna MoveToActor call is not blocked by our guard rails.
+static UObject* HookMercunaComponent(UObject* guard, bool mixed)
 {
     if (mixed)
     {
@@ -12189,7 +12199,7 @@ static void YieldHookMovement(UObject* guard, HookNativeFollowState& s, bool sto
 {
     if (s.mercuna && s.nav)
     {
-        if (stop && s.commandActive) AiMovementHooks::Stop(s.nav);
+        if (stop && s.commandActive) MercunaStop(guard);
         AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
     }
     else if (s.controller)
@@ -12211,6 +12221,9 @@ static void YieldHookMovement(UObject* guard, HookNativeFollowState& s, bool sto
     s.commandActive = false;
     s.restartPending = false;
     s.moving = false;
+    s.followState = 0;
+    s.closeBestM = -1.0f;
+    s.traverse3D = false;
 }
 
 static void ReleaseHookNativeMovement(UObject* guard, bool stop)
@@ -12256,7 +12269,7 @@ static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
     bool targetChanged=s.movementTarget!=target;
     if(targetChanged)
     {
-        if(s.mercuna && s.nav && s.commandActive) AiMovementHooks::Stop(s.nav);
+        if(s.mercuna && s.nav && s.commandActive) MercunaStop(guard);
         else if(s.controller && s.commandActive)
         {
             if(s.mixed) StopHookControllerMovement(s.controller);
@@ -12268,94 +12281,68 @@ static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
             (void*)guard,(void*)target,distance/kUnitsPerMetre,s.mixed?1:0);
     }
 
-    // Approach the enemy on the GROUND. Combat already seeds target + IsAggressive (InjectHookBodyguard),
-    // the recipe that walks/chases.
+    // Approach the enemy. Twins use the same Mercuna actor-tracking primitive as the
+    // working normal Twin bodyguard path; generic robots keep the controller route.
     UObject* ctrl=GetAiController(guard);
-    if(!ControllerPathFollowingReady(ctrl,guard)) return false;
+    if(!ctrl) return false;
 
     if(s.mixed)
     {
-        // Twin combat now uses the same fully traced ground chain as follow. TargetEnemy and
-        // IsAggressive still drive attack selection/montages; the guarded MoveToActor route owns
-        // only the approach and is released at contact range.
-        if(!AiMovementHooks::RegisterController(guard,ctrl)) return false;
+        UObject* nav=HookMercunaComponent(guard,true);
+        if(Mem::IsReadable(nav,0x30))
+        {
+            AiMovementHooks::RegisterMercunaComponent(guard,nav,true);
+            AiMovementHooks::SetMercunaOwned(guard,nav,false);
+        }
         AiMovementHooks::SetControllerOwned(guard,ctrl,false);
         SetHookControllerOwned(guard,false);
-        s.mercuna=false;s.nav=nullptr;s.controller=ctrl;
-        AiMovementHooks::SetMixedAutomatic(guard,false);
-        if(AiMovementHooks::CurrentMixedNavigation(guard)!=1)
-            AiMovementHooks::ForceMixedNavigation(guard,1);
-        HookPathChainState chain{};
-        if(!EnsureHookTwinGroundPathChain(guard,ctrl,targetChanged||s.restartPending,chain)) return false;
-        if(chain.repairedBinding) AiMovementHooks::RegisterController(guard,ctrl);
+        s.mercuna=Mem::IsReadable(nav,0x30);s.nav=nav;s.controller=ctrl;
+        AllowMixedNavAuto(guard);
         SetControllerForceFollow(ctrl,false);
         SetControllerAggressive(ctrl,true);
-        uint8_t status=DirectControllerMoveStatus(ctrl);
-        bool accepted=false;
-        bool simpleFallback=false;
-        if((targetChanged||s.restartPending||status!=3) && now-s.lastNativeMoveMs>=350)
+        bool mercMove=false,mercStop=false;
+        if(targetChanged)
         {
-            s.lastNativeMoveMs=now;
-            accepted=MoveControllerToActor(ctrl,guard,target,350.0f,true);
-            status=DirectControllerMoveStatus(ctrl);
-            if(status!=3 && !accepted)
-            {
-                simpleFallback=SimpleMoveToActor(ctrl,guard,target);
-                status=DirectControllerMoveStatus(ctrl);
-            }
-            s.restartPending=false;
+            s.lastMercunaMoveMs=0;
+            s.lastMercunaFlushMs=0;
+            s.traverse3D=false;
         }
-        s.commandActive=status==3;
-        float speed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
-        bool directInput=false, velocityWrite=false, recoveredMovement=false;
-        float planar=sqrtf(delta.X*delta.X+delta.Y*delta.Y);
-        if(planar>1.0f)
+        if(now-s.lastMercunaFlushMs>3000)
         {
-            FVector dir{delta.X/planar,delta.Y/planar,0.0f};
-            directInput=AddPawnMovementInput(guard,dir,1.0f);
-            if(directInput)
-            {
-                ++s.directInputs;
-                g_hookDirectMoveInputs.fetch_add(1,std::memory_order_relaxed);
-            }
-            if(speed<1.0f&&now-s.lastRecoveryMs>=750)
-            {
-                s.lastRecoveryMs=now;
-                recoveredMovement=RecoverHookFollowerMovement(guard,ctrl);
-                if(recoveredMovement)
-                {
-                    ++s.recoveries;
-                    g_hookMovementRecoveries.fetch_add(1,std::memory_order_relaxed);
-                }
-            }
-            if(s.velocityFallback||(s.commandActive&&speed<1.0f&&now-s.lastNativeMoveMs>=900))
-            {
-                if(!s.velocityFallback)
-                {
-                    s.velocityFallback=true;
-                    g_hookVelocityFallbacks.fetch_add(1,std::memory_order_relaxed);
-                    LOG("[AI-MOVE] Hook Twin combat velocity fallback armed guard=%p target=%p dist=%.1fm status=%u",
-                        (void*)guard,(void*)target,distance/kUnitsPerMetre,(unsigned)status);
-                }
-                velocityWrite=WriteHookFollowVelocity(guard,dir,650.0f);
-                if(velocityWrite)++s.velocityWrites;
-            }
+            mercStop=MercunaStop(guard);
+            s.lastMercunaFlushMs=now;
+            if(mercStop)++s.mercunaStops;
         }
+        else if(now-s.lastMercunaMoveMs>400)
+        {
+            mercMove=MercunaMoveToPlayer(guard,target,350.0f,650.0f);
+            s.lastMercunaMoveMs=now;
+            ++s.mercunaIssues;
+        }
+        uint8_t mode=0;
+        float speed=-1.0f;
+        uint8_t* gb=reinterpret_cast<uint8_t*>(guard);
+        if(Mem::IsReadable(gb+AH::Char_CharacterMovement,sizeof(void*)))
+        {
+            uint8_t* mv=*reinterpret_cast<uint8_t**>(gb+AH::Char_CharacterMovement);
+            if(Mem::IsReadable(mv+AH::Move_MovementMode,1))mode=*reinterpret_cast<uint8_t*>(mv+AH::Move_MovementMode);
+            if(Mem::IsReadable(mv+AH::Move_Velocity,sizeof(FVector)))
+            { FVector v=*reinterpret_cast<FVector*>(mv+AH::Move_Velocity); speed=sqrtf(v.X*v.X+v.Y*v.Y+v.Z*v.Z); }
+        }
+        s.commandActive=mercMove||s.mercuna;
         static ULONGLONG lastCombatChainLog=0;
         if(now-lastCombatChainLog>=2000)
         {
             lastCombatChainLog=now;
-            LOG("[AI-CHAIN] TwinCombat guard=%p target=%p status=%u accepted=%d simple=%d direct=%d velWrite=%d recover=%d pfc=%p move=%p cmc=%p nav=%p bind=%d mode=%u vel=%.1f fallback=%d totals=%u/%u/%u",
-                (void*)guard,(void*)target,(unsigned)status,accepted?1:0,simpleFallback?1:0,
-                directInput?1:0,velocityWrite?1:0,recoveredMovement?1:0,(void*)chain.pathFollower,
-                (void*)chain.boundMovement,(void*)chain.characterMovement,(void*)chain.navData,
-                chain.boundMovement==chain.characterMovement?1:0,(unsigned)chain.movementMode,speed,
-                s.velocityFallback?1:0,s.directInputs,s.velocityWrites,s.recoveries);
+            LOG("[AI-CHAIN] TwinCombatMercuna guard=%p target=%p dist=%.1fm nav=%p move=%d stop=%d mode=%u vel=%.1f issues=%u stops=%u auto=1",
+                (void*)guard,(void*)target,distance/kUnitsPerMetre,(void*)nav,mercMove?1:0,mercStop?1:0,
+                (unsigned)mode,speed,s.mercunaIssues,s.mercunaStops);
         }
-        return s.commandActive||directInput||velocityWrite;
+        return s.commandActive;
     }
 
     // Robots: owned native MoveToActor (protected from game override).
+    if(!ControllerPathFollowingReady(ctrl,guard)) return false;
     if(!AiMovementHooks::RegisterController(guard,ctrl))
         return false;
     if(s.mercuna&&s.nav)
@@ -12456,240 +12443,171 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
         else { s.sampleMs = 0; s.lastProgressMs = 0; }
         if (stalled) ++stalledCount;
 
-        // GROUND movement for EVERYONE (robots AND Twins) is the AIController + RecastNavMesh +
-        // AHPathFollowingComponent path below -- NOT Mercuna. Decisive snapshot evidence: a released
-        // Twin walking on the ground and chasing the player runs movement_mode=1, nav_data=RecastNavMesh,
-        // move_status=3, with Mercuna NOT involved at all (Mercuna is only her FLIGHT system). Our old
-        // Hook code drove her through the Mercuna component -- the wrong subsystem -- so ground never
-        // translated her and only flight glided her ("she glides / walks away / never reaches me"). She
-        // now walks via the exact same controller path the robots use. (Mercuna helpers stay resolved
-        // for a future vertical-traversal flight fallback, but are not used for ground follow.)
+        // Hook Diagnostics resolves both native helper layers for instrumentation, but movement is
+        // split by pawn type: Twins use the proven Mercuna actor-follow loop, generic robots use the
+        // protected AIController/Recast route below.
         (void)AiMovementHooks::ResolveHelpers(moveLocationFn,
             s.mixed ? CachedObjectClassFn(guard, "ForceNavigationType") : nullptr);
-        if (s.mercuna && s.nav) // release any stale Mercuna ownership from an earlier build
+        if (!s.mixed && s.mercuna && s.nav) // release stale Mercuna ownership before generic controller mode
         {
             if (s.commandActive) AiMovementHooks::Stop(s.nav);
             AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
             s.mercuna = false; s.nav = nullptr; s.commandActive = false; s.restartPending = false;
         }
 
-        // ---- TWIN (mixed-nav): seed BT state, then issue a real reflected Recast route ----------
-        // Blackboard writes alone leave the spawned Twin's path-following component Idle.
-        // The reflected MoveToActor call reaches her +0x790 mixed-navigation override
-        // (FUN_141d4a6d0), whose generic first stage builds the route. RegisterController
-        // keeps that call crash-firewalled while leaving ownership with the game.
+        // ---- TWIN (mixed-nav): Hook Diagnostics clone of the proven normal Twin mover ----
+        // The working non-hook Twin follower is Mercuna MoveToActor retargeted every few
+        // hundred milliseconds, with standalone Stop flushes to prevent path request stacking.
+        // Keep Hook ownership/friendship/combat policy, but use that exact movement primitive.
         if (s.mixed)
         {
             UObject* ctrl = GetAiController(guard);
-            if (!ControllerBlackboardReady(ctrl) || !ControllerPathFollowingReady(ctrl, guard))
+            if (!ctrl)
             { YieldHookMovement(guard, s, false); continue; }
-            if (s.mercuna && s.nav) AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
-            if (!AiMovementHooks::RegisterController(guard, ctrl))
-            {
-                YieldHookMovement(guard, s, false);
-                continue;
-            }
             AiMovementHooks::SetControllerOwned(guard, ctrl, false);
             SetHookControllerOwned(guard, false);
-            s.mercuna=false; s.nav=nullptr; s.controller=ctrl;
+            s.controller = ctrl;
             ++controller; ++active;
 
-            bool groundPinned = AiMovementHooks::SetMixedAutomatic(guard, false);
-            uint8_t navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
-            if (navigationMode != 1 && now - s.lastTransitionMs >= 500)
+            UObject* nav = HookMercunaComponent(guard, true);
+            bool navReady = Mem::IsReadable(nav, 0x30);
+            if (navReady)
             {
-                groundPinned = AiMovementHooks::ForceMixedNavigation(guard, 1);
-                s.lastTransitionMs = now;
-                navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
+                AiMovementHooks::RegisterMercunaComponent(guard, nav, true);
+                AiMovementHooks::SetMercunaOwned(guard, nav, false);
+                s.nav = nav;
+                s.mercuna = true;
             }
-            s.navigationMode = navigationMode;
-
-            HookPathChainState chain{};
-            if (!EnsureHookTwinGroundPathChain(guard, ctrl, !wasMoving || s.restartPending, chain))
+            else
             {
-                static ULONGLONG lastChainFailureLog = 0;
-                if (now - lastChainFailureLog >= 2000)
+                s.nav = nullptr;
+                s.mercuna = false;
+            }
+
+            uint8_t mode = 0;
+            float moveSpeed = -1.0f;
+            uint8_t* gb = reinterpret_cast<uint8_t*>(guard);
+            uint8_t* mv = Mem::IsReadable(gb + AH::Char_CharacterMovement, sizeof(void*))
+                ? *reinterpret_cast<uint8_t**>(gb + AH::Char_CharacterMovement) : nullptr;
+            if (Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+                mode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
+            if (Mem::IsReadable(mv + AH::Move_Velocity, sizeof(FVector)))
+            { FVector v = *reinterpret_cast<FVector*>(mv + AH::Move_Velocity); moveSpeed = sqrtf(v.X*v.X + v.Y*v.Y + v.Z*v.Z); }
+
+            if (mode == AH::MOVE_Flying && !s.traverse3D)
+            {
+                s.followState = 0;
+                ++mixed3D;
+                static ULONGLONG lastFlyingLog = 0;
+                if (now - lastFlyingLog >= 2000)
                 {
-                    lastChainFailureLog = now;
-                    LOG("[AI-CHAIN] Twin ground chain unavailable guard=%p ctrl=%p pfc=%p move=%p cmc=%p mode=%u",
-                        (void*)guard,(void*)ctrl,(void*)chain.pathFollower,(void*)chain.boundMovement,
-                        (void*)chain.characterMovement,(unsigned)chain.movementMode);
+                    lastFlyingLog = now;
+                    LOG("[AI-MOVE] HookTwinMercuna skip=flying guard=%p dist=%.1fm nav=%p vel=%.1f",
+                        (void*)guard, distanceM, (void*)nav, moveSpeed);
                 }
-                YieldHookMovement(guard, s, false);
                 continue;
             }
-            if (chain.repairedBinding) AiMovementHooks::RegisterController(guard, ctrl);
 
-            uint8_t* gb = reinterpret_cast<uint8_t*>(guard);
-            if (Mem::IsReadable(gb + AH::AICh_bIsPassive, 1)) *reinterpret_cast<bool*>(gb + AH::AICh_bIsPassive) = false;
-            if (Mem::IsReadable(gb + AH::AICh_Schedule, sizeof(void*)))
+            UnpinTwinSchedule(guard);
+            if (!s.traverse3D && now - s.lastTransitionMs >= 1500)
             {
-                UObject** sched = reinterpret_cast<UObject**>(gb + AH::AICh_Schedule);
-                if (*sched)
-                {
-                    if (g_stashedSchedule.find(guard) == g_stashedSchedule.end()) g_stashedSchedule[guard] = *sched;
-                    *sched = nullptr;
-                }
+                ForceGroundNavIfMixed(guard);
+                s.lastTransitionMs = now;
+                ++s.groundPins;
             }
+            s.navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
 
-            const bool uses2D = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_Uses3DNavigation, false);
-            const bool canReach2D = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach2D, true);
-            const bool reject3D = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, false);
-            const bool radiusOk = SetControllerFloatKeyAt(ctrl, AH::AICtrl_Key_AcceptableRadius, 75.0f);
-            uint8_t moveStatus = DirectControllerMoveStatus(ctrl);
-            if (chain.repairedBinding && moveStatus == 3)
-            {
-                StopHookControllerMovement(ctrl);
-                moveStatus = 0;
-                s.commandActive = false;
-                s.lastNativeMoveMs = 0;
-            }
-
+            const bool forceOk = SetControllerForceFollow(ctrl, s.moving);
             if (!s.moving)
             {
-                if (s.commandActive || moveStatus == 3) StopHookControllerMovement(ctrl);
-                const bool locationOk = SetControllerFollowLocation(ctrl, guardLoc) |
-                                        SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, guardLoc);
-                const bool forceOk = SetControllerForceFollow(ctrl, false);
-                const bool aggressiveOk = SetControllerAggressive(ctrl, false);
-                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
-                if (wasMoving) FocusControllerOnActor(ctrl, player);
-                s.commandActive = false;
-                if (s.velocityFallback)
+                bool stopped = false;
+                if (s.traverse3D)
                 {
-                    WriteHookFollowVelocity(guard, FVector{}, 0.0f);
-                    s.velocityFallback = false;
+                    s.traverse3D = false;
+                    ForceGroundNavIfMixed(guard);
+                    ++s.groundPins;
+                    LOG("[AI-MOVE] HookTwinMercuna reached ring while flying -> GROUND once guard=%p", (void*)guard);
                 }
-                s.restartPending = false;
-                s.lastNativeMoveMs = 0;
-                static ULONGLONG lastHoldFailureLog = 0;
-                if ((!locationOk || !forceOk || !aggressiveOk || !groundPinned) &&
-                    now - lastHoldFailureLog >= 2000)
+                if (s.followState != 2)
                 {
-                    lastHoldFailureLog = now;
-                    LOG("[AI-MOVE] Hook Twin hold incomplete guard=%p navMode=%u ground=%d location=%d force=%d aggressive=%d",
-                        (void*)guard, (unsigned)navigationMode, groundPinned?1:0,
-                        locationOk?1:0, forceOk?1:0, aggressiveOk?1:0);
+                    stopped = MercunaStop(guard);
+                    if (stopped) ++s.mercunaStops;
+                    FocusControllerOnActor(ctrl, player);
+                    s.followState = 2;
+                }
+                s.commandActive = false;
+                s.closeBestM = -1.0f;
+                s.sampleMs = 0;
+                static ULONGLONG lastHoldLog = 0;
+                if (now - lastHoldLog >= 3000)
+                {
+                    lastHoldLog = now;
+                    LOG("[AI-MOVE] HookTwinMercuna hold guard=%p dist=%.1fm nav=%p stop=%d force=%d mode=%u vel=%.1f issues=%u stops=%u",
+                        (void*)guard, distanceM, (void*)nav, stopped?1:0, forceOk?1:0,
+                        (unsigned)mode, moveSpeed, s.mercunaIssues, s.mercunaStops);
                 }
                 continue;
             }
             ++moving;
-
-            bool restarting = false;
-            bool nativeIssueAllowed = true;
-            if (s.restartPending)
+            if (s.closeBestM < 0.0f || distanceM < s.closeBestM - 0.5f)
             {
-                if (now < s.restartAtMs) nativeIssueAllowed = false;
-                else
-                {
-                    s.restartPending = false;
-                    s.lastIssueMs = 0;
-                    s.lastNativeMoveMs = 0;
-                    s.sampleMs = 0;
-                    restarting = true;
-                    EnsureHookTwinGroundPathChain(guard, ctrl, true, chain);
-                }
-            }
-
-            float inv = planar > 1.0f ? 1.0f / planar : 0.0f;
-            FVector goal{ playerLoc.X - delta.X*inv*kHookFollowStopM*kUnitsPerMetre,
-                          playerLoc.Y - delta.Y*inv*kHookFollowStopM*kUnitsPerMetre, playerLoc.Z };
-            bool locationOk = true, forceOk = true, reachOk = true, speedOk = true;
-            if (now - s.lastIssueMs >= 200)
-            {
-                s.lastIssueMs = now; ++s.issues;
-                locationOk = SetControllerFollowLocation(ctrl, goal) |
-                             SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal);
-                SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
-                reachOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
-                forceOk = SetControllerForceFollow(ctrl, true);
-                if (!wasMoving || restarting)
-                {
-                    EnsureFollowerCanMove(guard);
-                    speedOk = SetControllerFollowSpeed(ctrl);
-                }
-            }
-            const bool aggressiveOk = SetControllerAggressive(ctrl, true);
-            ClearControllerFocus(ctrl);
-
-            // Blackboard state alone remains Idle on spawned Twins. The reflected wrapper builds the
-            // exact FAIMoveRequest and enters the generic AIController/Recast route builder before the
-            // Twin override's fault-prone post-processing, which the +0x790 SEH detour contains.
-            bool nativeAccepted = false;
-            bool simpleFallback = false;
-            moveStatus = DirectControllerMoveStatus(ctrl);
-            if (nativeIssueAllowed && moveStatus != 3 && now - s.lastNativeMoveMs >= 750)
-            {
-                s.lastNativeMoveMs = now;
-                nativeAccepted = MoveControllerToActor(ctrl, guard, player,
-                    kHookFollowStopM*kUnitsPerMetre, true);
-                moveStatus = DirectControllerMoveStatus(ctrl);
-                if (moveStatus != 3 && !nativeAccepted)
-                {
-                    simpleFallback = SimpleMoveToActor(ctrl, guard, player);
-                    moveStatus = DirectControllerMoveStatus(ctrl);
-                }
-            }
-            s.commandActive = moveStatus == 3;
-            float chainSpeed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
-            bool directInput=false, velocityWrite=false, recoveredMovement=false;
-            float goalDx=goal.X-guardLoc.X, goalDy=goal.Y-guardLoc.Y;
-            float goalPlanar=sqrtf(goalDx*goalDx+goalDy*goalDy);
-            if(goalPlanar>1.0f)
-            {
-                FVector directDir{goalDx/goalPlanar,goalDy/goalPlanar,0.0f};
-                directInput=AddPawnMovementInput(guard,directDir,1.0f);
-                if(directInput)
-                {
-                    ++s.directInputs;
-                    g_hookDirectMoveInputs.fetch_add(1,std::memory_order_relaxed);
-                }
-
-                const bool hasSample=s.lastProgressMs!=0;
-                const bool noProgress=hasSample&&now-s.lastProgressMs>=900;
-                const bool nativeDead=hasSample&&s.commandActive&&chainSpeed<1.0f&&now-s.lastProgressMs>=650;
-                if((noProgress||nativeDead||stalled)&&now-s.lastRecoveryMs>=750)
-                {
-                    s.lastRecoveryMs=now;
-                    recoveredMovement=RecoverHookFollowerMovement(guard,ctrl);
-                    if(recoveredMovement)
-                    {
-                        ++s.recoveries;
-                        g_hookMovementRecoveries.fetch_add(1,std::memory_order_relaxed);
-                    }
-                }
-
-                if(s.velocityFallback||noProgress||stalled)
-                {
-                    if(!s.velocityFallback)
-                    {
-                        s.velocityFallback=true;
-                        g_hookVelocityFallbacks.fetch_add(1,std::memory_order_relaxed);
-                        LOG("[AI-MOVE] Hook Twin velocity fallback armed guard=%p dist=%.1fm status=%u nativeVel=%.1f restarts=%u",
-                            (void*)guard,distanceM,(unsigned)moveStatus,chainSpeed,s.restarts);
-                    }
-                    velocityWrite=WriteHookFollowVelocity(guard,directDir,650.0f);
-                    if(velocityWrite)++s.velocityWrites;
-                }
-            }
-
-            if (stalled && s.commandActive)
-            {
-                EnsureHookTwinGroundPathChain(guard, ctrl, true, chain);
-                StopHookControllerMovement(ctrl);
-                SetControllerForceFollow(ctrl, false);
-                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, false);
-                s.commandActive = false;
-                s.restartPending = true;
-                s.restartAtMs = now + 200;
-                s.sampleMs = 0;
+                s.closeBestM = distanceM;
+                s.closeBestMs = now;
                 s.lastProgressMs = now;
+            }
+            bool stuck = (now - s.closeBestMs > 3000) && distanceM > 10.0f && moveSpeed >= 0.0f && moveSpeed < 50.0f;
+            if (stuck && !s.traverse3D)
+            {
+                s.traverse3D = true;
+                ForceFlightNavIfMixed(guard);
+                s.lastMercunaMoveMs = 0;
+                ++s.flightPins;
                 ++s.restarts;
                 g_hookMovementRecoveries.fetch_add(1, std::memory_order_relaxed);
-                LOG("[AI-MOVE] Hook Twin native route stalled -> direct fallback + reissue guard=%p dist=%.1fm navMode=%u restart=%u direct=%d vel=%d",
-                    (void*)guard, distanceM, (unsigned)navigationMode, s.restarts,
-                    directInput?1:0, velocityWrite?1:0);
+                LOG("[AI-MOVE] HookTwinMercuna STUCK %.1fm vel=%.1f -> FORCE FLIGHT guard=%p", distanceM, moveSpeed, (void*)guard);
             }
+            else if (s.traverse3D && distanceM <= (kHookFollowStopM + kTwinFollowBandM))
+            {
+                s.traverse3D = false;
+                ForceGroundNavIfMixed(guard);
+                s.lastMercunaMoveMs = 0;
+                ++s.groundPins;
+                LOG("[AI-MOVE] HookTwinMercuna recovered %.1fm -> GROUND once guard=%p", distanceM, (void*)guard);
+            }
+
+            bool mercMove = false, mercStop = false;
+            if (now - s.lastMercunaFlushMs > 4000)
+            {
+                mercStop = MercunaStop(guard);
+                s.lastMercunaFlushMs = now;
+                if (mercStop) ++s.mercunaStops;
+            }
+            else if (now - s.lastMercunaMoveMs > 300)
+            {
+                mercMove = MercunaMoveToPlayer(guard, player, kHookFollowStopM*kUnitsPerMetre, 600.0f);
+                s.lastMercunaMoveMs = now;
+                ++s.mercunaIssues;
+            }
+            if (mercMove) ++mercuna;
+            s.commandActive = navReady && s.moving;
+
+            float inv = distance > 1.0f ? 1.0f / distance : 0.0f;
+            FVector goal{ playerLoc.X - delta.X*inv*kHookFollowStopM*kUnitsPerMetre,
+                          playerLoc.Y - delta.Y*inv*kHookFollowStopM*kUnitsPerMetre,
+                          playerLoc.Z - delta.Z*inv*kHookFollowStopM*kUnitsPerMetre };
+            bool locationOk = SetControllerFollowLocation(ctrl, goal) |
+                              SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal);
+            SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
+            bool reachOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
+            bool speedOk = true;
+            if (s.followState != 1)
+            {
+                ClearControllerFocus(ctrl);
+                EnsureFollowerCanMove(guard);
+                speedOk = SetControllerFollowSpeed(ctrl);
+                s.followState = 1;
+            }
+            const bool aggressiveOk = SetControllerAggressive(ctrl, true);
 
             static ULONGLONG lastTwinHookLog = 0;
             if (now - lastTwinHookLog >= 3000)
@@ -12704,29 +12622,22 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 bool okRbCan3D=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, rbCan3D);
                 AiMovementHooks::Status hookDiag = AiMovementHooks::GetStatus();
                 UObject* cachedTarget = ReadAiTargetField(guard);
-                LOG("[AI-MOVE] HookTwinFollow(GT): guard=%p dist=%.1fm moving=1 navMode=%u ground=%d status=%u nativeAccepted=%d simple=%d direct=%d velWrite=%d recover=%d keys[loc=%d force=%d reach=%d aggr=%d 2d=%d can2d=%d no3d=%d radius=%d speed=%d] chain[pfc=%p move=%p cmc=%p nav=%p bind=%d repaired=%d active=%d mode=%u vel=%.1f] fallback=%d totals=%u/%u/%u restarts=%u",
-                    (void*)guard, distanceM, (unsigned)navigationMode, groundPinned?1:0,
-                    (unsigned)moveStatus, nativeAccepted?1:0, simpleFallback?1:0,
-                    directInput?1:0, velocityWrite?1:0, recoveredMovement?1:0,
-                    locationOk?1:0, forceOk?1:0, reachOk?1:0, aggressiveOk?1:0, uses2D?1:0, canReach2D?1:0,
-                    reject3D?1:0, radiusOk?1:0, speedOk?1:0,(void*)chain.pathFollower,
-                    (void*)chain.boundMovement,(void*)chain.characterMovement,(void*)chain.navData,
-                    chain.boundMovement==chain.characterMovement?1:0,chain.repairedBinding?1:0,
-                    chain.reactivated?1:0,(unsigned)chain.movementMode,chainSpeed,
-                    s.velocityFallback?1:0,s.directInputs,s.velocityWrites,s.recoveries,s.restarts);
-                LOG("[AI-MOVE] HookTwinFollowBB: guard=%p target=%p read[force=%d/%d reach=%d/%d aggr=%d/%d uses3d=%d/%d can2d=%d/%d can3d=%d/%d] hooks[orig=%llu/%llu fallback=%llu/%llu canStart=%llu/%llu pathReq=%llu abort=%llu] directTotals=%u/%u/%u",
+                LOG("[AI-MOVE] HookTwinMercuna(GT): guard=%p dist=%.1fm moving=1 nav=%p navReady=%d mode=%u navMode=%u vel=%.1f move=%d stop=%d stuck=%d t3d=%d keys[loc=%d force=%d reach=%d aggr=%d speed=%d] totals[move=%u stop=%u ground=%u flight=%u restart=%u]",
+                    (void*)guard, distanceM, (void*)nav, navReady?1:0, (unsigned)mode,
+                    (unsigned)s.navigationMode, moveSpeed, mercMove?1:0, mercStop?1:0,
+                    stuck?1:0, s.traverse3D?1:0, locationOk?1:0, forceOk?1:0,
+                    reachOk?1:0, aggressiveOk?1:0, speedOk?1:0,
+                    s.mercunaIssues, s.mercunaStops, s.groundPins, s.flightPins, s.restarts);
+                LOG("[AI-MOVE] HookTwinMercunaBB: guard=%p target=%p read[force=%d/%d reach=%d/%d aggr=%d/%d uses3d=%d/%d can2d=%d/%d can3d=%d/%d] hooks[mercDetour=%d helper=%d mixed=%d ctrlCalls=%llu pathReq=%llu abort=%llu]",
                     (void*)guard,(void*)cachedTarget,okRbForce?1:0,rbForce?1:0,okRbReach?1:0,rbReach?1:0,
                     okRbAggressive?1:0,rbAggressive?1:0,okRbUses3D?1:0,rbUses3D?1:0,
                     okRbCan2D?1:0,rbCan2D?1:0,okRbCan3D?1:0,rbCan3D?1:0,
-                    (unsigned long long)hookDiag.twinOriginalMoveAccepted,(unsigned long long)hookDiag.twinOriginalMoveAttempts,
-                    (unsigned long long)hookDiag.twinGenericFallbackAccepted,(unsigned long long)hookDiag.twinGenericFallbacks,
-                    (unsigned long long)hookDiag.movementCanStartCalls,(unsigned long long)hookDiag.movementCanStartForced,
-                    (unsigned long long)hookDiag.pathRequests,(unsigned long long)hookDiag.pathAborts,
-                    s.directInputs,s.velocityWrites,s.recoveries);
+                    hookDiag.mercunaDetoursLive?1:0,hookDiag.moveHelperResolved?1:0,hookDiag.mixedTransitionResolved?1:0,
+                    (unsigned long long)hookDiag.controllerMoveCalls,(unsigned long long)hookDiag.pathRequests,
+                    (unsigned long long)hookDiag.pathAborts);
             }
             continue;
-        }
-        // ---- ROBOTS (generic AIController, clean +0x790 one-shot move): owned native MoveToActor ----
+        }        // ---- ROBOTS (generic AIController, clean +0x790 one-shot move): owned native MoveToActor ----
         UObject* ctrl = GetAiController(guard);
         if (!ControllerPathFollowingReady(ctrl, guard))
         {
