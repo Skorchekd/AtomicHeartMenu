@@ -235,6 +235,9 @@ namespace Features
     int  AiQueueLaunchAll();      // ragdoll-launch every cached enemy skyward
     bool AiSpawnBodyguard();      // clone + spawn the nearest live enemy as a guard (streamed)
     bool AiSpawnModel(int index); // spawn the dropdown-selected LIVE model as a guard (streamed)
+    int  AiBossPresetCount();
+    const char* AiBossPresetName(int index);
+    bool AiSpawnBossPreset(int index);
     int  AiSpawnedAllyCount();    // how many spawned allies are currently alive
     int  AiSpawnQueueCount();     // how many spawns are still waiting in the stream
 
@@ -342,10 +345,12 @@ namespace Features
     int      HookAiRecruitNearby();
     bool     HookAiSpawnBodyguard();
     bool     HookAiSpawnModel(int index);
+    bool     HookAiSpawnBossPreset(int index);
     bool     HookAiSpawnModelByName(const char* prettyName);
     void     HookAiFollow();
     void     HookAiAttack();
     void     HookAiRelease();
+    void     HookAiDeleteRoster();
     int      HookAiCount();
 
     void MaxWeaponUpgrades();     // BaseWeapon::FullUpgrade on the current weapon

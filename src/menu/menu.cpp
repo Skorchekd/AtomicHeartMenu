@@ -278,6 +278,29 @@ namespace
             if (ImGui::Button("Clone nearest enemy", ImVec2(-FLT_MIN, 0)))
                 Features::AiSpawnBodyguard();
 
+            ImGui::Spacing();
+            static int bossPreset = 0;
+            int bossPresetCount = Features::AiBossPresetCount();
+            if (bossPreset < 0 || bossPreset >= bossPresetCount) bossPreset = 0;
+            const char* bossPreview = bossPresetCount > 0 ? Features::AiBossPresetName(bossPreset) : "(no boss presets)";
+            ImGui::TextDisabled("Boss presets (base game + DLC)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##bosspreset", bossPreview))
+            {
+                for (int i = 0; i < bossPresetCount; ++i)
+                {
+                    bool sel = bossPreset == i;
+                    if (ImGui::Selectable(Features::AiBossPresetName(i), sel)) bossPreset = i;
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (AccentButton("Spawn boss preset"))
+            {
+                bool ok = Features::AiSpawnBossPreset(bossPreset);
+                LOG("UI: spawn boss preset %d -> %s", bossPreset, ok ? "queued" : "failed");
+            }
+
             // --- search + spawn ANY model in the whole game + DLC ----------
             ImGui::Spacing();
             ImGui::TextDisabled("Search ANY model (whole game + DLC, incl. bosses)");
@@ -838,6 +861,25 @@ static void RenderHookTestingTab()
         Features::HookAiSpawnModel(hookSpawnModel);
     ImGui::TextDisabled("Spawn queue: %d", Features::AiSpawnQueueCount());
 
+    static int hookBossPreset = 0;
+    int hookBossCount = Features::AiBossPresetCount();
+    if (hookBossPreset < 0 || hookBossPreset >= hookBossCount) hookBossPreset = 0;
+    const char* hookBossPreview = hookBossCount > 0 ? Features::AiBossPresetName(hookBossPreset) : "(no boss presets)";
+    ImGui::TextDisabled("Boss presets (base game + DLC)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##hookbosspreset", hookBossPreview))
+    {
+        for (int i = 0; i < hookBossCount; ++i)
+        {
+            bool selected = hookBossPreset == i;
+            if (ImGui::Selectable(Features::AiBossPresetName(i), selected)) hookBossPreset = i;
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::Button("Spawn boss preset as Hook bodyguard", ImVec2(-FLT_MIN, 0)))
+        Features::HookAiSpawnBossPreset(hookBossPreset);
+
     static char hookModelSearch[80]{};
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputTextWithHint("##hookmodelsearch", "Search all character classes (Twin, boss, Vova...)",
@@ -879,8 +921,11 @@ static void RenderHookTestingTab()
     ImGui::SameLine();
     if (ImGui::Button("Hook roster attack", ImVec2(-FLT_MIN, 0)))
     { LOG("UI: [hooktest] dispatch attack"); Features::HookAiAttack(); }
-    if (ImGui::Button("Release hook roster", ImVec2(-FLT_MIN, 0)))
+    if (ImGui::Button("Release hook roster", ImVec2(bw, 0)))
     { LOG("UI: [hooktest] release squad"); Features::HookAiRelease(); }
+    ImGui::SameLine();
+    if (ImGui::Button("Delete hook roster", ImVec2(-FLT_MIN, 0)))
+    { LOG("UI: [hooktest] delete hook roster"); Features::HookAiDeleteRoster(); }
     ImGui::Text("Hook roster: %d    Global squad: %d", Features::HookAiCount(), Features::AiSquadCount());
 }
 

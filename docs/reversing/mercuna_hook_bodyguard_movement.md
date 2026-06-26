@@ -56,14 +56,22 @@ The transition routine changes current mode, activates/deactivates both navigati
 
 ReVa also confirms the automatic selector at RVA `0x1D49010`: it only changes mode when `automaticNavigation` is nonzero and `forcedNavigation` is zero, deriving mode 2 from movement mode `MOVE_Flying` and mode 1 otherwise. That behavior explains why leaving a spawned Twin automatic could preserve flight/3D state while the Hook code was driving ground follow keys. `FUN_1410e9750` is called on the same `0x1FA8` Mercuna navigation component during mode changes.
 
+
+## 2026-06-26 validated Hook Twin status
+
+Live testing after the controller/Recast rewrite confirms the Hook Diagnostics Twin movement path is correct: she follows, walks with real locomotion, closes distance, and keeps the expected AI/combat behavior. Do not disturb this movement path while fixing combat edge cases.
+
+The remaining post-test issue is target lifecycle: after a robot dies, the Twin can keep standing over the corpse and attacking it. The fix is combat teardown only. Dead targets are now rejected by `Char_bIsDead` as well as health, and duplicate stale-target clears perform a throttled full stand-down instead of only clearing the raw target pointer. Movement, route issuance, nav mode, and the direct-generic controller detour are intentionally unchanged.
+
+Native Twin attacks may still fail to damage robots even while the AI and montage behavior are correct. Treat that as a future external damage attribution problem, not a reason to rework follow/combat movement. A later system should apply damage only when the Hook Twin is confirmed to be attacking/contacting a live robot target.
 ## Command state machine
 
 Each Hook guard has one command state:
 
 1. Start beyond 3.5 m; hold inside 2.5 m.
-2. Ordinary robots issue one owned native `AAIController::MoveToActor`. Twins never receive direct MoveTo; their own BT is driven with the ReVa-confirmed follow and 2D reachability keys.
+2. Ordinary robots issue one owned native `AAIController::MoveToActor`. Hook Twins issue reflected `AIController.MoveToActor` through the registered direct-generic `+0x790` controller detour; controller ownership stays false so native BT/controller ticks are not blocked.
 3. Sample real actor displacement every 500 ms.
-4. On no progress, robots stop/replan. Twins drop and re-arm the forced-follow branch, re-apply mode 1, and receive a short native movement-input unstick pulse.
+4. On no progress, robots stop/replan. Hook Twins repair/verify the path-following chain and stop/reissue the reflected Recast route after a short delay; no raw velocity, movement-input pulse, teleport, or Mercuna fallback is used.
 5. On combat entry, the per-frame injector seeds target + IsAggressive (the recipe that walks her); the approach drive owns one controller `MoveToActor` toward the enemy on Recast. Inside 4.5 m, stop and release movement ownership so native turning, root motion, abilities, and attack montages execute without interception.
 6. On combat exit, stop the enemy-approach request before acquiring a new player-follow command.
 7. On hold, release, mode disable, or actor removal, stop once and clear ownership.
@@ -113,6 +121,12 @@ Hook Diagnostics also exposes a dedicated spawn menu: a recommended loaded-runti
 
 This removes the previous queue flood: no 300/900 ms MoveTo spam and no periodic four-second Stop flush.
 
+
+## 2026-06-26 Hook roster deletion/cleanup manager
+
+Hook Diagnostics now has an explicit delete-roster path. Deleting a Hook bodyguard must clear more than the actor: the runtime cleanup removes native follow state, combat injection state, engaged/threat holds, Twin state, movement-hook registration, controller ownership, saved schedule/original-team bookkeeping when appropriate, and any references from other Hook guards. New Hook registration also clears stale state for the same pointer first, covering UE pointer reuse after `K2_DestroyActor`.
+
+Use the Hook tab's `Delete hook roster` control for destructive removal. General AI-list deletion now routes through the same cleanup before `K2_DestroyActor`, so deleting the old Hook bodyguard cannot poison the next spawned bodyguard's follow loop.
 ## Failure behavior
 
 - Missing/invalid helper callsite: native Mercuna requests remain unavailable.
@@ -141,6 +155,12 @@ After the user builds:
 4. For a non-Mercuna robot, verify controller Move/Stop vtable detours become live and direct block counters rise if the game cancels the request.
 5. Stop moving for 10 seconds. The guard must hold without oscillation or repeated Stop calls.
 6. Move across stairs and around obstacles. A progress timeout may cause one visible hitch and one controlled replan, not continuous twitching.
-7. Test a Hook Twin on level ground, stairs, and around obstacles. Verify `HookTwinFollow(GT)` reports `navMode=1`, successful keys, decreasing distance, and only occasional recovery pulses.
-8. Enter combat during follow. Verify movement ownership releases, abilities and attacks remain native, dead targets clear, and follow reacquires immediately afterward.
+7. Test a Hook Twin on level ground, stairs, and around obstacles. Verify `HookTwinRecast(GT)` reports `navMode=1`, successful keys, direct generic hook counters, decreasing distance, and no Mercuna movement counter involvement.
+8. Enter combat during follow. Verify movement ownership releases at melee range, abilities and attacks remain native, dead targets clear via `Char_bIsDead`/health plus stand-down, and follow reacquires immediately afterward.
 9. Release the Hook roster and disable the mode. Verify active commands stop and Twin automatic navigation is restored.
+
+## 2026-06-26 Controller vtable alias reuse
+
+Some boss/controller classes share individual vtable functions without sharing the entire controller vtable. Vov reproduced this with `Controller.StopMovement(+0x728)`: the controller chain had already installed a detour for the shared stop target, but `RegisterController` only treated all four controller slots as reusable when every target matched. The result was repeated `MH_CreateHook=3` logs every registration attempt.
+
+`ai_movement_hooks.cpp` now reuses controller detours per slot: Move, Stop, CommitPath, and BuildPath each look up an existing original trampoline by target address before calling MinHook. New controller classes only own the slots they actually install, and shutdown/removal only removes owned slots. Refusal logs are throttled so an unexpected third-party/already-created hook cannot flood the console while a guard is trying to register.

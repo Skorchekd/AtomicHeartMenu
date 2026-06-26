@@ -60,26 +60,26 @@ If the anchor is missing, ambiguous, outside executable memory, or fails byte se
 The Hook Diagnostics bodyguard path now follows these rules:
 
 - it keeps a dedicated Hook Diagnostics roster, separate from general squad selection;
-- Hook Diagnostics recruit/spawn/follow/attack/release buttons operate on that roster;
+- Hook Diagnostics recruit/spawn/follow/attack/release/delete buttons operate on that roster;
 - the player may be a follow location, focus actor, move target, and protected actor;
 - the player is never written to `AHAICharacter.SetTargetAlly` or `AHAIController.SetBlackboardTargetAlly`;
 - non-null `TargetAlly` assignments are validated with the native `IsA_AHAICharacter` helper and fail closed;
 - invalid attempts log `[AI] Skipping TargetAlly assignment: target is not AHAICharacter`;
 - follow movement is isolated from the normal Squad/Twin loop and runs from the game-thread hook pump through the native movement ownership controller;
-- Hook-owned Twins are excluded from `DriveTwinCombat`, `DriveTwinsFollowGameThread`, and legacy ground-nav repinning; only the Hook movement/combat state machines may command them;
+- Hook-owned Twins are excluded from `DriveTwinCombat`, `DriveTwinsFollowGameThread`, and legacy ground-nav repinning; only the Hook controller/Recast movement and combat state machines may command them;
 - Hook Diagnostics guards use a fixed 2.0 m hold ring with 2.75 m restart hysteresis;
-- recruitment performs team/target initialization only and cannot seed a legacy SDK follow request or legacy Twin mode pin;
+- recruitment performs team/target initialization only and cannot seed a legacy SDK follow request or legacy Twin mode pin; new Hook registration first clears stale runtime state for that actor pointer;
 - Mercuna guards use the ReVa-derived native `MoveToLocation` request builder and vtable-owned Move/Stop/Cancel dispatch; no reflected movement UFunction is called;
 - guards without a Mercuna component receive one native `AAIController::MoveToActor` request; vtable `Move +0x790` and `Stop +0x728` plus reflected Move/Stop interception prevent the game from replacing it while follow owns movement;
 - no Hook Bodyguard uses the normal squad blackboard drive, per-frame `Pawn.AddMovementInput`, raw velocity fallback, or periodic Mercuna flush;
 - actual actor displacement is sampled every 500 ms; sustained zero displacement outside the ring performs one controlled stop, waits 150 ms, then issues one replacement request;
 - moving guards clear controller focus so they face travel direction instead of walking backward toward the player;
-- Twins use their native mixed-navigation transition routine: vertical separation or blocked 2D progress selects 3D, vertical convergence selects 2D, and combat releases navigation back to automatic selection;
+- Hook Twins use the native mixed-navigation transition routine to hold ground mode `1` for the validated controller/Recast follow path and restore automatic selection on release; do not reintroduce the old flight-primary or Mercuna follow path;
 - combat approach uses the same native movement backend until melee range, then releases ownership for native abilities and attack animations;
 - threat perception scans the cached AI set in all directions, with no view-cone test;
 - idle threats only qualify inside a 12 m player/guard protection perimeter; a robot actively targeting the player or a managed guard qualifies out to 35 m;
-- dead, unreadable, and completed targets clear the native aggressive state immediately, with no stale combat hold;
-- Hook Diagnostics guards receive a large outgoing damage multiplier; the first observed health delta, or first close melee contact fallback, completes the kill and records `[AI-HIT]`;
+- dead, unreadable, deleted, and completed targets are rejected with both `Char_bIsDead` and health checks, then clear cached/blackboard target plus a throttled native stand-down so the Twin does not keep attacking the corpse; deleted Hook actors are pruned from all follow/combat maps;
+- Hook Diagnostics guards receive a large outgoing damage multiplier, but validated Twin AI/montages may still fail to damage robots; any future fix should be a separate confirmed-attack damage attribution layer, not a movement rewrite;
 - threat selection and attack otherwise use the guard's native aggressive state, enemy target, controller behavior, abilities, and attack animations;
 - the ownership lock blocks engine attempts to point managed guards back at the player;
 - `AreFriendlyCharacters` is forced true only for a player/managed-bodyguard pair while experimental Hook Debug mode is active;
@@ -114,14 +114,20 @@ The tab provides read-only checks for:
 7. Walk away and confirm the guard starts after crossing about 2.75 m, continuously closes using native walk/run animation, and holds at about 2.0 m without oscillating.
 8. Confirm `HookFollowNative(GT)` reports either `mercuna=1` or `controller=1`. The old Hook-path `input` and `velocity` counters must remain unchanged.
 9. For a Mercuna guard, confirm native move/stop counters increment and external Move/Stop/Cancel blocks remain available. For a non-Mercuna guard, confirm the controller vtable detours become live.
-10. Test stairs and a Twin across different elevations. Confirm the Twin changes to mode `2` for 3D traversal and returns to mode `1` after vertical convergence, without timer-based re-pinning.
+10. Test stairs and a Hook Twin around obstacles. Confirm `HookTwinRecast(GT)` stays on the validated ground controller/Recast path (`navMode=1` while following) and does not enter the legacy Mercuna/flying follow path.
 11. Put an idle robot farther than 12 m away and confirm the guard keeps following. Then bring it inside the perimeter or make it target the player and confirm the guard engages from any facing direction.
-12. Let the guard land one hit. Confirm the target dies and the log records `[AI-HIT] ... source=damage-delta` or `source=melee-contact`.
-13. Confirm the guard immediately stops attacking the dead location and reacquires native follow.
+12. Let the guard/Twin attack a live robot. Confirm the AI chooses and attacks the target; if native damage still does not land, leave movement alone and treat it as the future external damage-attribution task.
+13. Kill the target and confirm the guard/Twin immediately stops attacking the dead location, logs one stale-target clear instead of spam, and reacquires native follow.
 14. Attack or provoke the guard and confirm it does not target the player. Watch friendship-force and ownership-block counters.
-15. Release the Hook roster and verify the native command stops, Twin automatic navigation is restored, and original team/behavior restoration runs.
+15. Release the Hook roster and verify the native command stops, Twin automatic navigation is restored, and original team/behavior restoration runs. Then use `Delete hook roster`, spawn another Hook bodyguard, and verify follow starts cleanly with no stale target/follow state from the deleted actor.
 16. Review `AtomicHeartMenu.log` for resolver method, sanity result, native movement issue/block counters, `firstHitKills`, `staleTargetsCleared`, friendship overrides, and guard catches.
 
 Do not treat unavailable optional hooks as a crash-firewall failure. Stop testing if the required firewall is inactive.
 
 Native spawning is not claimed as resolved: see `mercuna_hook_bodyguard_movement.md` for the ReVa-mapped spawn chain and the packed spawn-parameter field that keeps direct spawning fail-closed.
+
+## 2026-06-26 Curated boss spawn presets
+
+The normal AI spawn tab and Hook Diagnostics tab now expose readable boss presets for base-game and DLC boss/enemy classes. Presets are not raw class pointers. Each preset is an alias bundle (`Belyash/MA-9`, `BEA-D/BUSA`, `MOR-4Y`, etc.) resolved against the loaded runtime classes plus the Asset Registry character list. A loaded class is spawned directly; an unloaded asset-registry result is queued as a guarded load-on-demand class path through the existing streamed spawn queue.
+
+This keeps the UI usable for non-technical users while preserving the safety rule: no bare native template spawn path is introduced. If a preset cannot resolve yet, the log tells the user to let `AssetModels` finish or open the model search once, rather than repeatedly retrying a bad class.

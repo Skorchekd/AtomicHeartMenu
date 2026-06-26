@@ -52,6 +52,7 @@ static bool MercunaMoveToPlayer(UObject* ai, UObject* target, float endDistU, fl
 static bool MercunaStop(UObject* ai); // cancel her current Mercuna move (so she cleanly holds / stops stacking)
 static UObject* GetMercunaNavComp(UObject* ai);
 static void ReleaseHookNativeMovement(UObject* guard, bool stop);
+static void ForgetHookBodyguardRuntimeState(UObject* guard, bool eraseReleaseBookkeeping);
 
 namespace
 {
@@ -1609,6 +1610,13 @@ namespace
     void HookBodyguardAdd(UObject* ai)
     {
         if (!Mem::IsReadable(ai, 0x30)) return;
+        {
+            std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+            for (UObject* guard : g_hookBodyguards) if (guard == ai) return;
+        }
+        // Pointer reuse after K2_DestroyActor can otherwise inherit the previous
+        // Hook guard's follow/combat maps. Clean old runtime state before registering.
+        ForgetHookBodyguardRuntimeState(ai, false);
         std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
         for (UObject* guard : g_hookBodyguards) if (guard == ai) return;
         g_hookBodyguards.push_back(ai);
@@ -1663,6 +1671,7 @@ namespace
             {
                 ReleaseHookNativeMovement(evicted, true);
                 HookBodyguardRemove(evicted);
+                ForgetHookBodyguardRuntimeState(evicted, true);
             });
     }
     // Remove from the squad (any thread; locked). Used when an actor is deleted from
@@ -2806,11 +2815,14 @@ namespace
     {
         if (!target || !AiUsable(target))
             return false;
+        uint8_t* base = reinterpret_cast<uint8_t*>(target);
+        if (Mem::IsReadable(base + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(base + AH::Char_bIsDead))
+            return false;
         float cur = 0.0f, mx = 0.0f;
         if (ReadCharacterHealth(target, cur, mx) && mx > 0.001f)
             return std::isfinite(cur) && cur > 0.001f;
         // Some special combat actors expose no normal health attribute. Keep them
-        // eligible only while the object is still a valid AHAICharacter.
+        // eligible only while the object is still a valid, not-dead AHAICharacter.
         return true;
     }
 
@@ -3373,9 +3385,14 @@ namespace
                 (void*)guard, (void*)clearTarget, reason ? reason : "stand-down");
         }
 
-        bool standDown = firstClear || (!clearTarget && (hadEngaged || hadThreatHold || s.hitTarget || s.targetArmedMs || s.lastTargetHealth > 0.0f));
+        bool standDown = firstClear || heavyClear || (!clearTarget && (hadEngaged || hadThreatHold || s.hitTarget || s.targetArmedMs || s.lastTargetHealth > 0.0f));
         if (standDown)
+        {
+            if (UObject* ctrl = GetAiController(guard))
+                SetControllerAggressive(ctrl, false);
+            StopCharacterAggressive(guard);
             ClearAiAggressiveLatch(guard);
+        }
         g_engagedUntilMs.erase(guard);
         g_lastThreatMs.erase(guard);
         if (clearTarget)
@@ -4301,8 +4318,17 @@ namespace
                     break;
                 }
                 case AiQueuedKind::Release:
+                {
+                    bool hookOwned = IsHookBodyguard(ai);
+                    if (hookOwned) ReleaseHookNativeMovement(ai, true);
                     ok = ApplyAiRelease(ai);
+                    if (hookOwned)
+                    {
+                        SquadRemove(ai);
+                        ForgetHookBodyguardRuntimeState(ai, !ok);
+                    }
                     break;
+                }
                 case AiQueuedKind::Launch:
                     ok = ApplyAiLaunch(ai);
                     break;
@@ -5336,6 +5362,30 @@ namespace
     std::atomic<bool>       g_assetModelsRequested{ false };
     bool                    g_assetModelsDone = false; // game-thread only
 
+    struct BossSpawnPreset
+    {
+        const char* label;
+        const char* aliases;
+    };
+
+    static const BossSpawnPreset kBossSpawnPresets[] =
+    {
+        { "Base: Twins / Ballerina",       "twinscharacter twins twin ballerina ballerinas" },
+        { "Base: Belyash / MA-9",          "belyashcharacter belyash beylash ma-9 ma9" },
+        { "Base: Hedgie / HOG-7",          "hedgiecharacter hedgie ezhh ezh hog-7 hog7" },
+        { "Base: Plyusch / Ivy",           "plyuschcharacter plyusch plush ivy" },
+        { "Base: Natasha / NA-T256",       "natashacharacter natasha na-t256 nat256" },
+        { "Base: Dewdrop / ROSA",          "dewdropcharacter dewdrop rosa dew drop" },
+        { "Base: VOV-A6 / Vova",           "vovcharacter vova vov-a6 vova6 vov" },
+        { "DLC 1: BEA-D / BUSA",           "busacharacter busa bea-d bead beads" },
+        { "DLC 1: Nora encounter",         "noracharacter nora eleanor" },
+        { "DLC 2: Limbo Goose",            "goosecharacter goose limbo" },
+        { "DLC 3: MOR-4Y",                 "mor-4y mor4y mory moray eel" },
+        { "DLC 3: Undersea boss",          "undersea underwater sea_boss seaboss" },
+        { "DLC 4: Polymorph boss",         "polymorph polymorphcharacter polymermorph" },
+        { "DLC 4: Crystal boss",           "crystalboss crystal_boss chariton khariton" },
+    };
+
     // FAssetData (CoreUObject_structs.hpp): 5 FNames then pad to 0x60.
     struct FAssetDataLite
     {
@@ -5500,6 +5550,150 @@ namespace
             std::lock_guard<std::mutex> lk(g_allModelsMutex);
             g_allModels.swap(out);
         }
+    }
+
+    int BossPresetCount()
+    {
+        return (int)(sizeof(kBossSpawnPresets) / sizeof(kBossSpawnPresets[0]));
+    }
+
+    std::string LowerBossText(std::string s)
+    {
+        for (char& c : s)
+            c = (char)std::tolower((unsigned char)c);
+        return s;
+    }
+
+    std::vector<std::string> BossAliasTerms(const char* aliases)
+    {
+        std::string flat = aliases ? aliases : "";
+        for (char& c : flat)
+        {
+            c = (char)std::tolower((unsigned char)c);
+            if (c == ',' || c == ';' || c == '|') c = ' ';
+        }
+        std::vector<std::string> terms;
+        std::istringstream iss(flat);
+        std::string term;
+        while (iss >> term)
+            if (term.size() >= 3)
+                terms.push_back(term);
+        return terms;
+    }
+
+    bool SameModelIdentity(const LiveModel& a, const LiveModel& b)
+    {
+        if (a.cls && b.cls && a.cls == b.cls) return true;
+        if (!a.path.empty() && !b.path.empty() && a.path == b.path) return true;
+        return a.name == b.name && a.path == b.path;
+    }
+
+    void AppendUniqueModel(std::vector<LiveModel>& out, const LiveModel& model)
+    {
+        for (const LiveModel& existing : out)
+            if (SameModelIdentity(existing, model))
+                return;
+        out.push_back(model);
+    }
+
+    void KickBossModelDiscovery()
+    {
+        g_allModelsWantedMs = GetTickCount64();
+        RequestAiDiscovery();
+        if (!g_assetModelsRequested.exchange(true))
+        {
+            InstallProcessEventHook();
+            QueueGameThread([]() { try { BuildAssetRegistryModelsGameThread(); } catch (...) {} });
+        }
+    }
+
+    std::vector<LiveModel> BossModelSnapshot()
+    {
+        std::vector<LiveModel> out;
+        {
+            std::lock_guard<std::mutex> lk(g_allModelsMutex);
+            out = g_allModels;
+        }
+        RefreshLiveModels();
+        for (const LiveModel& model : g_liveModels)
+            AppendUniqueModel(out, model);
+        {
+            std::lock_guard<std::mutex> lk(g_assetModelsMutex);
+            for (const LiveModel& model : g_assetModels)
+                AppendUniqueModel(out, model);
+        }
+        return out;
+    }
+
+    int ScoreBossModel(const LiveModel& model, const BossSpawnPreset& preset)
+    {
+        std::string name = LowerBossText(model.name);
+        std::string path = LowerBossText(model.path);
+        std::string hay = name + " " + path;
+        int score = Mem::IsReadable(model.cls, 0x30) ? 8 : 2;
+        for (const std::string& term : BossAliasTerms(preset.aliases))
+        {
+            if (name == term) score += 1000;
+            else if (name.find(term) != std::string::npos) score += 220 + (int)term.size();
+            else if (hay.find(term) != std::string::npos) score += 80 + (int)term.size();
+        }
+        return score;
+    }
+
+    bool ResolveBossPresetModel(int index, LiveModel& out, int& scoreOut)
+    {
+        scoreOut = 0;
+        if (index < 0 || index >= BossPresetCount())
+            return false;
+        KickBossModelDiscovery();
+        std::vector<LiveModel> snap = BossModelSnapshot();
+        int bestScore = 0;
+        LiveModel best{};
+        for (const LiveModel& model : snap)
+        {
+            int score = ScoreBossModel(model, kBossSpawnPresets[index]);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = model;
+            }
+        }
+        scoreOut = bestScore;
+        if (bestScore < 80)
+            return false;
+        out = best;
+        return Mem::IsReadable(out.cls, 0x30) || !out.path.empty();
+    }
+
+    bool QueueBossPresetSpawn(int index, bool hookOwned)
+    {
+        if (!G::sdkReady.load())
+            return false;
+        if (index < 0 || index >= BossPresetCount())
+            return false;
+
+        LiveModel model{};
+        int score = 0;
+        if (!ResolveBossPresetModel(index, model, score))
+        {
+            LOG("%s boss preset '%s' unresolved yet (score=%d). Open the model search once or wait for AssetModels to finish.",
+                hookOwned ? "[AI-HOOK]" : "AiSpawnBossPreset", kBossSpawnPresets[index].label, score);
+            return false;
+        }
+        if (!InstallProcessEventHook())
+            return false;
+
+        SpawnRequest req;
+        if (Mem::IsReadable(model.cls, 0x30)) req.cls = model.cls; else req.path = model.path;
+        req.label = std::string(hookOwned ? "Hook Diagnostics " : "") + kBossSpawnPresets[index].label;
+        if (!model.name.empty()) req.label += " -> " + model.name;
+        req.hookOwned = hookOwned;
+        bool queued = EnqueueSpawn(std::move(req));
+        LOG("%s boss preset '%s' resolved to '%s' score=%d spawn %s (%s)",
+            hookOwned ? "[AI-HOOK]" : "AiSpawnBossPreset", kBossSpawnPresets[index].label,
+            model.name.empty() ? model.path.c_str() : model.name.c_str(), score,
+            queued ? "queued" : "refused", model.cls ? "loaded runtime class" : "load-on-demand class path");
+        return queued;
     }
 
     // =======================================================================
@@ -10289,6 +10483,31 @@ int Features::AiSpawnModelCount()
     return (int)g_liveModels.size();
 }
 
+int Features::AiBossPresetCount()
+{
+    return BossPresetCount();
+}
+
+const char* Features::AiBossPresetName(int index)
+{
+    if (index < 0 || index >= BossPresetCount())
+        return "(no boss preset)";
+    return kBossSpawnPresets[index].label;
+}
+
+bool Features::AiSpawnBossPreset(int index)
+{
+    return QueueBossPresetSpawn(index, false);
+}
+
+bool Features::HookAiSpawnBossPreset(int index)
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive())
+        return false;
+    return QueueBossPresetSpawn(index, true);
+}
+
 // Spawn the dropdown-selected live model as a streamed bodyguard (one at a time).
 bool Features::AiSpawnModel(int index)
 {
@@ -10320,17 +10539,9 @@ int Features::AiSpawnQueueCount() { return g_spawnQueueCount.load(); }
 // sweep alive (g_allModelsWanted), so the list stays fresh while the panel is open.
 std::vector<std::string> Features::AiSearchModels(const char* query, int maxResults)
 {
-    g_allModelsWantedMs = GetTickCount64(); // keep the worker sweep alive while the panel is open
     std::vector<std::string> out;
     if (!G::sdkReady.load()) return out;
-
-    // First time the panel is used, kick the one-shot Asset-Registry enumeration on the
-    // game thread (every character BP in the game + DLC, including unloaded bosses).
-    if (!g_assetModelsRequested.exchange(true))
-    {
-        InstallProcessEventHook();
-        QueueGameThread([]() { try { BuildAssetRegistryModelsGameThread(); } catch (...) {} });
-    }
+    KickBossModelDiscovery();
     std::string q = query ? query : "";
     for (char& c : q) c = (char)std::tolower((unsigned char)c);
 
@@ -10341,7 +10552,7 @@ std::vector<std::string> Features::AiSearchModels(const char* query, int maxResu
         if ((int)out.size() >= maxResults) break;
         if (!q.empty())
         {
-            std::string nl = m.name;
+            std::string nl = m.name + " " + m.path;
             for (char& c : nl) c = (char)std::tolower((unsigned char)c);
             if (nl.find(q) == std::string::npos) continue;
         }
@@ -10414,17 +10625,18 @@ void Features::AiDeleteActor(unsigned long long id)
         return;
     }
 
+    g_selectedAi.erase(std::remove(g_selectedAi.begin(), g_selectedAi.end(), ai), g_selectedAi.end());
+
     InstallProcessEventHook();
     QueueGameThread([ai]()
     {
         try
         {
             if (!Mem::IsReadable(ai, 0x30)) return;
-            // Stop our systems from touching it before it dies. (g_selectedAi is
-            // render-thread-owned -- we don't poke it here; every consumer re-validates
-            // selection pointers via AiUsable, so a stale entry is harmless.)
+            // Stop every Hook/squad state machine from touching it before it dies.
+            ReleaseHookNativeMovement(ai, true);
             SquadRemove(ai);
-            g_stashedSchedule.erase(ai);
+            ForgetHookBodyguardRuntimeState(ai, true);
 
             UFunction* fn = CachedFn(AH::Fn_K2DestroyActor);
             if (!fn) { LOG("AiDeleteActor: K2_DestroyActor unresolved"); return; }
@@ -10731,11 +10943,18 @@ void Features::AiClearSpawnedAllies()
         try
         {
             std::vector<UObject*> squad;
+            std::vector<UObject*> hookGuards;
             { std::lock_guard<std::mutex> lk(g_squadMutex); squad.swap(g_spawnedAllies); g_spawnedAllyCount = 0; }
-            { std::lock_guard<std::mutex> lk(g_hookBodyguardMutex); g_hookBodyguards.clear(); }
+            { std::lock_guard<std::mutex> lk(g_hookBodyguardMutex); hookGuards.swap(g_hookBodyguards); }
             int n = 0;
             for (UObject* a : squad)
-                if (AiUsable(a) && ApplyAiRelease(a)) ++n; // back to normal killable enemies
+            {
+                bool hookOwned = std::find(hookGuards.begin(), hookGuards.end(), a) != hookGuards.end();
+                if (hookOwned) ReleaseHookNativeMovement(a, true);
+                bool released = AiUsable(a) && ApplyAiRelease(a); // back to normal killable enemies
+                if (hookOwned) ForgetHookBodyguardRuntimeState(a, !released);
+                if (released) ++n;
+            }
             LOG("AiClearSpawnedAllies: stood down %d squad member(s)", n);
         }
         catch (...) { LOG("AiClearSpawnedAllies: exception (ignored)"); }
@@ -11219,10 +11438,42 @@ void Features::HookAiRelease()
         for (UObject* guard : guards)
         {
             ReleaseHookNativeMovement(guard, true);
+            bool released = AiUsable(guard) && ApplyAiRelease(guard);
             SquadRemove(guard);
-            if (AiUsable(guard) && ApplyAiRelease(guard)) ++n;
+            ForgetHookBodyguardRuntimeState(guard, !released);
+            if (released) ++n;
         }
         LOG("[AI-HOOK] released %d dedicated bodyguard(s)", n);
+    });
+}
+
+void Features::HookAiDeleteRoster()
+{
+    std::vector<UObject*> guards = HookBodyguardSnapshot();
+    {
+        std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+        g_hookBodyguards.clear();
+    }
+    for (UObject* guard : guards)
+        g_selectedAi.erase(std::remove(g_selectedAi.begin(), g_selectedAi.end(), guard), g_selectedAi.end());
+    if (guards.empty()) { LOG("[AI-HOOK] delete roster: dedicated roster empty"); return; }
+    InstallProcessEventHook();
+    QueueGameThread([guards]()
+    {
+        UFunction* fn = CachedFn(AH::Fn_K2DestroyActor);
+        int n = 0;
+        for (UObject* guard : guards)
+        {
+            ReleaseHookNativeMovement(guard, true);
+            SquadRemove(guard);
+            ForgetHookBodyguardRuntimeState(guard, true);
+            if (!Mem::IsReadable(guard, 0x30) || !fn) continue;
+            uint8_t noParams = 0;
+            try { guard->ProcessEvent(fn, &noParams); ++n; }
+            catch (...) { LOG("[AI-HOOK] delete roster: destroy exception guard=%p", (void*)guard); }
+        }
+        RequestAiDiscovery();
+        LOG("[AI-HOOK] deleted %d dedicated bodyguard(s); runtime state cleared", n);
     });
 }
 
@@ -11428,8 +11679,12 @@ void Features::AiReleaseSelected()
             int n = 0;
             for (UObject* ai : targets)
             {
+                bool hookOwned = IsHookBodyguard(ai);
+                if (hookOwned) ReleaseHookNativeMovement(ai, true);
+                bool released = AiUsable(ai) && ApplyAiRelease(ai);
                 SquadRemove(ai);
-                if (AiUsable(ai) && ApplyAiRelease(ai)) ++n;
+                if (hookOwned) ForgetHookBodyguardRuntimeState(ai, !released);
+                if (released) ++n;
             }
             LOG("AiReleaseSelected: released %d", n);
         }
@@ -12245,6 +12500,46 @@ static void ReleaseHookNativeMovement(UObject* guard, bool stop)
     AiMovementHooks::UnregisterGuard(guard);
 }
 
+static void ForgetHookBodyguardRuntimeState(UObject* guard, bool eraseReleaseBookkeeping)
+{
+    if (!guard) return;
+
+    g_hookNativeFollow.erase(guard);
+    g_inject.erase(guard);
+    g_engagedUntilMs.erase(guard);
+    g_lastThreatMs.erase(guard);
+    g_twin.erase(guard);
+
+    for (auto& pair : g_inject)
+    {
+        InjectState& s = pair.second;
+        if (s.target == guard) s.target = nullptr;
+        if (s.hitTarget == guard) s.hitTarget = nullptr;
+        if (s.lastClearedTarget == guard) s.lastClearedTarget = nullptr;
+    }
+    for (auto& pair : g_hookNativeFollow)
+    {
+        HookNativeFollowState& s = pair.second;
+        if (s.movementTarget == guard)
+        {
+            s.movementTarget = nullptr;
+            s.commandActive = false;
+            s.restartPending = true;
+        }
+    }
+
+    if (eraseReleaseBookkeeping)
+    {
+        g_stashedSchedule.erase(guard);
+        g_origTeam.erase(guard);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_hookControllerOwnedMutex);
+        g_hookControllerOwned.erase(guard);
+    }
+    AiMovementHooks::UnregisterGuard(guard);
+}
+
 static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
                                     UObject* target, ULONGLONG now)
 {
@@ -12410,7 +12705,12 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
 
     for (UObject* guard : guards)
     {
-        if (!AiUsable(guard) || guard == player) continue;
+        if (!AiUsable(guard) || guard == player)
+        {
+            ForgetHookBodyguardRuntimeState(guard, true);
+            SquadRemove(guard);
+            continue;
+        }
         HookNativeFollowState& s = g_hookNativeFollow[guard];
         s.mixed = IsMixedNavCharacter(guard);
 
