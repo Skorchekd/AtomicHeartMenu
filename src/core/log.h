@@ -20,7 +20,19 @@ namespace Log
 {
     void Init(bool allocConsole);
     void Shutdown();
+    void Clear();
     void Write(const char* fmt, ...);
 }
 
 #define LOG(...)  ::Log::Write(__VA_ARGS__)
+
+// Channel-tagged logging so the two distinct subsystems are visually separable in
+// AtomicHeartMenu.log / the live console:
+//   [SDK]  -> engine reflection: GObjects/GNames/GWorld resolve, FindObject scans,
+//             UFunction resolution -- the "scan the object graph" world.
+//   [HOOK] -> native signature scanning + MinHook detours (native_hooks.*) -- the
+//             "scan raw code bytes and patch functions" world.
+// `fmt` must be a string literal (the tag is concatenated at compile time, so this
+// adds zero formatting cost and needs no change to Log::Write).
+#define LOG_SDK(fmt, ...)  ::Log::Write("[SDK] "  fmt, ##__VA_ARGS__)
+#define LOG_HOOK(fmt, ...) ::Log::Write("[HOOK] " fmt, ##__VA_ARGS__)

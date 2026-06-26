@@ -25,6 +25,8 @@ add_library(AtomicHeartMenu SHARED
     src/sdk/reflect.cpp
     src/hooks/wndproc_hook.cpp
     src/hooks/dx12_hook.cpp
+    src/hooks/native_hooks.cpp
+    src/hooks/ai_movement_hooks.cpp
     src/menu/menu.cpp
     src/features/features.cpp
     # --- Dear ImGui ---

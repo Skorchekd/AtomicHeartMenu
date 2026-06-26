@@ -187,6 +187,7 @@ namespace Offsets
         constexpr int Char_AbilitySystemComp = 0x738;
 
         // UCharacterMovementComponent
+        constexpr int Move_Velocity          = 0xE4;  // FVector, inherited UMovementComponent::Velocity
         constexpr int Move_GravityScale      = 0x170; // float (1.0 default; lower = floaty)
         constexpr int Move_JumpZVelocity     = 0x178; // float (jump impulse)
         constexpr int Move_MovementMode      = 0x188; // EMovementMode (5 = MOVE_Flying)
@@ -195,6 +196,13 @@ namespace Offsets
         constexpr int Move_AirControl        = 0x1E4; // float (0..1 mid-air steering)
         constexpr uint8_t MOVE_Flying        = 5;
         constexpr uint8_t MOVE_Walking       = 1;
+
+        // AAIMixedNavigationCharacter (Twins), dump + ReVa verified.
+        constexpr int Mixed_AutomaticNavigation = 0x1F98;
+        constexpr int Mixed_Mercuna3DMovement    = 0x1FA0;
+        constexpr int Mixed_MercunaNavigation    = 0x1FA8;
+        constexpr int Mixed_CurrentNavigation    = 0x1FC2; // 1=2D, 2=3D
+        constexpr int Mixed_ForcedNavigation     = 0x1FC3;
 
         // FGameplayAttributeData inner layout (size 0x10)
         constexpr int Attr_BaseValue         = 0x08;
@@ -335,6 +343,7 @@ namespace Offsets
         constexpr const char* Obj_GameplayStatics      = "Engine.Default__GameplayStatics";
         // ESP target: enemy AI characters (AAHAICharacter : AAHBaseCharacter).
         constexpr const char* Cls_AICharacter          = "AtomicHeart.AHAICharacter";
+        constexpr const char* Cls_AHBaseCharacter      = "AtomicHeart.AHBaseCharacter";
         constexpr const char* Cls_AHAIController       = "AtomicHeart.AHAIController";
         constexpr const char* Cls_AIController         = "AIModule.AIController";
         constexpr const char* Cls_AIBlueprintHelper    = "AIModule.AIBlueprintHelperLibrary";
@@ -371,6 +380,8 @@ namespace Offsets
 
         // Generic AIModule helpers.
         constexpr const char* Fn_AIController_MoveToActor = "Function /Script/AIModule.AIController.MoveToActor";
+        constexpr const char* Fn_AIController_MoveToLocation = "Function /Script/AIModule.AIController.MoveToLocation";
+        constexpr const char* Fn_AIController_StopMovement = "Function /Script/Engine.Controller.StopMovement";
         constexpr const char* Fn_AIController_K2_SetFocus = "Function /Script/AIModule.AIController.K2_SetFocus";
         constexpr const char* Fn_AIBlueprintHelper_SpawnAIFromClass = "Function /Script/AIModule.AIBlueprintHelperLibrary.SpawnAIFromClass";
         constexpr const char* Fn_AIBlueprintHelper_SimpleMoveToActor = "Function /Script/AIModule.AIBlueprintHelperLibrary.SimpleMoveToActor"; // reliable nav walk toward an actor
@@ -448,6 +459,9 @@ namespace Offsets
         constexpr int AICtrl_Key_IsAggressive      = 0x0388;
         constexpr int AICtrl_Key_CanReachFollowLoc = 0x03A8;
         constexpr int AICtrl_Key_BehaviorState     = 0x03B0;
+        constexpr int AICtrl_Key_Uses3DNavigation  = 0x03E0;
+        constexpr int AICtrl_Key_CanReach2D        = 0x03E8;
+        constexpr int AICtrl_Key_CanReach3D        = 0x03F0;
         constexpr int AICtrl_Key_AcceptableRadius  = 0x03F8;
 
         // AIModule_classes.hpp: UBlackboardComponent / UBlackboardData.

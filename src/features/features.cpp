@@ -17,6 +17,8 @@
 #include "../core/globals.h"
 #include "../core/log.h"
 #include "../core/memory.h"
+#include "../hooks/native_hooks.h"
+#include "../hooks/ai_movement_hooks.h"
 #include <Windows.h>
 #include <MinHook.h>
 #include <cmath>
@@ -50,6 +52,9 @@ void DriveSquadVelocityGameThread();
 // MercunaNavigationComponent, so this is what actually walks her to a target.
 static bool MercunaMoveToPlayer(UObject* ai, UObject* target, float endDistU, float speed);
 static bool MercunaStop(UObject* ai); // cancel her current Mercuna move (so she cleanly holds / stops stacking)
+static UObject* GetMercunaNavComp(UObject* ai);
+static UObject* HookMercunaComponent(UObject* guard, bool mixed);
+static void ReleaseHookNativeMovement(UObject* guard, bool stop);
 
 namespace
 {
@@ -114,6 +119,52 @@ namespace
     std::atomic<void*>  g_fnSaveProgress{ nullptr };
     std::atomic<void*>  g_fnSavePersistentData{ nullptr };
     std::atomic<void*>  g_fnCheckpointSaveProgress{ nullptr };
+
+    // ---- AI ownership lock (native, ProcessEvent-level) --------------------
+    // The reliable way to "own" an AI is not to keep RE-WRITING its team (the game
+    // re-evaluates and flips it back -- the "fragile" behaviour), but to STOP the
+    // game from ever flipping it: swallow, right here in ProcessEvent, the exact
+    // UFunctions the engine would use to turn one of OUR squad units against us.
+    // Same proven mechanism as the no-save guard above -- a few cheap pointer
+    // compares, and only ever acts on squad members + only on the un-allying
+    // direction (our own friendly/attack-real-enemy calls pass straight through).
+    // This is class-agnostic, so it covers EVERY AI including the Twins.
+    std::atomic<bool>     g_ownershipLock{ false };
+    std::atomic<uint64_t> g_ownershipSwallows{ 0 };
+    std::atomic<void*>    g_fnOwnSwitchTeamAttitude{ nullptr }; // AHAICharacter.SwitchTeamToMatchCharacterAttitude
+    std::atomic<void*>    g_fnOwnSetTargetEnemy{ nullptr };     // AHAICharacter.SetTargetEnemy
+    std::atomic<void*>    g_fnOwnSetBbTargetEnemy{ nullptr };   // AHAIController.SetBlackboardTargetEnemy
+    // Hook Debug's experimental bodyguard mode. This is deliberately separate
+    // from the normal AI/Squad tab. Its friendship override only affects the
+    // player <-> managed-bodyguard pair and otherwise passes through untouched.
+    std::atomic<bool>     g_hookBodyguardMode{ false };
+    std::atomic<void*>    g_fnHookAreFriendly{ nullptr };
+    std::atomic<uint64_t> g_friendshipForces{ 0 };
+    std::atomic<uint64_t> g_unsafeTargetAllySkips{ 0 };
+    std::atomic<uint64_t> g_hookDirectMoveInputs{ 0 };
+    std::atomic<uint64_t> g_hookVelocityFallbacks{ 0 };
+    std::atomic<uint64_t> g_hookMovementRecoveries{ 0 };
+    std::atomic<uint64_t> g_hookFirstHitKills{ 0 };
+    std::atomic<uint64_t> g_hookStaleTargetsCleared{ 0 };
+    std::atomic<void*>    g_fnHookMoveToActor{ nullptr };
+    std::atomic<void*>    g_fnHookMoveToLocation{ nullptr };
+    std::atomic<void*>    g_fnHookStopMovement{ nullptr };
+    std::atomic<void*>    g_fnHookSetCharacterAggressive{ nullptr };
+    std::atomic<void*>    g_fnHookSetCharacterPassive{ nullptr };
+    std::atomic<uint64_t> g_hookCombatTargetEvents{ 0 };
+    std::atomic<uint64_t> g_hookCombatStateEvents{ 0 };
+    std::atomic<uint64_t> g_hookControllerMovesBlocked{ 0 };
+    thread_local bool     t_hookMovementInternal = false;
+    std::mutex            g_hookControllerOwnedMutex;
+    std::unordered_set<UObject*> g_hookControllerOwned;
+    // Defined far below (needs the param structs + IsSquadMember); declared here so
+    // hkProcessEvent can call it. Returns true => swallow this dispatch (block it).
+    bool OwnershipShouldSwallow(void* obj, void* fn, void* params);
+
+
+    bool HookFriendshipShouldForce(void* fn, void* params);
+    bool HookMovementShouldSwallow(void* obj, void* fn);
+    void HookCombatTrace(void* obj, void* fn, void* params);
 
     void DiagnosticTraceProcessEvent(void* obj, void* fn, void* params);
     void RunConsoleCommandImpl(const std::string& cmd); // defined later; used by the spawn anim-safety fix
@@ -199,6 +250,61 @@ namespace
             }
         }
 
+        // Hook Bodyguard combat-chain observer. This is read-only and records the game's
+        // target/aggressive/passive transitions before any ownership policy can swallow one.
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && fn && params)
+        {
+            try { HookCombatTrace(obj, fn, params); } catch (...) {}
+        }
+
+        // AI ownership lock: while armed, block the game from turning one of OUR squad
+        // units against us. Cheap pointer compares first (OwnershipShouldSwallow rejects
+        // immediately unless fn is one of the 3 cached un-allying UFunctions), so this
+        // costs nothing on the hot path. Swallow = return WITHOUT calling the original,
+        // exactly like the no-save guard. Wrapped so a bad param read can never escalate.
+        if (g_ownershipLock.load(std::memory_order_relaxed) && fn && obj)
+        {
+            bool swallow = false;
+            try { swallow = OwnershipShouldSwallow(obj, fn, params); } catch (...) { swallow = false; }
+            if (swallow)
+            {
+                uint64_t n = g_ownershipSwallows.fetch_add(1, std::memory_order_relaxed) + 1;
+                static ULONGLONG lastOwnLogMs = 0;
+                ULONGLONG nowO = GetTickCount64();
+                if (nowO - lastOwnLogMs > 1000) { lastOwnLogMs = nowO; LOG("Ownership: blocked the game from un-allying a squad unit (total %llu)", (unsigned long long)n); }
+                return; // depthGuard restores t_peDepth
+            }
+        }
+
+        // Hook Bodyguard movement ownership. Only the exact controller Move/Stop
+        // UFunctions are considered, only for a controller possessing a dedicated
+        // Hook roster pawn, and only while our native follow command is active.
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && fn && obj)
+        {
+            bool swallow = false;
+            try { swallow = HookMovementShouldSwallow(obj, fn); } catch (...) { swallow = false; }
+            if (swallow)
+            {
+                uint64_t n = g_hookControllerMovesBlocked.fetch_add(1, std::memory_order_relaxed) + 1;
+                static ULONGLONG lastLog = 0; ULONGLONG now = GetTickCount64();
+                if (now - lastLog > 1500)
+                { lastLog = now; LOG("[AI-MOVE] blocked external AIController Move/Stop replacement (total=%llu)", (unsigned long long)n); }
+                return;
+            }
+        }
+
+        // Hook Debug experimental friendship override. The reflected
+        // AIUtils.AreFriendlyCharacters UFunction is uniquely resolved by SDK
+        // metadata; ReVa confirms its native exec thunk at RVA 0x225BDA0. We
+        // intercept only this dispatch and only for player <-> managed guard.
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && fn && params)
+        {
+            bool force = false;
+            try { force = HookFriendshipShouldForce(fn, params); } catch (...) { force = false; }
+            if (force)
+                return; // params.ReturnValue was set true; narrow override complete
+        }
+
         // Drain deferred game-thread work only at a proven-safe callsite (see the
         // header comment): outermost dispatch, on the game thread, not on an AI
         // object. Nested calls (including the ProcessEvent our own tasks make) and
@@ -222,7 +328,20 @@ namespace
             {
                 static ULONGLONG lastDriveMs = 0;
                 ULONGLONG nowMs = GetTickCount64();
-                if (nowMs - lastDriveMs >= 50) // ~20 Hz; keys are level-triggered, no need to spam
+                // Two gates, BOTH required (the second one was missing and is the fix
+                // for the hard menu-open / random freeze):
+                //   * ~20 Hz throttle -- the follow keys are level-triggered, no need to spam.
+                //   * NOT mid-AI-dispatch -- DriveSquadVelocityGameThread writes blackboard
+                //     keys via ProcessEvent on the AI controller (SetController*). If that
+                //     lands while the engine is itself dispatching AI logic at this top-level
+                //     callsite (a BT task/service/decorator event -- see PeDispatchingOnAi),
+                //     it mutates the very state the engine is iterating and the game thread
+                //     spins forever inside engine AI code = the permanent freeze. The queue
+                //     drain below already refuses those callsites; the per-frame follow MUST
+                //     refuse them too. PeDispatchingOnAi is only evaluated once the throttle
+                //     is ready, so it stays cheap; if this callsite is unsafe we simply wait
+                //     for the next safe one (they occur many times per frame).
+                if (nowMs - lastDriveMs >= 50 && !PeDispatchingOnAi(obj))
                 {
                     lastDriveMs = nowMs;
                     try { DriveSquadVelocityGameThread(); } catch (...) {}
@@ -590,6 +709,7 @@ namespace
     struct P_ObjectReturn { void* ReturnValue; };
     struct P_WorldContext { void* WorldContextObject; };
     struct P_BoolParam { bool bValue; };
+    struct P_SetMovementMode { uint8_t NewMovementMode; uint8_t NewCustomMode; };
     struct P_SetActorLocation
     {
         FVector NewLocation;
@@ -1462,6 +1582,8 @@ namespace
     // the menu roster, recruit/release). Capped so it can't grow without bound.
     std::mutex                 g_squadMutex;
     std::vector<UObject*>      g_spawnedAllies;          // = the squad (spawned + recruited)
+    std::mutex                 g_hookBodyguardMutex;
+    std::vector<UObject*>      g_hookBodyguards;         // Hook Diagnostics-owned subset
     // g_spawnedAllyCount (the size mirror) is declared near the top atomics so
     // hkProcessEvent can gate the per-frame squad walk on it.
     constexpr int              kMaxSpawnedAllies = 24;
@@ -1481,25 +1603,248 @@ namespace
         for (UObject* s : g_selectedAi) if (s == ai) return true;
         return false;
     }
+    bool IsHookBodyguard(UObject* ai)
+    {
+        std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+        for (UObject* guard : g_hookBodyguards) if (guard == ai) return true;
+        return false;
+    }
+    void HookBodyguardAdd(UObject* ai)
+    {
+        if (!Mem::IsReadable(ai, 0x30)) return;
+        std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+        for (UObject* guard : g_hookBodyguards) if (guard == ai) return;
+        g_hookBodyguards.push_back(ai);
+    }
+    void HookBodyguardRemove(UObject* ai)
+    {
+        {
+            std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+            for (size_t i = 0; i < g_hookBodyguards.size(); ++i)
+                if (g_hookBodyguards[i] == ai) { g_hookBodyguards.erase(g_hookBodyguards.begin() + i); break; }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_hookControllerOwnedMutex);
+            g_hookControllerOwned.erase(ai);
+        }
+        AiMovementHooks::UnregisterGuard(ai);
+    }
+    std::vector<UObject*> HookBodyguardSnapshot()
+    {
+        std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+        return g_hookBodyguards;
+    }
+    UObject* HookDebugSelectedGuard()
+    {
+        for (UObject* selected : g_selectedAi)
+            if (Mem::IsReadable(selected, 0x30) && IsHookBodyguard(selected))
+                return selected;
+        std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+        for (UObject* guard : g_hookBodyguards)
+            if (Mem::IsReadable(guard, 0x30))
+                return guard;
+        return nullptr;
+    }
     // Add to the squad (any thread; locked). Dedup + cap (drop oldest).
     void SquadAdd(UObject* ai)
     {
         if (!Mem::IsReadable(ai, 0x30)) return;
-        std::lock_guard<std::mutex> lk(g_squadMutex);
-        for (UObject* s : g_spawnedAllies) if (s == ai) return;
-        if ((int)g_spawnedAllies.size() >= kMaxSpawnedAllies)
-            g_spawnedAllies.erase(g_spawnedAllies.begin());
-        g_spawnedAllies.push_back(ai);
-        g_spawnedAllyCount = (int)g_spawnedAllies.size();
+        UObject* evicted = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_squadMutex);
+            for (UObject* s : g_spawnedAllies) if (s == ai) return;
+            if ((int)g_spawnedAllies.size() >= kMaxSpawnedAllies)
+            {
+                evicted = g_spawnedAllies.front();
+                g_spawnedAllies.erase(g_spawnedAllies.begin());
+            }
+            g_spawnedAllies.push_back(ai);
+            g_spawnedAllyCount = (int)g_spawnedAllies.size();
+        }
+        if (evicted)
+            QueueGameThread([evicted]()
+            {
+                ReleaseHookNativeMovement(evicted, true);
+                HookBodyguardRemove(evicted);
+            });
     }
     // Remove from the squad (any thread; locked). Used when an actor is deleted from
     // the world so the follow drive stops poking a dead pointer.
     void SquadRemove(UObject* ai)
     {
-        std::lock_guard<std::mutex> lk(g_squadMutex);
-        for (size_t i = 0; i < g_spawnedAllies.size(); ++i)
-            if (g_spawnedAllies[i] == ai) { g_spawnedAllies.erase(g_spawnedAllies.begin() + i); break; }
-        g_spawnedAllyCount = (int)g_spawnedAllies.size();
+        {
+            std::lock_guard<std::mutex> lk(g_squadMutex);
+            for (size_t i = 0; i < g_spawnedAllies.size(); ++i)
+                if (g_spawnedAllies[i] == ai) { g_spawnedAllies.erase(g_spawnedAllies.begin() + i); break; }
+            g_spawnedAllyCount = (int)g_spawnedAllies.size();
+        }
+        HookBodyguardRemove(ai);
+    }
+
+    // ---- AI ownership lock: the swallow decision (declared up by hkProcessEvent) ----
+    // A controller -> its possessed pawn (the character). Guarded; null on any bad
+    // read so the caller simply treats the object as "not one of ours".
+    UObject* OwnershipControllerPawn(void* ctrl)
+    {
+        uint8_t* c = reinterpret_cast<uint8_t*>(ctrl);
+        if (!Mem::IsReadable(c + Offsets::O_BaseController_Pawn, sizeof(void*)))
+            return nullptr;
+        return *reinterpret_cast<UObject**>(c + Offsets::O_BaseController_Pawn);
+    }
+
+    // Should this ProcessEvent dispatch be swallowed to keep a Hook Debug unit ours?
+    // Only ever true for: (a) one of three cached "un-ally" UFunctions, dispatched
+    // (b) on a Hook Diagnostics character or its controller, (c) in the
+    // direction that would turn it against the player / another hook bodyguard. Our
+    // OWN friendly / attack-real-enemy calls never match, so they pass through.
+    bool OwnershipShouldSwallow(void* obj, void* fn, void* params)
+    {
+        void* fSwitch = g_fnOwnSwitchTeamAttitude.load(std::memory_order_relaxed);
+        void* fEnemyC = g_fnOwnSetTargetEnemy.load(std::memory_order_relaxed);
+        void* fEnemyB = g_fnOwnSetBbTargetEnemy.load(std::memory_order_relaxed);
+        if (fn != fSwitch && fn != fEnemyC && fn != fEnemyB)
+            return false;                       // cheap reject (the hot path)
+        if (!Mem::IsReadable(params, 0x10))
+            return false;
+
+        UObject* o = reinterpret_cast<UObject*>(obj);
+        bool owned = IsHookBodyguard(o);
+        if (!owned)
+        {
+            UObject* pawn = OwnershipControllerPawn(obj); // obj may be the controller
+            owned = pawn && IsHookBodyguard(pawn);
+        }
+        if (!owned)
+            return false;                       // never touch AI we do not own
+
+        UObject* player = UE::GetLocalPawn();
+        auto isUs = [&](void* x) -> bool {
+            return x && (x == player || IsHookBodyguard(reinterpret_cast<UObject*>(x)));
+        };
+
+        if (fn == fSwitch)
+        {
+            // Block the engine flipping our unit to a NON-friendly attitude toward us.
+            // Our own SwitchTeamToMatchCharacterAttitude(player, Friendly=0) passes.
+            auto* p = reinterpret_cast<P_SwitchTeamToMatchCharacterAttitude*>(params);
+            return isUs(p->OtherCharacter) && p->TargetTeamAttitude != 0;
+        }
+        if (fn == fEnemyC)
+        {
+            // Never let our unit take US as its enemy (real-enemy targets pass through).
+            auto* p = reinterpret_cast<P_SetTargetEnemy*>(params);
+            return isUs(p->TargetEnemy);
+        }
+        // fn == fEnemyB
+        auto* p = reinterpret_cast<P_SetBlackboardTargetEnemy*>(params);
+        return isUs(p->NewTarget);
+    }
+
+    bool HookMovementShouldSwallow(void* obj, void* fn)
+    {
+        if (t_hookMovementInternal)
+            return false;
+        void* moveActor = g_fnHookMoveToActor.load(std::memory_order_relaxed);
+        void* moveLocation = g_fnHookMoveToLocation.load(std::memory_order_relaxed);
+        void* stop = g_fnHookStopMovement.load(std::memory_order_relaxed);
+        if (fn != moveActor && fn != moveLocation && fn != stop)
+            return false;
+        UObject* pawn = OwnershipControllerPawn(obj);
+        if (!pawn || !IsHookBodyguard(pawn))
+            return false;
+        std::lock_guard<std::mutex> lock(g_hookControllerOwnedMutex);
+        return g_hookControllerOwned.find(pawn) != g_hookControllerOwned.end();
+    }
+
+    void HookCombatTrace(void* obj, void* fn, void* params)
+    {
+        void* fCharTarget = g_fnOwnSetTargetEnemy.load(std::memory_order_relaxed);
+        void* fBbTarget = g_fnOwnSetBbTargetEnemy.load(std::memory_order_relaxed);
+        void* fAggressive = g_fnHookSetCharacterAggressive.load(std::memory_order_relaxed);
+        void* fPassive = g_fnHookSetCharacterPassive.load(std::memory_order_relaxed);
+        if (fn != fCharTarget && fn != fBbTarget && fn != fAggressive && fn != fPassive) return;
+
+        UObject* guard = nullptr;
+        UObject* target = nullptr;
+        int active = -1;
+        if (fn == fCharTarget)
+        {
+            guard = reinterpret_cast<UObject*>(obj);
+            target = reinterpret_cast<UObject*>(reinterpret_cast<P_SetTargetEnemy*>(params)->TargetEnemy);
+        }
+        else if (fn == fBbTarget)
+        {
+            guard = OwnershipControllerPawn(obj);
+            target = reinterpret_cast<UObject*>(reinterpret_cast<P_SetBlackboardTargetEnemy*>(params)->NewTarget);
+        }
+        else if (fn == fAggressive)
+        {
+            auto* p = reinterpret_cast<P_SetCharacterAggressive*>(params);
+            guard = reinterpret_cast<UObject*>(p->InAICharacter);
+            target = reinterpret_cast<UObject*>(p->InTargetEnemy);
+            active = p->bShouldBeActive ? 1 : 0;
+        }
+        else
+        {
+            auto* p = reinterpret_cast<P_SetCharacterPassive*>(params);
+            guard = reinterpret_cast<UObject*>(p->InAICharacter);
+            active = 0;
+        }
+        if (!guard || !IsHookBodyguard(guard)) return;
+
+        uint64_t count = 0;
+        const char* stage = nullptr;
+        if (fn == fAggressive || fn == fPassive)
+        {
+            count = g_hookCombatStateEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+            stage = fn == fAggressive ? "SetCharacterAggressive" : "SetCharacterPassive";
+        }
+        else
+        {
+            count = g_hookCombatTargetEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+            stage = fn == fCharTarget ? "SetTargetEnemy" : "SetBlackboardTargetEnemy";
+        }
+        static ULONGLONG lastCombatTraceMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastCombatTraceMs >= 750)
+        {
+            lastCombatTraceMs = now;
+            LOG("[AI-CHAIN] combat stage=%s guard=%p target=%p active=%d count=%llu",
+                stage,(void*)guard,(void*)target,active,(unsigned long long)count);
+        }
+    }
+
+    bool HookFriendshipShouldForce(void* fn, void* params)
+    {
+        if (!g_hookBodyguardMode.load(std::memory_order_relaxed) ||
+            fn != g_fnHookAreFriendly.load(std::memory_order_relaxed) ||
+            !Mem::IsReadable(params, sizeof(P_AreFriendlyCharacters)))
+            return false;
+
+        auto* p = reinterpret_cast<P_AreFriendlyCharacters*>(params);
+        UObject* a = reinterpret_cast<UObject*>(p->CharacterOne);
+        UObject* b = reinterpret_cast<UObject*>(p->CharacterTwo);
+        UObject* player = GetLocalPawn();
+        if (!Mem::IsReadable(player, 0x30))
+            return false;
+
+        UObject* guard = nullptr;
+        if (a == player && b && IsHookBodyguard(b)) guard = b;
+        if (b == player && a && IsHookBodyguard(a)) guard = a;
+        if (!guard || !NativeHooks::IsAHAICharacter(guard))
+            return false;
+
+        p->ReturnValue = true;
+        uint64_t n = g_friendshipForces.fetch_add(1, std::memory_order_relaxed) + 1;
+        static ULONGLONG lastLogMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastLogMs > 1000)
+        {
+            lastLogMs = now;
+            LOG("[AI-FRIENDSHIP] forcing friendly for player/bodyguard pair (total %llu)",
+                (unsigned long long)n);
+        }
+        return true;
     }
 
     std::mutex        g_aiOpMutex;
@@ -1965,10 +2310,28 @@ namespace
     // kFightTeamB so guards and free brawlers are never accidentally the same side.
     constexpr uint8_t kGuardTeam = 230;
 
+    bool ValidateTargetAllyAssignment(UObject* target)
+    {
+        if (!target)
+            return true; // clearing the field is always safe
+        if (NativeHooks::IsAHAICharacter(target))
+            return true;
+
+        g_unsafeTargetAllySkips.fetch_add(1, std::memory_order_relaxed);
+        static ULONGLONG lastLogMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastLogMs > 1000)
+        {
+            lastLogMs = now;
+            LOG("[AI] Skipping TargetAlly assignment: target is not AHAICharacter");
+        }
+        return false;
+    }
+
     bool SetAiTargetAlly(UObject* ai, UObject* ally)
     {
         UFunction* fn = CachedClassFn(AH::Cls_AICharacter, "SetTargetAlly");
-        if (!AiUsable(ai) || !fn)
+        if (!AiUsable(ai) || !fn || !ValidateTargetAllyAssignment(ally))
             return false;
         P_SetTargetAlly p{ ally };
         ai->ProcessEvent(fn, &p);
@@ -2043,7 +2406,7 @@ namespace
     bool SetControllerTargetAlly(UObject* ctrl, UObject* ally)
     {
         UFunction* fn = CachedObjectClassFn(ctrl, "SetBlackboardTargetAlly");
-        if (!ControllerBlackboardReady(ctrl) || !fn)
+        if (!ControllerBlackboardReady(ctrl) || !fn || !ValidateTargetAllyAssignment(ally))
             return false;
         P_SetBlackboardTargetAlly p{ ally };
         ctrl->ProcessEvent(fn, &p);
@@ -2145,15 +2508,42 @@ namespace
         return true;
     }
 
-    // Drive the controller to walk to `goal` the SAME way the game's own BT does --
-    // a native AIController::MoveToActor, but with bUsePathfinding=FALSE. This is the
-    // key: Atomic Heart navigates with Mercuna, NOT the UE NavSystem, so a pathfinding
-    // MoveTo from the BP layer finds no nav data (no move, and the historical crash).
-    // A DIRECT move skips the nav query entirely and drives the AHPathFollowingComponent
-    // + CharacterMovementComponent straight at the goal -> REAL locomotion WITH the
-    // walk/run animation (the thing glide/teleport never gave). Gated on a readable
-    // PathFollowingComponent + the controller owning this pawn, so it cannot deref null.
-    bool MoveControllerToActor(UObject* ctrl, UObject* controlledPawn, UObject* goal, float acceptanceRadius)
+    bool SetControllerFloatKeyAt(UObject* ctrl, int keyNameOffset, float value)
+    {
+        if (!ControllerBlackboardReady(ctrl)) return false;
+        uint8_t* base = reinterpret_cast<uint8_t*>(ctrl);
+        UObject* bb = *reinterpret_cast<UObject**>(base + AH::AICtrl_Blackboard);
+        if (!Mem::IsReadable(bb, 0x30) || !Mem::IsReadable(base + keyNameOffset, sizeof(FName))) return false;
+        FName key = *reinterpret_cast<FName*>(base + keyNameOffset);
+        if (key.ComparisonIndex <= 0) return false;
+        UFunction* fn = CachedObjectClassFn(bb, "SetValueAsFloat");
+        if (!fn) return false;
+        struct { FName KeyName; float Value; } p{ key, value };
+        bb->ProcessEvent(fn, &p);
+        return true;
+    }
+
+    bool ReadControllerBoolKeyAt(UObject* ctrl, int keyNameOffset, bool& out)
+    {
+        if (!ControllerBlackboardReady(ctrl)) return false;
+        uint8_t* base = reinterpret_cast<uint8_t*>(ctrl);
+        UObject* bb = *reinterpret_cast<UObject**>(base + AH::AICtrl_Blackboard);
+        if (!Mem::IsReadable(bb, 0x30) || !Mem::IsReadable(base + keyNameOffset, sizeof(FName))) return false;
+        FName key = *reinterpret_cast<FName*>(base + keyNameOffset);
+        if (key.ComparisonIndex <= 0) return false;
+        UFunction* fn = CachedObjectClassFn(bb, "GetValueAsBool");
+        if (!fn) return false;
+        struct { FName KeyName; bool Value; uint8_t pad[3]; } p{ key, false, {0,0,0} };
+        bb->ProcessEvent(fn, &p);
+        out = p.Value;
+        return true;
+    }
+    // Issue the reflected AIController::MoveToActor request used by Hook followers.
+    // Twins require pathfinding so the generic controller route builder creates an
+    // active Recast path before their mixed-navigation override post-processes it.
+    // ControllerPathFollowingReady validates the controller/pawn ownership chain first.
+    bool MoveControllerToActor(UObject* ctrl, UObject* controlledPawn, UObject* goal,
+                               float acceptanceRadius, bool usePathfinding = false)
     {
         if (!ControllerPathFollowingReady(ctrl, controlledPawn) || !Mem::IsReadable(goal, 0x30))
             return false;
@@ -2166,12 +2556,43 @@ namespace
         p.Goal = goal;
         p.AcceptanceRadius = acceptanceRadius; // stop this far away -> no orbiting at point-blank
         p.bStopOnOverlap = true;
-        p.bUsePathfinding = false; // DIRECT (no Mercuna/nav query) -> real CMC walk, crash-safe
+        p.bUsePathfinding = usePathfinding;
         p.bCanStrafe = false;
         p.FilterClass = nullptr;
         p.bAllowPartialPath = true;
-        ctrl->ProcessEvent(fn, &p);
+        t_hookMovementInternal = true;
+        AiMovementHooks::SetControllerCallInternal(true);
+        try { ctrl->ProcessEvent(fn, &p); }
+        catch (...) { AiMovementHooks::SetControllerCallInternal(false); t_hookMovementInternal = false; throw; }
+        AiMovementHooks::SetControllerCallInternal(false);
+        t_hookMovementInternal = false;
         return p.ReturnValue != 0; // Failed=0, AlreadyAtGoal=1, RequestSuccessful=2 (SDK)
+    }
+
+    [[maybe_unused]] bool StopHookControllerMovement(UObject* ctrl)
+    {
+        UFunction* fn = CachedObjectClassFn(ctrl, "StopMovement");
+        if (!AiControllerUsable(ctrl) || !Mem::IsReadable(fn, 0x30)) return false;
+        bool ok = false;
+        try
+        {
+            t_hookMovementInternal = true;
+            AiMovementHooks::SetControllerCallInternal(true);
+            ok = ProcessNoParams(ctrl, fn);
+            AiMovementHooks::SetControllerCallInternal(false);
+            t_hookMovementInternal = false;
+        }
+        catch (...) { AiMovementHooks::SetControllerCallInternal(false); t_hookMovementInternal = false; ok = false; }
+        return ok;
+    }
+
+    uint8_t DirectControllerMoveStatus(UObject* ctrl)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ctrl);
+        // ReVa: AAIController::GetMoveStatus reads PathFollowingComponent +0x1D8.
+        if (!Mem::IsReadable(base + 0x2F8, sizeof(void*))) return 0xFF;
+        uint8_t* path = *reinterpret_cast<uint8_t**>(base + 0x2F8);
+        return Mem::IsReadable(path + 0x1D8, 1) ? path[0x1D8] : 0xFF;
     }
 
     // Poll the controller's path-following status (EPathFollowingStatus: 0 Idle,
@@ -2362,6 +2783,40 @@ namespace
             *reinterpret_cast<bool*>(base + AH::AICh_bIsAlwaysAggressive) = true;
     }
 
+    // Hook Debug idle state: keep the pawn awake and perceptive without leaving the
+    // game's "always aggressive" latch set. That latch was the reason a managed guard
+    // immediately re-entered combat against distant robots after we cleared its target.
+    void ClearAiAggressiveLatch(UObject* ai)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (Mem::IsReadable(base + AH::AICh_bIsPassive, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive) = false;
+        if (Mem::IsReadable(base + AH::AICh_bPassiveButWithSenses, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bPassiveButWithSenses) = false;
+        if (Mem::IsReadable(base + AH::AICh_bIsAlwaysAggressive, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bIsAlwaysAggressive) = false;
+    }
+
+    UObject* ReadAiTargetField(UObject* ai)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (!Mem::IsReadable(base + AH::AICh_CachedTargetEnemy, sizeof(void*)))
+            return nullptr;
+        return *reinterpret_cast<UObject**>(base + AH::AICh_CachedTargetEnemy);
+    }
+
+    bool IsLiveCombatTarget(UObject* target)
+    {
+        if (!target || !AiUsable(target))
+            return false;
+        float cur = 0.0f, mx = 0.0f;
+        if (ReadCharacterHealth(target, cur, mx) && mx > 0.001f)
+            return std::isfinite(cur) && cur > 0.001f;
+        // Some special combat actors expose no normal health attribute. Keep them
+        // eligible only while the object is still a valid AHAICharacter.
+        return true;
+    }
+
     // Make `ai` hostile toward `other` using the game's own team setter, so the
     // engine's attitude solver returns Hostile and hits between them deal real
     // damage (no friendly-fire zeroing). attitude: 0 Friendly, 1 Neutral, 2 Hostile.
@@ -2470,6 +2925,17 @@ namespace
         float     lastDist = 0.0f;   // last distance to player (progress / stuck detection)
         ULONGLONG lastProgressMs = 0;
         ULONGLONG lastFriendlyMs = 0; // last time we re-asserted Friendly-to-player (throttled)
+        UObject*  hitTarget = nullptr;
+        float     lastTargetHealth = -1.0f;
+        ULONGLONG targetArmedMs = 0;
+        bool      followMoving = false;
+        ULONGLONG lastFollowGoalMs = 0;
+        ULONGLONG lastMoveRecoveryMs = 0;
+        FVector   followSampleLoc{};
+        ULONGLONG followSampleMs = 0;
+        ULONGLONG followLastProgressMs = 0;
+        bool      velocityFallback = false;
+        uint32_t  movementRecoveries = 0;
     };
     std::unordered_map<UObject*, InjectState> g_inject; // game thread (pump) only
 
@@ -2532,6 +2998,16 @@ namespace
     constexpr float     kFollowTeleportM = 30.0f; // OPT-IN teleport leash distance (only if aiAllowTeleport; default off -> they WALK)
     constexpr float     kGuardEngageM    = 40.0f; // a guard engages a threat within this range of YOU or of itself
     constexpr ULONGLONG kMoveReissueMs   = 800;   // don't restart pathfinding more often than this -- re-issuing every pump WAS the "stutter / stand still / circle"
+    // She's fast and overshoots, so finish a bit early and stand off: aim the MoveTo at a
+    // 2.5 m ring (her braking/momentum then coasts her to ~2 m) and only (re)chase once you're
+    // past 3.5 m. The 1 m hysteresis band keeps her parked instead of jittering at the edge.
+    constexpr float     kHookFollowStopM = 2.5f;   // hold ring + MoveTo acceptance (finish point)
+    constexpr float     kHookFollowStartM = 3.5f;  // re-chase ring (hysteresis)
+    constexpr float     kHookPerimeterM = 12.0f;
+    constexpr float     kHookAttackerAwarenessM = 35.0f;
+    constexpr float     kHookFirstHitContactM = 4.5f;
+
+    bool ApplyAiKill(UObject* ai);
 
     // Reliable nav walk toward an actor (AIBlueprintHelperLibrary.SimpleMoveToActor):
     // sets up persistent path following on the controller so it WALKS (with locomotion
@@ -2561,6 +3037,162 @@ namespace
         p.bForce = true; // ignore the AI's input-ignore gate
         pawn->ProcessEvent(fn, &p);
         return true;
+    }
+
+    uint8_t* GetCharacterMovementPtr(UObject* pawn)
+    {
+        if (!CharacterUsable(pawn))
+            return nullptr;
+        uint8_t* base = reinterpret_cast<uint8_t*>(pawn);
+        if (!Mem::IsReadable(base + AH::Char_CharacterMovement, sizeof(void*)))
+            return nullptr;
+        uint8_t* movement = *reinterpret_cast<uint8_t**>(base + AH::Char_CharacterMovement);
+        return Mem::IsReadable(movement, AH::Move_MaxWalkSpeed + sizeof(float)) ? movement : nullptr;
+    }
+
+    bool WriteHookFollowVelocity(UObject* pawn, const FVector& direction, float speed)
+    {
+        uint8_t* movement = GetCharacterMovementPtr(pawn);
+        if (!movement || !Mem::IsReadable(movement + AH::Move_Velocity, sizeof(FVector)))
+            return false;
+        FVector& velocity = *reinterpret_cast<FVector*>(movement + AH::Move_Velocity);
+        velocity.X = direction.X * speed;
+        velocity.Y = direction.Y * speed;
+        // Preserve vertical physics: stairs, falling and ability landing remain native.
+        return true;
+    }
+
+    bool RecoverHookFollowerMovement(UObject* pawn, UObject* controller)
+    {
+        uint8_t* movement = GetCharacterMovementPtr(pawn);
+        if (!movement)
+            return false;
+
+        UObject* movementObject = reinterpret_cast<UObject*>(movement);
+        bool touched = false;
+        // Reactivate the component and its tick using reflected engine functions. These
+        // are only called after measured zero displacement, never continuously.
+        if (UFunction* fn = CachedObjectClassFn(movementObject, "SetComponentTickEnabled"))
+        {
+            P_BoolParam p{ true };
+            movementObject->ProcessEvent(fn, &p);
+            touched = true;
+        }
+        if (UFunction* fn = CachedObjectClassFn(movementObject, "Activate"))
+        {
+            P_BoolParam p{ true }; // bReset=true
+            movementObject->ProcessEvent(fn, &p);
+            touched = true;
+        }
+
+        // A stopped combat/ability state can leave this regular ground guard in
+        // MOVE_None/custom mode. Hook Diagnostics excludes Twins here, so restoring
+        // Walking is the correct fail-closed recovery for its follow state.
+        if (Mem::IsReadable(movement + AH::Move_MovementMode, 1))
+        {
+            uint8_t& mode = *reinterpret_cast<uint8_t*>(movement + AH::Move_MovementMode);
+            if (mode != AH::MOVE_Walking)
+            {
+                mode = AH::MOVE_Walking;
+                touched = true;
+            }
+        }
+        if (controller)
+        {
+            if (UFunction* stop = CachedObjectClassFn(controller, "StopMovement"))
+                ProcessNoParams(controller, stop);
+        }
+        EnsureFollowerCanMove(pawn);
+        return touched;
+    }
+
+    struct HookPathChainState
+    {
+        UObject* pathFollower = nullptr;
+        UObject* boundMovement = nullptr;
+        UObject* characterMovement = nullptr;
+        UObject* navData = nullptr;
+        FVector velocity{};
+        uint8_t movementMode = 0;
+        bool repairedBinding = false;
+        bool reactivated = false;
+    };
+
+    bool ActivateHookComponent(UObject* component)
+    {
+        if (!Mem::IsReadable(component, 0x30)) return false;
+        bool ok = false;
+        if (UFunction* fn = CachedObjectClassFn(component, "SetComponentTickEnabled"))
+        {
+            P_BoolParam p{ true };
+            component->ProcessEvent(fn, &p);
+            ok = true;
+        }
+        if (UFunction* fn = CachedObjectClassFn(component, "Activate"))
+        {
+            P_BoolParam p{ true };
+            component->ProcessEvent(fn, &p);
+            ok = true;
+        }
+        return ok;
+    }
+
+    // ReVa chain: AIController +0x798 -> PathFollowingComponent +0x428 -> MovementComp +0x108.
+    // A spawned Hook Twin can accept the route and report Moving while that final binding is null,
+    // stale, inactive, or still attached to its 3D movement backend. Repair only the Hook Twin's
+    // ground-follow chain and leave every other AI/component untouched.
+    bool EnsureHookTwinGroundPathChain(UObject* guard, UObject* ctrl, bool reactivate,
+                                       HookPathChainState& out)
+    {
+        if (!ControllerOwnsPawn(ctrl, guard)) return false;
+        auto* controllerBytes = reinterpret_cast<uint8_t*>(ctrl);
+        if (!Mem::IsReadable(controllerBytes + AH::AICtrl_PathFollowing, sizeof(void*))) return false;
+        out.pathFollower = *reinterpret_cast<UObject**>(controllerBytes + AH::AICtrl_PathFollowing);
+        uint8_t* path = reinterpret_cast<uint8_t*>(out.pathFollower);
+        uint8_t* movement = GetCharacterMovementPtr(guard);
+        out.characterMovement = reinterpret_cast<UObject*>(movement);
+        if (!Mem::IsReadable(path, 0x30) || !movement ||
+            !Mem::IsReadable(path + AH::PathFollow_MovementComp, sizeof(void*))) return false;
+
+        out.boundMovement = *reinterpret_cast<UObject**>(path + AH::PathFollow_MovementComp);
+        if (out.boundMovement != out.characterMovement)
+        {
+            *reinterpret_cast<UObject**>(path + AH::PathFollow_MovementComp) = out.characterMovement;
+            out.boundMovement = out.characterMovement;
+            out.repairedBinding = true;
+            reactivate = true;
+        }
+        if (Mem::IsReadable(path + AH::PathFollow_NavData, sizeof(void*)))
+            out.navData = *reinterpret_cast<UObject**>(path + AH::PathFollow_NavData);
+
+        if (reactivate)
+        {
+            out.reactivated = ActivateHookComponent(out.pathFollower);
+            out.reactivated = ActivateHookComponent(out.characterMovement) || out.reactivated;
+        }
+
+        if (Mem::IsReadable(movement + AH::Move_MovementMode, 1))
+        {
+            out.movementMode = *reinterpret_cast<uint8_t*>(movement + AH::Move_MovementMode);
+            if (out.movementMode != AH::MOVE_Walking)
+            {
+                UObject* movementObject = reinterpret_cast<UObject*>(movement);
+                if (UFunction* fn = CachedObjectClassFn(movementObject, "SetMovementMode"))
+                {
+                    P_SetMovementMode p{ AH::MOVE_Walking, 0 };
+                    movementObject->ProcessEvent(fn, &p);
+                }
+                if (Mem::IsReadable(movement + AH::Move_MovementMode, 1) &&
+                    *reinterpret_cast<uint8_t*>(movement + AH::Move_MovementMode) != AH::MOVE_Walking)
+                    *reinterpret_cast<uint8_t*>(movement + AH::Move_MovementMode) = AH::MOVE_Walking;
+                out.movementMode = *reinterpret_cast<uint8_t*>(movement + AH::Move_MovementMode);
+                out.reactivated = true;
+            }
+        }
+        if (Mem::IsReadable(movement + AH::Move_Velocity, sizeof(FVector)))
+            out.velocity = *reinterpret_cast<FVector*>(movement + AH::Move_Velocity);
+        EnsureFollowerCanMove(guard);
+        return out.boundMovement == out.characterMovement && out.movementMode == AH::MOVE_Walking;
     }
 
     // Teleport a follower right next to the player. The reliability failsafe so
@@ -2700,6 +3332,134 @@ namespace
             SetControllerTargetEnemy(ctrl, nullptr, true);
     }
 
+    void ClearHookBodyguardCombat(UObject* guard, UObject* player, const char* reason)
+    {
+        InjectState& s = g_inject[guard];
+        UObject* cached = ReadAiTargetField(guard);
+        bool hadCombatTarget = (s.target && s.target != player) || (cached && cached != player);
+
+        // Transition-only teardown. Re-sending the native target/aggression/team
+        // setters every 200 ms while already idle restarts the AI state machine and
+        // eventually leaves CharacterMovement accepting input but consuming none.
+        if (hadCombatTarget)
+        {
+            WriteAiTargetField(guard, nullptr);
+            SetAiTargetEnemy(guard, nullptr, true);
+            if (UObject* ctrl = GetAiController(guard))
+            {
+                SetControllerTargetEnemy(ctrl, nullptr, true);
+                SetControllerAggressive(ctrl, false);
+            }
+            StopCharacterAggressive(guard);
+            SwitchAiTeamFriendlyTo(guard, player);
+            s.lastFriendlyMs = GetTickCount64();
+        }
+        ClearAiAggressiveLatch(guard);
+        g_engagedUntilMs.erase(guard);
+        g_lastThreatMs.erase(guard);
+        if (hadCombatTarget)
+        {
+            g_hookStaleTargetsCleared.fetch_add(1, std::memory_order_relaxed);
+            LOG("[AI-HOOK] combat target cleared immediately: guard=%p target=%p reason=%s",
+                (void*)guard, (void*)(s.target ? s.target : cached), reason ? reason : "stand-down");
+        }
+        s.target = nullptr;
+        s.hitTarget = nullptr;
+        s.lastTargetHealth = -1.0f;
+        s.targetArmedMs = 0;
+    }
+
+    bool TryHookFirstHitKill(UObject* guard, UObject* target, const FVector& guardLoc,
+                             const FVector& targetLoc, ULONGLONG now)
+    {
+        InjectState& s = g_inject[guard];
+        float cur = -1.0f, mx = 0.0f;
+        bool hasHealth = ReadCharacterHealth(target, cur, mx) && mx > 0.001f && std::isfinite(cur);
+
+        if (s.hitTarget != target)
+        {
+            s.hitTarget = target;
+            s.lastTargetHealth = hasHealth ? cur : -1.0f;
+            s.targetArmedMs = now;
+            return false;
+        }
+
+        bool damageObserved = hasHealth && s.lastTargetHealth > 0.0f && cur + 0.01f < s.lastTargetHealth;
+        float targetDistance = DistanceMetres(guardLoc, targetLoc);
+        // Damage deltas are authoritative. The close-contact fallback handles robots
+        // whose friendly-fire filter suppresses the damage event despite a connected
+        // native melee montage; 850 ms leaves time for the first swing to land.
+        bool firstContact = targetDistance <= kHookFirstHitContactM &&
+                            s.targetArmedMs && now - s.targetArmedMs >= 850;
+        if (hasHealth)
+            s.lastTargetHealth = cur;
+        if (!damageObserved && !firstContact)
+            return false;
+
+        const char* source = damageObserved ? "damage-delta" : "melee-contact";
+        bool killed = ApplyAiKill(target);
+        if (killed)
+        {
+            uint64_t total = g_hookFirstHitKills.fetch_add(1, std::memory_order_relaxed) + 1;
+            LOG("[AI-HIT] first-hit kill: guard=%p target=%p source=%s distance=%.1fm total=%llu",
+                (void*)guard, (void*)target, source, targetDistance, (unsigned long long)total);
+        }
+        return killed;
+    }
+
+    // Dedicated Hook Diagnostics bodyguard state machine. Perception is an
+    // all-direction cache scan (no view-cone test); the selector below limits it to
+    // a 12 m protection perimeter, or 35 m only when an enemy is actively targeting
+    // the player/managed guard. No stale combat hold is retained after death.
+    bool InjectHookBodyguard(UObject* guard, UObject* player, const FVector& playerLoc,
+                             UObject* threat, bool forceEngage = false)
+    {
+        if (!FollowPawnUsable(guard) || !Mem::IsReadable(player, 0x30) || guard == player)
+            return false;
+
+        EnsureFollowerCanMove(guard);
+        SuppressGuardTargetingPlayer(guard, player);
+        FVector guardLoc{}, threatLoc{};
+        // Hook Diagnostics owns its protection/combat policy. Do not depend on
+        // the normal AI/Squad tab's "squad aggressive" setting.
+        bool engage = ReadActorLocationFast(guard, guardLoc) &&
+                      IsLiveCombatTarget(threat) && threat != guard && threat != player &&
+                      !IsHookBodyguard(threat) && ReadActorLocationFast(threat, threatLoc);
+
+        if (engage)
+        {
+            UObject* enemyTarget = ReadAiTargetField(threat);
+            bool attacksProtected = enemyTarget == player ||
+                                    (enemyTarget && IsHookBodyguard(enemyTarget));
+            float dPlayer = DistanceMetres(playerLoc, threatLoc);
+            float dGuard = DistanceMetres(guardLoc, threatLoc);
+            bool continuing = g_inject[guard].target == threat;
+            engage = forceEngage || dPlayer <= kHookPerimeterM || dGuard <= kHookPerimeterM ||
+                     (continuing && dGuard <= kHookAttackerAwarenessM) ||
+                     (attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM);
+        }
+
+        if (!engage)
+        {
+            ClearHookBodyguardCombat(guard, player,
+                threat && !IsLiveCombatTarget(threat) ? "dead/unreadable" : "no eligible 360-degree threat");
+            return true; // Hook native follow owns all movement outside combat
+        }
+
+        SetCharacterInstigatedDamage(guard, 10000.0f);
+        InjectAttack(guard, threat, nullptr, 0, (int)kGuardTeam);
+        SuppressGuardTargetingPlayer(guard, player);
+        g_engagedUntilMs[guard] = GetTickCount64() + 350; // bridges the 5 Hz selector only
+
+        ULONGLONG now = GetTickCount64();
+        if (TryHookFirstHitKill(guard, threat, guardLoc, threatLoc, now))
+        {
+            ClearHookBodyguardCombat(guard, player, "first hit completed");
+            return true;
+        }
+        return true; // native combat/abilities own movement while engaged
+    }
+
     // Force a mixed-navigation character (the Twins = AAIMixedNavigationCharacter) onto
     // GROUND nav so the follow drive can actually move it. WHY: a Twin switches between
     // ground walk and 3D flight; while flight nav is active it ignores the ground
@@ -2827,6 +3587,8 @@ namespace
     {
         if (!FollowPawnUsable(guard) || !Mem::IsReadable(player, 0x30) || guard == player)
             return false;
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && IsHookBodyguard(guard))
+            return InjectHookBodyguard(guard, player, playerLoc, threat);
 
         // Drive combat for ANY squad AHAICharacter, NOT just ones the BT-name heuristic
         // (AiIsCombatCapable) flags "combat". WHY: the heuristic mis-flagged the Twins
@@ -2844,12 +3606,11 @@ namespace
 
         if (combatCapable)
         {
-            // The player is always the guard's ALLY (never a valid target), and any
-            // stray player-target gets blanked before we decide engage/idle below.
+            // The player is protected/followed/focused but is NEVER stored in
+            // TargetAlly: that native path requires AHAICharacter, while the player
+            // is only AHBaseCharacter. Friendship is supplied by the Hook Debug
+            // pair override and team logic instead.
             WriteAiAggressiveFlags(guard, true);
-            SetAiTargetAlly(guard, player);
-            if (UObject* ctrl = GetAiController(guard))
-                SetControllerTargetAlly(ctrl, player);
             SuppressGuardTargetingPlayer(guard, player);
         }
 
@@ -3050,7 +3811,8 @@ namespace
             return false;
 
         // Baseline convert: friendly to the player (team 0, so it stops hitting you)
-        // + ally = player, and record its real team so release can restore it. This
+        // without ever storing the player in TargetAlly, and record its real team
+        // so release can restore it. This
         // is only the DOCILE resting state -- team 0 does NOT make it hunt the robots
         // (team 0 is the game's passive/civilian faction). The per-frame squad pump
         // (InjectBodyguard) is what arms it: when a threat is near it parks the guard
@@ -3059,10 +3821,12 @@ namespace
         bool ok = false;
         if (AiUsable(ai))
         {
-            WriteAiAggressiveFlags(ai, true);
+            const bool hookOwned = g_hookBodyguardMode.load(std::memory_order_relaxed) &&
+                                   IsHookBodyguard(ai);
+            if (hookOwned) ClearAiAggressiveLatch(ai);
+            else WriteAiAggressiveFlags(ai, true);
             ok = SetAiPassive(ai, false);
             ok = SwitchAiTeamFriendlyTo(ai, player) || ok;
-            ok = SetAiTargetAlly(ai, player) || ok;
             WriteAiTargetField(ai, nullptr);   // drop any aggro on the player
             SetAiTargetEnemy(ai, nullptr, true);
             // Make sure the BT isn't left in its attack branch from a prior state.
@@ -3071,17 +3835,27 @@ namespace
                 SetControllerTargetEnemy(ctrl, nullptr, true);
                 SetControllerAggressive(ctrl, false);
             }
-            // Ground her ONCE at recruit so she follows on flat ground. We do NOT re-pin on a
-            // timer (the REPEATED re-pin was what froze her animations) -- the per-frame follow
-            // only re-grounds her once when she lands back on flat after a flight traversal.
-            ForceGroundNavIfMixed(ai);
-            // Start her dedicated Twin state fresh (clears any stale phase from a prior
-            // recruit/release cycle; the brain + per-frame follow re-seed it).
-            g_twin.erase(ai);
+            if (!hookOwned)
+            {
+                // The normal squad path retains its existing one-time grounding.
+                // Hook Diagnostics must not seed the legacy Twin movement state:
+                // its native mixed-navigation transition owns 2D/3D selection.
+                ForceGroundNavIfMixed(ai);
+                g_twin.erase(ai);
+            }
         }
 
-        // Follow closely + constantly. Some callers pass an empty hint (e.g. the
-        // spawn fixup), so read a fresh player location when the hint is unset.
+        // Hook Diagnostics performs no movement here. Its 20 Hz native controller
+        // acquires exactly one Mercuna/AIController request after this safe team and
+        // target initialization, so recruitment cannot leave a legacy SDK request
+        // queued underneath the ownership detours.
+        const bool hookOwned = g_hookBodyguardMode.load(std::memory_order_relaxed) &&
+                               IsHookBodyguard(ai);
+        if (hookOwned)
+            return ok;
+
+        // Normal squad follow keeps its existing SDK behavior. Some callers pass
+        // an empty hint (e.g. spawn fixup), so read a fresh player location.
         FVector playerLoc = playerLocHint;
         if (playerLoc.X == 0.0f && playerLoc.Y == 0.0f && playerLoc.Z == 0.0f)
             ReadActorLocationFast(player, playerLoc);
@@ -3164,7 +3938,9 @@ namespace
     }
 
     // One game-frame fixup pass; re-queues itself so the actor is force-shown a
-    // few frames running (significance re-hides on the frame it spawns).
+    // few frames running (significance re-hides on the frame it spawns). Hook
+    // bodyguards snap only once: repeated grounding fights the native mixed-nav
+    // transition and can leave a Twin's locomotion state pinned.
     void SpawnFixupPass(UObject* actor, UObject* player, int passesLeft)
     {
         try
@@ -3172,7 +3948,8 @@ namespace
             if (!Mem::IsReadable(actor, 0x30))
                 return;
             ForceActorVisible(actor);
-            SnapAiToGround(actor);
+            if (!IsHookBodyguard(actor) || passesLeft == 5)
+                SnapAiToGround(actor);
             if (Mem::IsReadable(player, 0x30))
                 ApplyAiBodyguard(actor, player, {}); // keep it friendly while it settles
             if (passesLeft > 1)
@@ -3653,6 +4430,43 @@ namespace
         return best;
     }
 
+    // Hook Debug 360-degree perception: every cached live combat AI is considered,
+    // independent of the guard's facing. Proximity is intentionally narrow so a
+    // distant idle robot does not drag the bodyguard into combat across the level.
+    UObject* SelectHookThreat360(const std::vector<InjNode>& pool, UObject* guard,
+                                 const FVector& guardLoc, UObject* player,
+                                 const FVector& playerLoc, float* outDistance = nullptr)
+    {
+        UObject* best = nullptr;
+        float bestScore = 3.4e38f;
+        float bestDistance = -1.0f;
+        for (const InjNode& n : pool)
+        {
+            if (!n.ok || n.actor == guard || n.actor == player || IsHookBodyguard(n.actor) ||
+                !IsLiveCombatTarget(n.actor) || !AiIsCombatCapable(n.actor))
+                continue;
+            float dPlayer = DistanceMetres(n.loc, playerLoc);
+            float dGuard = DistanceMetres(n.loc, guardLoc);
+            UObject* currentTarget = ReadAiTargetField(n.actor);
+            bool attacksProtected = currentTarget == player ||
+                                    (currentTarget && IsHookBodyguard(currentTarget));
+            bool eligible = dPlayer <= kHookPerimeterM || dGuard <= kHookPerimeterM ||
+                            (attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM);
+            if (!eligible)
+                continue;
+            float nearestProtected = std::min(dPlayer, dGuard);
+            float score = nearestProtected - (attacksProtected ? 1000.0f : 0.0f);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestDistance = nearestProtected;
+                best = n.actor;
+            }
+        }
+        if (outDistance) *outDistance = bestDistance;
+        return best;
+    }
+
     void ReleaseFightParticipants(const char* why)
     {
         int n = 0;
@@ -3827,17 +4641,20 @@ namespace
         {
             if (!FollowPawnUsable(ally) || ally == player)
                 continue;
+            const bool hookOwned = g_hookBodyguardMode.load(std::memory_order_relaxed) &&
+                                   IsHookBodyguard(ally);
             // Twins are driven by their OWN dedicated brain (DriveTwinCombat) + per-frame
             // follow -- never the normal squad combat/follow path. Keep her completely
             // separate (no ground-nav hammering, no InjectBodyguard, no assist-kill here).
-            if (IsMixedNavCharacter(ally))
+            if (IsMixedNavCharacter(ally) && !hookOwned)
                 continue;
             FVector loc{};
             if (!ReadActorLocationFast(ally, loc))
                 continue;
             ++dbgDriven;
-            // Keep mixed-nav members (Twins) pinned to GROUND nav so the follow drive can
-            // move them. Re-asserted on a slow per-member timer (no-op for normal pawns).
+            // Legacy squad members keep their old grounding heartbeat. Hook Twins
+            // must never enter it: their ReVa-derived mixed-nav state owns this field.
+            if (!hookOwned)
             {
                 static std::unordered_map<UObject*, ULONGLONG> groundNavMs; // game thread
                 ULONGLONG& gnm = groundNavMs[ally];
@@ -3850,21 +4667,37 @@ namespace
             // Otherwise choose the nearest threat to the guard as before.
             UObject* threat = nullptr;
             float bestAttackerD = 3.4e38f;
-            for (const InjNode& candidate : threats)
+            if (hookOwned)
             {
-                if (!candidate.ok || candidate.actor == ally || candidate.actor == player)
-                    continue;
-                uint8_t* cb = reinterpret_cast<uint8_t*>(candidate.actor);
-                bool attacksPlayer =
-                    Mem::IsReadable(cb + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
-                    *reinterpret_cast<UObject**>(cb + AH::AICh_CachedTargetEnemy) == player;
-                if (!attacksPlayer)
-                    continue;
-                float d = DistanceMetres(candidate.loc, playerLoc);
-                if (d < bestAttackerD) { bestAttackerD = d; threat = candidate.actor; }
+                InjectState& hs = g_inject[ally];
+                if (IsLiveCombatTarget(hs.target))
+                {
+                    FVector retainedLoc{};
+                    if (ReadActorLocationFast(hs.target, retainedLoc) &&
+                        DistanceMetres(loc, retainedLoc) <= kHookAttackerAwarenessM)
+                        threat = hs.target;
+                }
+                if (!threat)
+                    threat = SelectHookThreat360(threats, ally, loc, player, playerLoc, &bestAttackerD);
             }
-            if (!threat)
-                threat = NearestNode(threats, loc, player, -1, nullptr);
+            else
+            {
+                for (const InjNode& candidate : threats)
+                {
+                    if (!candidate.ok || candidate.actor == ally || candidate.actor == player)
+                        continue;
+                    uint8_t* cb = reinterpret_cast<uint8_t*>(candidate.actor);
+                    bool attacksPlayer =
+                        Mem::IsReadable(cb + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
+                        *reinterpret_cast<UObject**>(cb + AH::AICh_CachedTargetEnemy) == player;
+                    if (!attacksPlayer)
+                        continue;
+                    float d = DistanceMetres(candidate.loc, playerLoc);
+                    if (d < bestAttackerD) { bestAttackerD = d; threat = candidate.actor; }
+                }
+                if (!threat)
+                    threat = NearestNode(threats, loc, player, -1, nullptr);
+            }
             // Diagnostics: nearest threat distance to this guard + whether it's engaged.
             if (threat)
             {
@@ -3889,7 +4722,7 @@ namespace
                 // attacking you. Applied to ANY usable squad member (raw attribute write,
                 // crash-safe) -- gating this on the BT heuristic skipped mis-flagged combat
                 // units like the Twins; a true civilian that never swings just never uses it.
-                if (AiUsable(ally)) SetCharacterInstigatedDamage(ally, 100.0f);
+                if (AiUsable(ally)) SetCharacterInstigatedDamage(ally, hookOwned ? 10000.0f : 100.0f);
 
                 // ASSIST-KILL (user request: "trigger a kill event on the enemy it's
                 // targeting, for speed"). A guard's own swings are slow/unreliable, so when
@@ -3897,7 +4730,7 @@ namespace
                 // is actively ATTACKING YOU, finish it directly -> robots die fast even when
                 // several pile on. Non-combat NPCs (civilians/Larisa) are NEVER touched, and
                 // it's gated on aiSquadAggressive so "peaceful followers" stays peaceful.
-                if (Features::Get().aiSquadAggressive && threat && threat != player
+                if (!hookOwned && Features::Get().aiSquadAggressive && threat && threat != player
                     && AiUsable(threat) && AiIsCombatCapable(threat))
                 {
                     FVector tl{};
@@ -3965,7 +4798,8 @@ namespace
 
         std::vector<UObject*> twins;
         for (UObject* a : squad)
-            if (Mem::IsReadable(a, 0x30) && IsMixedNavCharacter(a))
+            if (Mem::IsReadable(a, 0x30) && IsMixedNavCharacter(a) &&
+                !(g_hookBodyguardMode.load(std::memory_order_relaxed) && IsHookBodyguard(a)))
                 twins.push_back(a);
         if (twins.empty())
             return;
@@ -4020,9 +4854,6 @@ namespace
 
             // HARD never-attack-you: she is always your ally; blank any aggro on you.
             WriteAiAggressiveFlags(twin, true);
-            SetAiTargetAlly(twin, player);
-            if (UObject* ctrl = GetAiController(twin))
-                SetControllerTargetAlly(ctrl, player);
             SuppressGuardTargetingPlayer(twin, player);
 
             // Threat selection: prefer an enemy attacking YOU, else the nearest to HER, and
@@ -4168,9 +4999,14 @@ namespace
     }
 
     // Register a freshly spawned ally into the squad (locked, dedup + cap).
-    void RegisterSpawnedAlly(UObject* ally)
+    void RegisterSpawnedAlly(UObject* ally, bool hookOwned)
     {
         SquadAdd(ally);
+        if (hookOwned)
+        {
+            HookBodyguardAdd(ally);
+            LOG("[AI-HOOK] spawned bodyguard registered in Hook Diagnostics roster: %p", (void*)ally);
+        }
     }
 
     // =======================================================================
@@ -4180,7 +5016,7 @@ namespace
     //  the spawn/fixup/register logic lives in ONE place. Caller resolves the
     //  UClass (nearest live enemy, or a saved class re-resolved by name).
     // =======================================================================
-    void SpawnAndRegisterAlly(UClass* pawnClass)
+    void SpawnAndRegisterAlly(UClass* pawnClass, bool hookOwned = false)
     {
         if (!Mem::IsReadable(pawnClass, 0x30))
         {
@@ -4238,7 +5074,7 @@ namespace
 
         // Register FIRST (so the squad tracks it and Stand-down can remove it even if
         // the fixup throws), then run the fixup. Fixup is best-effort and self-guarded.
-        RegisterSpawnedAlly(spawned);
+        RegisterSpawnedAlly(spawned, hookOwned);
         try { SpawnFixupPass(spawned, player, 5); } catch (...) { LOG("SpawnAndRegisterAlly: fixup threw (ignored)"); }
         RequestAiDiscovery();
         LOG("SpawnAndRegisterAlly: spawned ally actor=%p", (void*)spawned);
@@ -4267,6 +5103,7 @@ namespace
         std::string path;
         std::string label;
         bool        cloneNearest = false;
+        bool        hookOwned = false;
     };
     std::mutex               g_spawnQueueMutex;
     std::vector<SpawnRequest> g_spawnQueue;        // any thread enqueues; game thread drains
@@ -4274,16 +5111,17 @@ namespace
     constexpr int            kMaxSpawnQueue   = 16;  // don't let requests pile up without bound
     constexpr ULONGLONG      kSpawnIntervalMs = 300; // stream: at most one construction per window
 
-    void EnqueueSpawn(SpawnRequest req)
+    bool EnqueueSpawn(SpawnRequest req)
     {
         std::lock_guard<std::mutex> lk(g_spawnQueueMutex);
         if ((int)g_spawnQueue.size() >= kMaxSpawnQueue)
         {
             LOG("Spawn queue full (%d) -- ignoring request", (int)g_spawnQueue.size());
-            return;
+            return false;
         }
         g_spawnQueue.push_back(std::move(req));
         g_spawnQueueCount = (int)g_spawnQueue.size();
+        return true;
     }
 
     // Load a class by its asset path ON DEMAND -- so we can spawn a saved NPC/boss
@@ -4397,7 +5235,7 @@ namespace
                 LOG("Spawn '%s': could not resolve/load type (see LoadClassByPath log above)", lbl);
                 return;
             }
-            SpawnAndRegisterAlly(cls);
+            SpawnAndRegisterAlly(cls, req.hookOwned);
             LOG("Spawn '%s': SpawnAndRegisterAlly returned cleanly", lbl);
         }
         catch (...) { LOG("DrainSpawnQueue: exception during spawn of '%s' (ignored)", lbl); }
@@ -9874,6 +10712,7 @@ void Features::AiClearSpawnedAllies()
         {
             std::vector<UObject*> squad;
             { std::lock_guard<std::mutex> lk(g_squadMutex); squad.swap(g_spawnedAllies); g_spawnedAllyCount = 0; }
+            { std::lock_guard<std::mutex> lk(g_hookBodyguardMutex); g_hookBodyguards.clear(); }
             int n = 0;
             for (UObject* a : squad)
                 if (AiUsable(a) && ApplyAiRelease(a)) ++n; // back to normal killable enemies
@@ -9979,6 +10818,402 @@ int  Features::HordeRound()       { return g_hordeRound.load(); }
 int  Features::HordeAliveCount()  { return g_hordeAlive.load(); }
 int  Features::HordeKillCount()   { return g_hordeKills.load(); }
 int  Features::HordePendingCount(){ return g_hordePending.load(); }
+
+// ---- AI ownership lock (native ProcessEvent-level "they're ours, permanently") ----
+void Features::SetOwnershipLock(bool on)
+{
+    if (on)
+    {
+        // Resolve (and cache) the three un-ally UFunctions we compare against, and make
+        // sure the ProcessEvent detour is live so the swallow can actually fire.
+        if (!g_fnOwnSwitchTeamAttitude.load())
+            g_fnOwnSwitchTeamAttitude.store(CachedClassFn(AH::Cls_AICharacter, "SwitchTeamToMatchCharacterAttitude"));
+        if (!g_fnOwnSetTargetEnemy.load())
+            g_fnOwnSetTargetEnemy.store(CachedClassFn(AH::Cls_AICharacter, "SetTargetEnemy"));
+        if (!g_fnOwnSetBbTargetEnemy.load())
+            g_fnOwnSetBbTargetEnemy.store(CachedClassFn(AH::Cls_AHAIController, "SetBlackboardTargetEnemy"));
+        InstallProcessEventHook();
+        LOG("Ownership lock: ON (resolved switch=%p targetEnemy=%p bbTargetEnemy=%p)",
+            g_fnOwnSwitchTeamAttitude.load(), g_fnOwnSetTargetEnemy.load(), g_fnOwnSetBbTargetEnemy.load());
+    }
+    else
+    {
+        LOG("Ownership lock: OFF");
+    }
+    g_ownershipLock.store(on, std::memory_order_relaxed);
+}
+bool     Features::OwnershipLockActive()  { return g_ownershipLock.load(std::memory_order_relaxed); }
+uint64_t Features::OwnershipSwallowCount(){ return g_ownershipSwallows.load(std::memory_order_relaxed); }
+bool     Features::OwnershipResolved()
+{
+    return g_fnOwnSwitchTeamAttitude.load() && g_fnOwnSetTargetEnemy.load() && g_fnOwnSetBbTargetEnemy.load();
+}
+
+void Features::SetHookBodyguardMode(bool on)
+{
+    if (on && g_hookBodyguardMode.load(std::memory_order_relaxed) && HookFriendshipResolved())
+        return;
+    if (!on)
+    {
+        g_hookBodyguardMode.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(g_hookControllerOwnedMutex);
+            g_hookControllerOwned.clear();
+        }
+        std::vector<UObject*> guards = HookBodyguardSnapshot();
+        QueueGameThread([guards]() { for (UObject* guard : guards) ReleaseHookNativeMovement(guard, true); });
+        SetOwnershipLock(false);
+        LOG("[AI-HOOK] experimental Hook Debug bodyguard mode OFF");
+        return;
+    }
+
+    bool peReady = InstallProcessEventHook();
+    UFunction* fn = FindFunction(AH::Fn_AIUtils_AreFriendlyCharacters);
+    bool exactMetadata = false;
+    try { exactMetadata = Mem::IsReadable(fn, 0x30) && fn->GetFullName() == AH::Fn_AIUtils_AreFriendlyCharacters; }
+    catch (...) { exactMetadata = false; }
+    if (exactMetadata)
+        g_fnHookAreFriendly.store(fn, std::memory_order_relaxed);
+    g_fnHookMoveToActor.store(CachedFn(AH::Fn_AIController_MoveToActor), std::memory_order_relaxed);
+    g_fnHookMoveToLocation.store(CachedFn(AH::Fn_AIController_MoveToLocation), std::memory_order_relaxed);
+    g_fnHookStopMovement.store(CachedFn(AH::Fn_AIController_StopMovement), std::memory_order_relaxed);
+    g_fnHookSetCharacterAggressive.store(CachedFn(AH::Fn_AIUtils_SetCharacterAggressive), std::memory_order_relaxed);
+    g_fnHookSetCharacterPassive.store(CachedFn(AH::Fn_AIUtils_SetCharacterPassive), std::memory_order_relaxed);
+    AiMovementHooks::ResolveHelpers(CachedFn(AH::Fn_Mercuna_MoveToLocation), nullptr);
+
+    const bool ready = peReady && exactMetadata;
+    g_hookBodyguardMode.store(ready, std::memory_order_relaxed);
+    if (ready)
+    {
+        SetOwnershipLock(true);
+        LOG("[AI-HOOK] friendship hook resolved via SDK metadata: %s -> %p; ReVa native exec thunk RVA 0x225BDA0 confirmed",
+            AH::Fn_AIUtils_AreFriendlyCharacters, (void*)fn);
+        LOG("[AI-HOOK] experimental bodyguard mode ACTIVE (follow/protect/attack driven by our hook pump; TargetAlly never receives player)");
+        LOG("[AI-MOVE] controller ownership resolved moveActor=%p moveLocation=%p stop=%p",
+            g_fnHookMoveToActor.load(), g_fnHookMoveToLocation.load(), g_fnHookStopMovement.load());
+    }
+    else
+    {
+        LOG("[AI-HOOK] optional friendship hook unavailable: ProcessEvent=%d UFunction=%p exactMetadata=%d; mode refused fail-closed",
+            peReady ? 1 : 0, (void*)fn, exactMetadata ? 1 : 0);
+    }
+}
+
+bool Features::HookBodyguardModeActive()
+{
+    return g_hookBodyguardMode.load(std::memory_order_relaxed);
+}
+
+bool Features::HookFriendshipResolved()
+{
+    return oProcessEvent && Mem::IsReadable(g_fnHookAreFriendly.load(std::memory_order_relaxed), 0x30);
+}
+
+uint64_t Features::HookFriendshipForceCount()
+{
+    return g_friendshipForces.load(std::memory_order_relaxed);
+}
+
+uint64_t Features::UnsafeTargetAllySkipCount()
+{
+    return g_unsafeTargetAllySkips.load(std::memory_order_relaxed);
+}
+
+Features::HookBodyguardValidation Features::ValidateHookBodyguardPair(bool writeLog)
+{
+    HookBodyguardValidation out{};
+    UObject* guard = HookDebugSelectedGuard();
+    UObject* player = GetLocalPawn();
+    out.guard = reinterpret_cast<std::uintptr_t>(guard);
+    out.player = reinterpret_cast<std::uintptr_t>(player);
+    out.guardManaged = guard && IsHookBodyguard(guard);
+    out.guardIsAHAICharacter = guard && NativeHooks::IsAHAICharacter(guard);
+    out.playerIsAHAICharacter = player && NativeHooks::IsAHAICharacter(player);
+    UClass* baseClass = FindObjectFast(AH::Cls_AHBaseCharacter);
+    out.playerIsAHBaseCharacter = player && baseClass && player->IsA(baseClass);
+    out.legacyTargetAllyWouldBeUnsafe = player && !out.playerIsAHAICharacter;
+    out.currentCodeWouldAssignUnsafeTargetAlly = false;
+    out.friendshipWouldForce = HookBodyguardModeActive() && HookFriendshipResolved() &&
+                               out.guardManaged && out.guardIsAHAICharacter && player;
+    out.crashGuardActive = NativeHooks::CrashGuardActive();
+    out.mixedNavigation = guard && IsMixedNavCharacter(guard);
+    // Dry-run stays read-only: use only a component already registered by the
+    // game-thread native controller; never call GetComponentsByClass from the UI.
+    UObject* nav = guard ? AiMovementHooks::RegisteredNavigation(guard) : nullptr;
+    UObject* ctrl = guard ? GetAiController(guard) : nullptr;
+    out.navigationComponent = reinterpret_cast<std::uintptr_t>(nav);
+    out.controller = reinterpret_cast<std::uintptr_t>(ctrl);
+    AiMovementHooks::Status move = AiMovementHooks::GetStatus();
+    out.nativeMoveHelperResolved = move.moveHelperResolved;
+    out.nativeMercunaDetoursLive = move.mercunaDetoursLive;
+    out.nativeMovementOwned = guard && (AiMovementHooks::OwnsGuard(guard) || [&]() {
+        std::lock_guard<std::mutex> lock(g_hookControllerOwnedMutex);
+        return g_hookControllerOwned.find(guard) != g_hookControllerOwned.end();
+    }());
+    out.currentNavigationMode = out.mixedNavigation ? AiMovementHooks::CurrentMixedNavigation(guard) : 0;
+    out.movementBackend = nav ? "Mercuna native/vtable-owned" : (ctrl ? "AIController native/hook-owned" : "none (fail closed)");
+    try
+    {
+        if (guard)
+        {
+            out.guardName = guard->GetName();
+            UObject* cls = guard->Class();
+            out.guardClass = Mem::IsReadable(cls, 0x30) ? cls->GetName() : "<unreadable>";
+        }
+        if (player)
+        {
+            out.playerName = player->GetName();
+            UObject* cls = player->Class();
+            out.playerClass = Mem::IsReadable(cls, 0x30) ? cls->GetName() : "<unreadable>";
+        }
+    }
+    catch (...) {}
+
+    if (writeLog)
+    {
+        LOG("[AI-DRYRUN] guard=%p name=%s class=%s managed=%d isAHAI=%d | player=%p name=%s class=%s isAHBase=%d isAHAI=%d | legacyUnsafe=%d currentUnsafeAttempt=%d friendshipForce=%d crashGuard=%d | movement=%s nav=%p ctrl=%p owned=%d helper=%d detours=%d mixed=%d mode=%u",
+            (void*)guard, out.guardName.c_str(), out.guardClass.c_str(), out.guardManaged ? 1 : 0,
+            out.guardIsAHAICharacter ? 1 : 0, (void*)player, out.playerName.c_str(),
+            out.playerClass.c_str(), out.playerIsAHBaseCharacter ? 1 : 0,
+            out.playerIsAHAICharacter ? 1 : 0, out.legacyTargetAllyWouldBeUnsafe ? 1 : 0,
+            out.currentCodeWouldAssignUnsafeTargetAlly ? 1 : 0, out.friendshipWouldForce ? 1 : 0,
+            out.crashGuardActive ? 1 : 0, out.movementBackend.c_str(), (void*)nav, (void*)ctrl,
+            out.nativeMovementOwned?1:0, out.nativeMoveHelperResolved?1:0,
+            out.nativeMercunaDetoursLive?1:0, out.mixedNavigation?1:0,
+            (unsigned)out.currentNavigationMode);
+    }
+    return out;
+}
+
+void Features::DumpHookAiStatus()
+{
+    NativeHooks::DumpStatus();
+    AiMovementHooks::DumpStatus();
+    ValidateHookBodyguardPair(true);
+    LOG("[AI-HOOK] mode=%d friendshipResolved=%d friendshipForced=%llu unsafeTargetAllySkipped=%llu ownershipLock=%d ownershipBlocked=%llu directMoveInputs=%llu velocityFallbacks=%llu movementRecoveries=%llu firstHitKills=%llu staleTargetsCleared=%llu",
+        HookBodyguardModeActive() ? 1 : 0, HookFriendshipResolved() ? 1 : 0,
+        (unsigned long long)HookFriendshipForceCount(), (unsigned long long)UnsafeTargetAllySkipCount(),
+        OwnershipLockActive() ? 1 : 0, (unsigned long long)OwnershipSwallowCount(),
+        (unsigned long long)g_hookDirectMoveInputs.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookVelocityFallbacks.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookMovementRecoveries.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookFirstHitKills.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookStaleTargetsCleared.load(std::memory_order_relaxed));
+    LOG("[AI-CHAIN] combat target/state events=%llu/%llu aggressiveFn=%p passiveFn=%p",
+        (unsigned long long)g_hookCombatTargetEvents.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookCombatStateEvents.load(std::memory_order_relaxed),
+        g_fnHookSetCharacterAggressive.load(std::memory_order_relaxed),
+        g_fnHookSetCharacterPassive.load(std::memory_order_relaxed));
+    LOG("[AI-MOVE] controller external Move/Stop replacements blocked=%llu native-follow-states=%d",
+        (unsigned long long)g_hookControllerMovesBlocked.load(std::memory_order_relaxed),
+        HookAiCount());
+}
+
+void Features::RescanHookMovementResolvers()
+{
+    UFunction* force = nullptr;
+    UObject* guard = HookDebugSelectedGuard();
+    if (guard && IsMixedNavCharacter(guard)) force = CachedObjectClassFn(guard, "ForceNavigationType");
+    bool ok = AiMovementHooks::ResolveHelpers(CachedFn(AH::Fn_Mercuna_MoveToLocation), force);
+    LOG("[AI-MOVE] resolver rescan: moveHelper=%d selectedMixedForceFn=%p", ok?1:0, (void*)force);
+}
+
+int Features::HookAiRecruitNearby()
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive() || !G::sdkReady.load())
+        return 0;
+    std::vector<UObject*> targets = CollectNearbyAi(g_state.aiRadius, kMaxAiCommandTargets);
+    if (targets.empty())
+    {
+        RequestAiDiscovery();
+        LOG("[AI-HOOK] recruit nearby: no candidates yet");
+        return 0;
+    }
+    InstallProcessEventHook();
+    QueueGameThread([targets]()
+    {
+        UObject* player = GetLocalPawn();
+        FVector playerLoc{}; ReadLocalPawnLocationFast(playerLoc);
+        int added = 0;
+        for (UObject* ai : targets)
+        {
+            if (!AiUsable(ai) || ai == player) continue;
+            SquadAdd(ai);
+            HookBodyguardAdd(ai);
+            ApplyAiBodyguard(ai, player, playerLoc);
+            ++added;
+        }
+        LOG("[AI-HOOK] dedicated roster recruited %d bodyguard(s)", added);
+    });
+    return (int)targets.size();
+}
+
+bool Features::HookAiSpawnBodyguard()
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive())
+        return false;
+    if (!G::sdkReady.load() || !InstallProcessEventHook())
+        return false;
+    SpawnRequest req;
+    req.cloneNearest = true;
+    req.hookOwned = true;
+    req.label = "Hook Diagnostics nearest enemy";
+    bool queued = EnqueueSpawn(std::move(req));
+    LOG("[AI-HOOK] dedicated spawn %s", queued ? "queued" : "refused (queue full)");
+    return queued;
+}
+
+bool Features::HookAiSpawnModel(int index)
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive() || !G::sdkReady.load()) return false;
+    RefreshLiveModels();
+    if (index < 0 || index >= (int)g_liveModels.size())
+    {
+        LOG("[AI-HOOK] spawn selected refused: live model index %d unavailable", index);
+        return false;
+    }
+    UClass* cls = g_liveModels[index].cls;
+    std::string label = g_liveModels[index].name;
+    if (!Mem::IsReadable(cls, 0x30) || !InstallProcessEventHook()) return false;
+    SpawnRequest req;
+    req.cls = cls;
+    req.label = "Hook Diagnostics " + label;
+    req.hookOwned = true;
+    bool queued = EnqueueSpawn(std::move(req));
+    LOG("[AI-HOOK] selected runtime class '%s' spawn %s", label.c_str(), queued ? "queued" : "refused");
+    return queued;
+}
+
+bool Features::HookAiSpawnModelByName(const char* prettyName)
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive() || !G::sdkReady.load() || !prettyName || !*prettyName)
+        return false;
+    UClass* cls = nullptr;
+    std::string label, path;
+    {
+        std::lock_guard<std::mutex> lk(g_allModelsMutex);
+        for (const LiveModel& model : g_allModels)
+            if (model.name == prettyName)
+            { cls = model.cls; label = model.name; path = model.path; break; }
+    }
+    if (!Mem::IsReadable(cls, 0x30) && path.empty())
+    {
+        LOG("[AI-HOOK] model '%s' refused: class/path unavailable", prettyName);
+        return false;
+    }
+    if (!InstallProcessEventHook()) return false;
+    SpawnRequest req;
+    if (Mem::IsReadable(cls, 0x30)) req.cls = cls; else req.path = path;
+    req.label = "Hook Diagnostics " + label;
+    req.hookOwned = true;
+    bool queued = EnqueueSpawn(std::move(req));
+    LOG("[AI-HOOK] searchable model '%s' spawn %s (%s)", label.c_str(),
+        queued ? "queued" : "refused", cls ? "loaded runtime class" : "load-on-demand class path");
+    return queued;
+}
+
+void Features::HookAiFollow()
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive()) return;
+    std::vector<UObject*> guards = HookBodyguardSnapshot();
+    if (guards.empty()) { LOG("[AI-HOOK] follow: dedicated roster empty"); return; }
+    InstallProcessEventHook();
+    QueueGameThread([guards]()
+    {
+        UObject* player = GetLocalPawn();
+        int n = 0;
+        for (UObject* guard : guards)
+        {
+            if (!AiUsable(guard)) continue;
+            ClearHookBodyguardCombat(guard, player, "manual native follow");
+            g_engagedUntilMs.erase(guard);
+            ReleaseHookNativeMovement(guard, true); // next 20 Hz pass acquires a clean native request
+            ++n;
+        }
+        LOG("[AI-HOOK] native follow reset for %d dedicated bodyguard(s)", n);
+    });
+}
+
+void Features::HookAiAttack()
+{
+    SetHookBodyguardMode(true);
+    if (!HookBodyguardModeActive()) return;
+    std::vector<UObject*> units = HookBodyguardSnapshot();
+    if (units.empty()) { LOG("[AI-HOOK] attack: dedicated roster empty"); return; }
+    InstallProcessEventHook();
+    QueueGameThread([units]()
+    {
+        UObject* player = GetLocalPawn();
+        FVector playerLoc{};
+        if (!ReadLocalPawnLocationFast(playerLoc) || !Mem::IsReadable(player, 0x30))
+            return;
+        std::vector<UObject*> all = CollectAllCachedAi(kMaxCachedAiActors);
+        std::vector<InjNode> enemies;
+        std::vector<UObject*> candidates;
+        for (UObject* actor : all)
+        {
+            bool managed = false;
+            for (UObject* guard : units) if (guard == actor) { managed = true; break; }
+            if (!managed) candidates.push_back(actor);
+        }
+        BuildInjNodes(candidates, enemies);
+        int n = 0;
+        for (UObject* guard : units)
+        {
+            FVector loc{};
+            if (!AiUsable(guard) || !ReadActorLocationFast(guard, loc)) continue;
+            UObject* target = nullptr;
+            float best = 3.4e38f;
+            for (const InjNode& candidate : enemies)
+            {
+                if (!candidate.ok || candidate.actor == guard || candidate.actor == player ||
+                    IsHookBodyguard(candidate.actor) || !IsLiveCombatTarget(candidate.actor) ||
+                    !AiIsCombatCapable(candidate.actor)) continue;
+                float d = DistanceMetres(loc, candidate.loc);
+                if (d <= kHookAttackerAwarenessM && d < best)
+                { best = d; target = candidate.actor; }
+            }
+            if (target && InjectHookBodyguard(guard, player, playerLoc, target, true)) ++n;
+        }
+        LOG("[AI-HOOK] attack dispatched for %d dedicated bodyguard(s)", n);
+    });
+}
+
+void Features::HookAiRelease()
+{
+    std::vector<UObject*> guards = HookBodyguardSnapshot();
+    {
+        std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+        g_hookBodyguards.clear();
+    }
+    if (guards.empty()) return;
+    InstallProcessEventHook();
+    QueueGameThread([guards]()
+    {
+        int n = 0;
+        for (UObject* guard : guards)
+        {
+            ReleaseHookNativeMovement(guard, true);
+            SquadRemove(guard);
+            if (AiUsable(guard) && ApplyAiRelease(guard)) ++n;
+        }
+        LOG("[AI-HOOK] released %d dedicated bodyguard(s)", n);
+    });
+}
+
+int Features::HookAiCount()
+{
+    int count = 0;
+    std::lock_guard<std::mutex> lk(g_hookBodyguardMutex);
+    for (UObject* guard : g_hookBodyguards)
+        if (Mem::IsReadable(guard, 0x30)) ++count;
+    return count;
+}
 
 const char* Features::HordeStatusText()
 {
@@ -10173,10 +11408,7 @@ void Features::AiReleaseSelected()
             int n = 0;
             for (UObject* ai : targets)
             {
-                { std::lock_guard<std::mutex> lk(g_squadMutex);
-                  for (size_t i = 0; i < g_spawnedAllies.size(); ++i)
-                      if (g_spawnedAllies[i] == ai) { g_spawnedAllies.erase(g_spawnedAllies.begin() + i); break; }
-                  g_spawnedAllyCount = (int)g_spawnedAllies.size(); }
+                SquadRemove(ai);
                 if (AiUsable(ai) && ApplyAiRelease(ai)) ++n;
             }
             LOG("AiReleaseSelected: released %d", n);
@@ -10482,12 +11714,15 @@ void Features::Prewarm()
         FindObjectFast(AH::Cls_Pawn);
         FindObjectFast(AH::Cls_Character);
         CachedFn(AH::Fn_AIController_MoveToActor);
+        CachedFn(AH::Fn_AIController_MoveToLocation);
+        CachedFn(AH::Fn_AIController_StopMovement);
         CachedFn(AH::Fn_AIBlueprintHelper_SimpleMoveToActor);
         CachedFn(AH::Fn_Pawn_AddMovementInput);
         // Mercuna (the game's real ground-AI mover). Resolve on the worker thread so the
         // game-thread squad walk never triggers a slow GObjects scan.
         FindObjectFast(AH::Cls_MercunaNavComponent);
         CachedFn(AH::Fn_Mercuna_MoveToActor);
+        CachedFn(AH::Fn_Mercuna_MoveToLocation);
         CachedFn(AH::Fn_Mercuna_Stop);
         // Render-hijack functions (console / lights / chams material params).
         CachedObject(AH::Obj_KismetSystemLibrary);
@@ -10888,6 +12123,577 @@ static bool MercunaStop(UObject* ai)
     return true;
 }
 
+// Hook Diagnostics has its own movement controller. It does not enter the normal
+// squad blackboard/AddMovementInput/velocity loop. Mercuna units receive native
+// location requests through the ReVa-derived helper; non-Mercuna units receive a
+// single AIController native move request whose replacement/cancellation is then
+// blocked by hkProcessEvent until combat or release yields ownership.
+struct HookNativeFollowState
+{
+    UObject* nav = nullptr;
+    UObject* controller = nullptr;
+    UObject* movementTarget = nullptr;
+    FVector issuedGoal{};
+    FVector sampleLocation{};
+    ULONGLONG lastIssueMs = 0;
+    ULONGLONG restartAtMs = 0;
+    ULONGLONG sampleMs = 0;
+    ULONGLONG lastProgressMs = 0;
+    ULONGLONG lastTransitionMs = 0;
+    ULONGLONG lastFocusClearMs = 0;
+    ULONGLONG lastNativeMoveMs = 0;
+    bool mercuna = false;
+    bool mixed = false;
+    bool moving = false;
+    bool commandActive = false;
+    bool restartPending = false;
+    bool wasEngaged = false;
+    bool mixedRecovery3D = false;
+    uint8_t navigationMode = 0;
+    ULONGLONG modeEnteredMs = 0;
+    ULONGLONG mixedFallbackUntilMs = 0;
+    uint32_t issues = 0;
+    uint32_t restarts = 0;
+};
+static std::unordered_map<UObject*, HookNativeFollowState> g_hookNativeFollow;
+
+static void SetHookControllerOwned(UObject* guard, bool owned)
+{
+    std::lock_guard<std::mutex> lock(g_hookControllerOwnedMutex);
+    if (owned) g_hookControllerOwned.insert(guard);
+    else g_hookControllerOwned.erase(guard);
+}
+
+// Kept for a future vertical-traversal flight fallback. Ground follow no longer uses Mercuna
+// (the Twin walks via AIController + Recast; see DriveHookBodyguardsNativeGameThread).
+[[maybe_unused]] static UObject* HookMercunaComponent(UObject* guard, bool mixed)
+{
+    if (mixed)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(guard);
+        if (Mem::IsReadable(base + AH::Mixed_MercunaNavigation, sizeof(void*)))
+        {
+            UObject* nav = *reinterpret_cast<UObject**>(base + AH::Mixed_MercunaNavigation);
+            if (Mem::IsReadable(nav, 0x30)) return nav;
+        }
+    }
+    return GetMercunaNavComp(guard);
+}
+
+static void YieldHookMovement(UObject* guard, HookNativeFollowState& s, bool stop)
+{
+    if (s.mercuna && s.nav)
+    {
+        if (stop && s.commandActive) AiMovementHooks::Stop(s.nav);
+        AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
+    }
+    else if (s.controller)
+    {
+        if (stop && s.commandActive)
+        {
+            if (s.mixed) StopHookControllerMovement(s.controller);
+            else AiMovementHooks::ControllerStop(guard, s.controller);
+        }
+        AiMovementHooks::SetControllerOwned(guard, s.controller, false);
+        SetHookControllerOwned(guard, false);
+    }
+    if (s.mixed) AiMovementHooks::SetMixedAutomatic(guard, true);
+    s.commandActive = false;
+    s.restartPending = false;
+    s.moving = false;
+}
+
+static void ReleaseHookNativeMovement(UObject* guard, bool stop)
+{
+    auto it = g_hookNativeFollow.find(guard);
+    if (it != g_hookNativeFollow.end())
+    {
+        YieldHookMovement(guard, it->second, stop);
+        g_hookNativeFollow.erase(it);
+    }
+    else
+    {
+        SetHookControllerOwned(guard, false);
+        if (IsMixedNavCharacter(guard)) AiMovementHooks::SetMixedAutomatic(guard, true);
+    }
+    AiMovementHooks::UnregisterGuard(guard);
+}
+
+static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
+                                    UObject* target, ULONGLONG now)
+{
+    if (!IsLiveCombatTarget(target)) return false;
+    FVector guardLoc{}, targetLoc{};
+    if (!ReadActorLocationFast(guard, guardLoc) || !ReadActorLocationFast(target, targetLoc))
+        return false;
+    FVector delta{targetLoc.X-guardLoc.X,targetLoc.Y-guardLoc.Y,targetLoc.Z-guardLoc.Z};
+    float distance = sqrtf(delta.X*delta.X+delta.Y*delta.Y+delta.Z*delta.Z);
+
+    // At attack range, stop and release movement ownership. Native combat then
+    // owns turning, root motion, ability movement and the attack montage.
+    if (distance <= kHookFirstHitContactM*kUnitsPerMetre)
+    {
+        if (AiMovementHooks::OwnsGuard(guard) || (s.mixed && s.commandActive))
+        {
+            YieldHookMovement(guard,s,true);
+            LOG("[AI-COMBAT] melee range reached; movement released to native abilities guard=%p target=%p dist=%.1fm",
+                (void*)guard,(void*)target,distance/kUnitsPerMetre);
+        }
+        s.movementTarget=target;
+        return true;
+    }
+
+    bool targetChanged=s.movementTarget!=target;
+    if(targetChanged)
+    {
+        if(s.mercuna && s.nav && s.commandActive) AiMovementHooks::Stop(s.nav);
+        else if(s.controller && s.commandActive)
+        {
+            if(s.mixed) StopHookControllerMovement(s.controller);
+            else AiMovementHooks::ControllerStop(guard,s.controller);
+        }
+        s.commandActive=false; s.restartPending=true; s.restartAtMs=now+150;
+        s.lastIssueMs=0; s.movementTarget=target;
+        LOG("[AI-COMBAT] native approach acquired guard=%p target=%p dist=%.1fm mixed=%d",
+            (void*)guard,(void*)target,distance/kUnitsPerMetre,s.mixed?1:0);
+    }
+
+    // Approach the enemy on the GROUND. Combat already seeds target + IsAggressive (InjectHookBodyguard),
+    // the recipe that walks/chases.
+    UObject* ctrl=GetAiController(guard);
+    if(!ControllerPathFollowingReady(ctrl,guard)) return false;
+
+    if(s.mixed)
+    {
+        // Twin combat now uses the same fully traced ground chain as follow. TargetEnemy and
+        // IsAggressive still drive attack selection/montages; the guarded MoveToActor route owns
+        // only the approach and is released at contact range.
+        if(!AiMovementHooks::RegisterController(guard,ctrl)) return false;
+        AiMovementHooks::SetControllerOwned(guard,ctrl,false);
+        SetHookControllerOwned(guard,false);
+        s.mercuna=false;s.nav=nullptr;s.controller=ctrl;
+        AiMovementHooks::SetMixedAutomatic(guard,false);
+        if(AiMovementHooks::CurrentMixedNavigation(guard)!=1)
+            AiMovementHooks::ForceMixedNavigation(guard,1);
+        HookPathChainState chain{};
+        if(!EnsureHookTwinGroundPathChain(guard,ctrl,targetChanged||s.restartPending,chain)) return false;
+        if(chain.repairedBinding) AiMovementHooks::RegisterController(guard,ctrl);
+        SetControllerForceFollow(ctrl,false);
+        SetControllerAggressive(ctrl,true);
+        uint8_t status=DirectControllerMoveStatus(ctrl);
+        bool accepted=false;
+        bool simpleFallback=false;
+        if((targetChanged||s.restartPending||status!=3) && now-s.lastNativeMoveMs>=350)
+        {
+            s.lastNativeMoveMs=now;
+            accepted=MoveControllerToActor(ctrl,guard,target,350.0f,true);
+            status=DirectControllerMoveStatus(ctrl);
+            if(status!=3 && !accepted)
+            {
+                simpleFallback=SimpleMoveToActor(ctrl,guard,target);
+                status=DirectControllerMoveStatus(ctrl);
+            }
+            s.restartPending=false;
+        }
+        s.commandActive=status==3;
+        static ULONGLONG lastCombatChainLog=0;
+        if(now-lastCombatChainLog>=2000)
+        {
+            lastCombatChainLog=now;
+            float speed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
+            LOG("[AI-CHAIN] TwinCombat guard=%p target=%p status=%u accepted=%d simple=%d pfc=%p move=%p cmc=%p nav=%p bind=%d mode=%u vel=%.1f",
+                (void*)guard,(void*)target,(unsigned)status,accepted?1:0,simpleFallback?1:0,(void*)chain.pathFollower,
+                (void*)chain.boundMovement,(void*)chain.characterMovement,(void*)chain.navData,
+                chain.boundMovement==chain.characterMovement?1:0,(unsigned)chain.movementMode,speed);
+        }
+        return s.commandActive;
+    }
+
+    // Robots: owned native MoveToActor (protected from game override).
+    if(!AiMovementHooks::RegisterController(guard,ctrl))
+        return false;
+    if(s.mercuna&&s.nav)
+    { if(s.commandActive)AiMovementHooks::Stop(s.nav); AiMovementHooks::SetMercunaOwned(guard,s.nav,false);s.commandActive=false;s.restartPending=false; }
+    s.mercuna=false;s.nav=nullptr;s.controller=ctrl;
+    AiMovementHooks::SetControllerOwned(guard,ctrl,true);SetHookControllerOwned(guard,true);
+    auto issueMove=[&]()
+    {
+        s.commandActive=AiMovementHooks::ControllerMoveToActor(guard,ctrl,target,350.0f);
+        s.lastIssueMs=now; ++s.issues;
+    };
+    uint8_t status=DirectControllerMoveStatus(ctrl);
+    if(s.restartPending){ if(now>=s.restartAtMs){ issueMove(); s.restartPending=false; } }
+    else if((!s.commandActive||status!=3)&&now-s.lastIssueMs>=400) issueMove();
+    return s.commandActive;
+}
+
+static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& playerLoc, ULONGLONG now)
+{
+    std::vector<UObject*> guards = HookBodyguardSnapshot();
+    if (guards.empty() || !g_hookBodyguardMode.load(std::memory_order_relaxed)) return;
+
+    UFunction* moveLocationFn = CachedFn(AH::Fn_Mercuna_MoveToLocation);
+    int active = 0, moving = 0, engagedCount = 0, mercuna = 0, controller = 0, stalledCount = 0, mixed3D = 0;
+    float nearestM = -1.0f;
+
+    for (UObject* guard : guards)
+    {
+        if (!AiUsable(guard) || guard == player) continue;
+        HookNativeFollowState& s = g_hookNativeFollow[guard];
+        s.mixed = IsMixedNavCharacter(guard);
+
+        // Never retain the player or a corpse as a combat target while follow owns movement.
+        uint8_t* base = reinterpret_cast<uint8_t*>(guard);
+        if (Mem::IsReadable(base + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
+            *reinterpret_cast<UObject**>(base + AH::AICh_CachedTargetEnemy) == player)
+            *reinterpret_cast<UObject**>(base + AH::AICh_CachedTargetEnemy) = nullptr;
+        InjectState& injection = g_inject[guard];
+        UObject* activeTarget = injection.target ? injection.target : ReadAiTargetField(guard);
+        if (activeTarget && activeTarget != player && !IsLiveCombatTarget(activeTarget))
+            ClearHookBodyguardCombat(guard, player, "native follow dead-target check");
+
+        auto engagedIt = g_engagedUntilMs.find(guard);
+        bool engaged = engagedIt != g_engagedUntilMs.end() && engagedIt->second > now;
+        if (engaged)
+        {
+            ++engagedCount;
+            if (!s.wasEngaged)
+            {
+                YieldHookMovement(guard,s,true);
+                s.lastIssueMs=0;s.movementTarget=nullptr;
+            }
+            s.wasEngaged = true;
+            DriveHookCombatApproach(guard,s,injection.target?injection.target:ReadAiTargetField(guard),now);
+            continue;
+        }
+        if (s.wasEngaged)
+        {
+            YieldHookMovement(guard,s,true); // never inherit an enemy-approach request into follow
+            s.wasEngaged = false;
+            s.lastIssueMs = 0;
+            s.sampleMs = 0;
+            s.navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
+            s.modeEnteredMs = now;
+            s.lastTransitionMs = now;
+            s.movementTarget = nullptr;
+            LOG("[AI-MOVE] combat released movement; native follow reacquiring guard=%p", (void*)guard);
+        }
+
+        FVector guardLoc{};
+        if (!ReadActorLocationFast(guard, guardLoc)) continue;
+        FVector delta{playerLoc.X-guardLoc.X, playerLoc.Y-guardLoc.Y, playerLoc.Z-guardLoc.Z};
+        float planar = sqrtf(delta.X*delta.X + delta.Y*delta.Y);
+        float distance = s.mixed ? sqrtf(planar*planar + delta.Z*delta.Z) : planar;
+        float distanceM = distance / kUnitsPerMetre;
+        if (nearestM < 0.0f || distanceM < nearestM) nearestM = distanceM;
+        bool wasMoving = s.moving;
+        s.moving = wasMoving ? distance > kHookFollowStopM*kUnitsPerMetre
+                             : distance > kHookFollowStartM*kUnitsPerMetre;
+
+        bool stalled = false;
+        if (s.moving)
+        {
+            if (!s.sampleMs)
+            {
+                s.sampleLocation = guardLoc; s.sampleMs = now; s.lastProgressMs = now;
+            }
+            else if (now - s.sampleMs >= 500)
+            {
+                float dx=guardLoc.X-s.sampleLocation.X, dy=guardLoc.Y-s.sampleLocation.Y,
+                      dz=s.mixed ? guardLoc.Z-s.sampleLocation.Z : 0.0f;
+                float progressed = sqrtf(dx*dx + dy*dy + dz*dz);
+                if (progressed >= 25.0f) s.lastProgressMs = now;
+                stalled = s.commandActive && now - s.lastProgressMs >= 1800;
+                s.sampleLocation = guardLoc; s.sampleMs = now;
+            }
+        }
+        else { s.sampleMs = 0; s.lastProgressMs = 0; }
+        if (stalled) ++stalledCount;
+
+        // GROUND movement for EVERYONE (robots AND Twins) is the AIController + RecastNavMesh +
+        // AHPathFollowingComponent path below -- NOT Mercuna. Decisive snapshot evidence: a released
+        // Twin walking on the ground and chasing the player runs movement_mode=1, nav_data=RecastNavMesh,
+        // move_status=3, with Mercuna NOT involved at all (Mercuna is only her FLIGHT system). Our old
+        // Hook code drove her through the Mercuna component -- the wrong subsystem -- so ground never
+        // translated her and only flight glided her ("she glides / walks away / never reaches me"). She
+        // now walks via the exact same controller path the robots use. (Mercuna helpers stay resolved
+        // for a future vertical-traversal flight fallback, but are not used for ground follow.)
+        (void)AiMovementHooks::ResolveHelpers(moveLocationFn,
+            s.mixed ? CachedObjectClassFn(guard, "ForceNavigationType") : nullptr);
+        if (s.mercuna && s.nav) // release any stale Mercuna ownership from an earlier build
+        {
+            if (s.commandActive) AiMovementHooks::Stop(s.nav);
+            AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
+            s.mercuna = false; s.nav = nullptr; s.commandActive = false; s.restartPending = false;
+        }
+
+        // ---- TWIN (mixed-nav): seed BT state, then issue a real reflected Recast route ----------
+        // Blackboard writes alone leave the spawned Twin's path-following component Idle.
+        // The reflected MoveToActor call reaches her +0x790 mixed-navigation override
+        // (FUN_141d4a6d0), whose generic first stage builds the route. RegisterController
+        // keeps that call crash-firewalled while leaving ownership with the game.
+        if (s.mixed)
+        {
+            UObject* ctrl = GetAiController(guard);
+            if (!ControllerBlackboardReady(ctrl) || !ControllerPathFollowingReady(ctrl, guard))
+            { YieldHookMovement(guard, s, false); continue; }
+            if (s.mercuna && s.nav) AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
+            if (!AiMovementHooks::RegisterController(guard, ctrl))
+            {
+                YieldHookMovement(guard, s, false);
+                continue;
+            }
+            AiMovementHooks::SetControllerOwned(guard, ctrl, false);
+            SetHookControllerOwned(guard, false);
+            s.mercuna=false; s.nav=nullptr; s.controller=ctrl;
+            ++controller; ++active;
+
+            bool groundPinned = AiMovementHooks::SetMixedAutomatic(guard, false);
+            uint8_t navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
+            if (navigationMode != 1 && now - s.lastTransitionMs >= 500)
+            {
+                groundPinned = AiMovementHooks::ForceMixedNavigation(guard, 1);
+                s.lastTransitionMs = now;
+                navigationMode = AiMovementHooks::CurrentMixedNavigation(guard);
+            }
+            s.navigationMode = navigationMode;
+
+            HookPathChainState chain{};
+            if (!EnsureHookTwinGroundPathChain(guard, ctrl, !wasMoving || s.restartPending, chain))
+            {
+                static ULONGLONG lastChainFailureLog = 0;
+                if (now - lastChainFailureLog >= 2000)
+                {
+                    lastChainFailureLog = now;
+                    LOG("[AI-CHAIN] Twin ground chain unavailable guard=%p ctrl=%p pfc=%p move=%p cmc=%p mode=%u",
+                        (void*)guard,(void*)ctrl,(void*)chain.pathFollower,(void*)chain.boundMovement,
+                        (void*)chain.characterMovement,(unsigned)chain.movementMode);
+                }
+                YieldHookMovement(guard, s, false);
+                continue;
+            }
+            if (chain.repairedBinding) AiMovementHooks::RegisterController(guard, ctrl);
+
+            uint8_t* gb = reinterpret_cast<uint8_t*>(guard);
+            if (Mem::IsReadable(gb + AH::AICh_bIsPassive, 1)) *reinterpret_cast<bool*>(gb + AH::AICh_bIsPassive) = false;
+            if (Mem::IsReadable(gb + AH::AICh_Schedule, sizeof(void*)))
+            {
+                UObject** sched = reinterpret_cast<UObject**>(gb + AH::AICh_Schedule);
+                if (*sched)
+                {
+                    if (g_stashedSchedule.find(guard) == g_stashedSchedule.end()) g_stashedSchedule[guard] = *sched;
+                    *sched = nullptr;
+                }
+            }
+
+            const bool uses2D = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_Uses3DNavigation, false);
+            const bool canReach2D = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach2D, true);
+            const bool reject3D = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, false);
+            const bool radiusOk = SetControllerFloatKeyAt(ctrl, AH::AICtrl_Key_AcceptableRadius, 75.0f);
+            uint8_t moveStatus = DirectControllerMoveStatus(ctrl);
+            if (chain.repairedBinding && moveStatus == 3)
+            {
+                StopHookControllerMovement(ctrl);
+                moveStatus = 0;
+                s.commandActive = false;
+                s.lastNativeMoveMs = 0;
+            }
+
+            if (!s.moving)
+            {
+                if (s.commandActive || moveStatus == 3) StopHookControllerMovement(ctrl);
+                const bool locationOk = SetControllerFollowLocation(ctrl, guardLoc) |
+                                        SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, guardLoc);
+                const bool forceOk = SetControllerForceFollow(ctrl, false);
+                const bool aggressiveOk = SetControllerAggressive(ctrl, false);
+                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
+                if (wasMoving) FocusControllerOnActor(ctrl, player);
+                s.commandActive = false;
+                s.restartPending = false;
+                s.lastNativeMoveMs = 0;
+                static ULONGLONG lastHoldFailureLog = 0;
+                if ((!locationOk || !forceOk || !aggressiveOk || !groundPinned) &&
+                    now - lastHoldFailureLog >= 2000)
+                {
+                    lastHoldFailureLog = now;
+                    LOG("[AI-MOVE] Hook Twin hold incomplete guard=%p navMode=%u ground=%d location=%d force=%d aggressive=%d",
+                        (void*)guard, (unsigned)navigationMode, groundPinned?1:0,
+                        locationOk?1:0, forceOk?1:0, aggressiveOk?1:0);
+                }
+                continue;
+            }
+            ++moving;
+
+            bool restarting = false;
+            if (s.restartPending)
+            {
+                if (now < s.restartAtMs) continue;
+                s.restartPending = false;
+                s.lastIssueMs = 0;
+                s.lastNativeMoveMs = 0;
+                s.sampleMs = 0;
+                s.lastProgressMs = now;
+                restarting = true;
+                EnsureHookTwinGroundPathChain(guard, ctrl, true, chain);
+            }
+
+            float inv = planar > 1.0f ? 1.0f / planar : 0.0f;
+            FVector goal{ playerLoc.X - delta.X*inv*kHookFollowStopM*kUnitsPerMetre,
+                          playerLoc.Y - delta.Y*inv*kHookFollowStopM*kUnitsPerMetre, playerLoc.Z };
+            bool locationOk = true, forceOk = true, reachOk = true, speedOk = true;
+            if (now - s.lastIssueMs >= 200)
+            {
+                s.lastIssueMs = now; ++s.issues;
+                locationOk = SetControllerFollowLocation(ctrl, goal) |
+                             SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal);
+                SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
+                reachOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
+                forceOk = SetControllerForceFollow(ctrl, true);
+                if (!wasMoving || restarting)
+                {
+                    EnsureFollowerCanMove(guard);
+                    speedOk = SetControllerFollowSpeed(ctrl);
+                }
+            }
+            const bool aggressiveOk = SetControllerAggressive(ctrl, true);
+            ClearControllerFocus(ctrl);
+
+            // Blackboard state alone remains Idle on spawned Twins. The reflected wrapper builds the
+            // exact FAIMoveRequest and enters the generic AIController/Recast route builder before the
+            // Twin override's fault-prone post-processing, which the +0x790 SEH detour contains.
+            bool nativeAccepted = false;
+            bool simpleFallback = false;
+            moveStatus = DirectControllerMoveStatus(ctrl);
+            if (moveStatus != 3 && now - s.lastNativeMoveMs >= 750)
+            {
+                s.lastNativeMoveMs = now;
+                nativeAccepted = MoveControllerToActor(ctrl, guard, player,
+                    kHookFollowStopM*kUnitsPerMetre, true);
+                moveStatus = DirectControllerMoveStatus(ctrl);
+                if (moveStatus != 3 && !nativeAccepted)
+                {
+                    simpleFallback = SimpleMoveToActor(ctrl, guard, player);
+                    moveStatus = DirectControllerMoveStatus(ctrl);
+                }
+            }
+            s.commandActive = moveStatus == 3;
+
+            if (stalled && s.commandActive)
+            {
+                EnsureHookTwinGroundPathChain(guard, ctrl, true, chain);
+                StopHookControllerMovement(ctrl);
+                SetControllerForceFollow(ctrl, false);
+                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, false);
+                s.commandActive = false;
+                s.restartPending = true;
+                s.restartAtMs = now + 200;
+                s.sampleMs = 0;
+                s.lastProgressMs = now;
+                ++s.restarts;
+                g_hookMovementRecoveries.fetch_add(1, std::memory_order_relaxed);
+                LOG("[AI-MOVE] Hook Twin route stalled -> stop/reissue guard=%p dist=%.1fm navMode=%u restart=%u",
+                    (void*)guard, distanceM, (unsigned)navigationMode, s.restarts);
+                continue;
+            }
+
+            static ULONGLONG lastTwinHookLog = 0;
+            if (now - lastTwinHookLog >= 3000)
+            {
+                lastTwinHookLog = now;
+                float chainSpeed=sqrtf(chain.velocity.X*chain.velocity.X+chain.velocity.Y*chain.velocity.Y+chain.velocity.Z*chain.velocity.Z);
+                bool rbForce=false, rbReach=false, rbAggressive=false, rbUses3D=false, rbCan2D=false, rbCan3D=false;
+                bool okRbForce=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_ForceFollowLoc, rbForce);
+                bool okRbReach=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, rbReach);
+                bool okRbAggressive=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_IsAggressive, rbAggressive);
+                bool okRbUses3D=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_Uses3DNavigation, rbUses3D);
+                bool okRbCan2D=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach2D, rbCan2D);
+                bool okRbCan3D=ReadControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReach3D, rbCan3D);
+                AiMovementHooks::Status hookDiag = AiMovementHooks::GetStatus();
+                UObject* cachedTarget = ReadAiTargetField(guard);
+                LOG("[AI-MOVE] HookTwinFollow(GT): guard=%p dist=%.1fm moving=1 navMode=%u ground=%d status=%u nativeAccepted=%d simple=%d keys[loc=%d force=%d reach=%d aggr=%d 2d=%d can2d=%d no3d=%d radius=%d speed=%d] chain[pfc=%p move=%p cmc=%p nav=%p bind=%d repaired=%d active=%d mode=%u vel=%.1f] restarts=%u",
+                    (void*)guard, distanceM, (unsigned)navigationMode, groundPinned?1:0,
+                    (unsigned)moveStatus, nativeAccepted?1:0, simpleFallback?1:0, locationOk?1:0, forceOk?1:0,
+                    reachOk?1:0, aggressiveOk?1:0, uses2D?1:0, canReach2D?1:0,
+                    reject3D?1:0, radiusOk?1:0, speedOk?1:0,(void*)chain.pathFollower,
+                    (void*)chain.boundMovement,(void*)chain.characterMovement,(void*)chain.navData,
+                    chain.boundMovement==chain.characterMovement?1:0,chain.repairedBinding?1:0,
+                    chain.reactivated?1:0,(unsigned)chain.movementMode,chainSpeed,s.restarts);
+                LOG("[AI-MOVE] HookTwinFollowBB: guard=%p target=%p read[force=%d/%d reach=%d/%d aggr=%d/%d uses3d=%d/%d can2d=%d/%d can3d=%d/%d] hooks[orig=%llu/%llu fallback=%llu/%llu canStart=%llu/%llu pathReq=%llu abort=%llu]",
+                    (void*)guard,(void*)cachedTarget,okRbForce?1:0,rbForce?1:0,okRbReach?1:0,rbReach?1:0,
+                    okRbAggressive?1:0,rbAggressive?1:0,okRbUses3D?1:0,rbUses3D?1:0,
+                    okRbCan2D?1:0,rbCan2D?1:0,okRbCan3D?1:0,rbCan3D?1:0,
+                    (unsigned long long)hookDiag.twinOriginalMoveAccepted,(unsigned long long)hookDiag.twinOriginalMoveAttempts,
+                    (unsigned long long)hookDiag.twinGenericFallbackAccepted,(unsigned long long)hookDiag.twinGenericFallbacks,
+                    (unsigned long long)hookDiag.movementCanStartCalls,(unsigned long long)hookDiag.movementCanStartForced,
+                    (unsigned long long)hookDiag.pathRequests,(unsigned long long)hookDiag.pathAborts);
+            }
+            continue;
+        }
+        // ---- ROBOTS (generic AIController, clean +0x790 one-shot move): owned native MoveToActor ----
+        UObject* ctrl = GetAiController(guard);
+        if (!ControllerPathFollowingReady(ctrl, guard))
+        {
+            YieldHookMovement(guard, s, false);
+            continue;
+        }
+        if (!AiMovementHooks::RegisterController(guard, ctrl))
+        {
+            YieldHookMovement(guard, s, false);
+            continue; // fail closed: no unprotected controller request
+        }
+        ++controller; ++active;
+        if (s.mercuna && s.nav)
+        {
+            if (s.commandActive) AiMovementHooks::Stop(s.nav);
+            AiMovementHooks::SetMercunaOwned(guard, s.nav, false);
+            s.commandActive=false; s.restartPending=false;
+        }
+        s.mercuna=false; s.nav=nullptr; s.controller=ctrl;
+        AiMovementHooks::SetControllerOwned(guard,ctrl,true);
+        SetHookControllerOwned(guard, true);
+        if (!s.moving)
+        {
+            if (s.commandActive) AiMovementHooks::ControllerStop(guard, ctrl);
+            s.commandActive=false; s.restartPending=false;
+            if (wasMoving) FocusControllerOnActor(ctrl, player);
+            continue;
+        }
+        ++moving;
+        uint8_t status = DirectControllerMoveStatus(ctrl);
+        if (s.restartPending)
+        {
+            if (now >= s.restartAtMs)
+            {
+                s.commandActive = AiMovementHooks::ControllerMoveToActor(guard, ctrl, player,
+                                                                          kHookFollowStopM*kUnitsPerMetre);
+                s.restartPending=false; s.lastIssueMs=now; ++s.issues; s.lastProgressMs=now;
+            }
+        }
+        else if ((!s.commandActive || status != 3) && now-s.lastIssueMs>=500)
+        {
+            s.commandActive = AiMovementHooks::ControllerMoveToActor(guard, ctrl, player,
+                                                                      kHookFollowStopM*kUnitsPerMetre);
+            s.lastIssueMs=now; ++s.issues; s.lastProgressMs=now;
+        }
+        else if (stalled && now-s.lastIssueMs >= 1500)
+        {
+            AiMovementHooks::ControllerStop(guard, ctrl); s.commandActive=false; s.restartPending=true;
+            s.restartAtMs=now+150; ++s.restarts;
+            LOG("[AI-MOVE] controller progress timeout -> controlled stop/replan guard=%p dist=%.1fm status=%u", (void*)guard, distanceM, (unsigned)status);
+        }
+        if (!wasMoving || now-s.lastFocusClearMs>=1500)
+        { ClearControllerFocus(ctrl); s.lastFocusClearMs=now; }
+    }
+
+    static ULONGLONG lastLog = 0;
+    if (now-lastLog >= 3000)
+    {
+        lastLog=now;
+        LOG("HookFollowNative(GT): active=%d moving=%d engaged=%d mercuna=%d controller=%d mixed3D=%d stalled=%d roster=%zu nearest=%.1fm",
+            active,moving,engagedCount,mercuna,controller,mixed3D,stalledCount,guards.size(),nearestM);
+    }
+}
+
 // Per-member nav re-issue timer (game-thread only): Mercuna MoveToActor auto-tracks the
 // target, so we only re-issue it on a timer rather than every frame (no path-request spam).
 // (The idle-schedule stash g_stashedSchedule lives up with the top-of-file squad globals
@@ -10895,7 +12701,7 @@ static bool MercunaStop(UObject* ai)
 static std::unordered_map<UObject*, unsigned long long> g_navReissueMs;
 
 // =======================================================================
-//  SQUAD FOLLOW  --  TRICK THE AI'S OWN LOCOMOTION (game thread, per frame)
+//  SQUAD FOLLOW  --  NATIVE ANIMATION + DIRECT CMC INPUT (game thread, per frame)
 // -----------------------------------------------------------------------
 //  No drag, no teleport, no velocity write. Every one of those produced the
 //  "dogshit gliding" the user rejected. Instead we make the member's OWN behaviour
@@ -10907,10 +12713,10 @@ static std::unordered_map<UObject*, unsigned long long> g_navReissueMs;
 //      NOT to you -- the "she walks AWAY" we saw) and ignores the follow keys. We stash
 //      it once (for restore) and null it every tick, so her BT falls through to the
 //      follow branch.
-//   2) DRIVE the follow keys her BT's follow branch reads: TargetAlly = you,
-//      FollowLocation + CurrentWaypoint = your position, ForceFollowLocation = true,
-//      CanReachFollowLocation = true, plus a healthy FollowSpeed and a focus on you.
-//      Re-written every tick so as you move, her destination tracks you live.
+//   2) DRIVE FollowLocation + CurrentWaypoint (never TargetAlly(player)). Hook Debug
+//      guards also receive Pawn.AddMovementInput every frame, which uses Character
+//      Movement and therefore preserves their normal walk/run animation even when
+//      they have no Mercuna component.
 //   3) Mercuna MoveToActor as a bonus for pawns that DO have a nav component (real
 //      nav pawns/robots); a no-op for Larisa (she has none). Re-issued on a timer.
 //
@@ -10956,6 +12762,7 @@ static void DriveTwinsFollowGameThread()
     for (UObject* twin : squad)
     {
         if (!Mem::IsReadable(twin, 0x30) || twin == player) continue;
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && IsHookBodyguard(twin)) continue;
         if (!IsMixedNavCharacter(twin) || !FollowPawnUsable(twin)) continue;
         TwinState& s = g_twin[twin];
         dbgAny = true;
@@ -10997,8 +12804,6 @@ static void DriveTwinsFollowGameThread()
 
         UObject* ctrl = GetAiController(twin);
         if (!ctrl) continue;
-        SetControllerTargetAlly(ctrl, player);
-
         // Hysteresis: start moving only when BEYOND the outer band, stop when inside the ring.
         // This stable band (not a per-frame "dist > ring" flip) kills the start/stop twitch.
         if (s.moving) { if (dist <= stopU)  s.moving = false; }
@@ -11105,16 +12910,24 @@ void DriveSquadVelocityGameThread()
     std::vector<UObject*> squad;
     { std::lock_guard<std::mutex> lk(g_squadMutex); squad = g_spawnedAllies; }
 
-    int followed = 0, mercuna = 0, unpinned = 0;
+    int followed = 0, mercuna = 0, unpinned = 0, directMoves = 0, velocityMoves = 0;
+    int hookMoving = 0, recoveries = 0;
     float nearest = -1.0f, nearVel = -1.0f;
     std::string nearSched = "?";
     ULONGLONG nowm = GetTickCount64();
+
+    // Dedicated Hook Diagnostics roster is driven first by its native ownership
+    // controller and is skipped completely by the legacy squad/Twin paths below.
+    DriveHookBodyguardsNativeGameThread(player, playerLoc, nowm);
 
     for (UObject* ai : squad)
     {
         if (!Mem::IsReadable(ai, 0x30) || ai == player) continue;
         if (!AiUsable(ai)) continue; // AHAICharacter
-        if (IsMixedNavCharacter(ai)) continue; // Twins use their OWN per-frame follow (DriveTwinsFollowGameThread)
+        const bool hookOwned = g_hookBodyguardMode.load(std::memory_order_relaxed) &&
+                               IsHookBodyguard(ai);
+        if (hookOwned) continue; // never share SDK/blackboard/input/velocity movement with Hook Bodyguards
+        if (IsMixedNavCharacter(ai)) continue; // non-hook Twins use their legacy dedicated path
 
         // *** HARD never-attack-you guard, at the FAST 20Hz rate (the 5Hz pump alone
         // wasn't fast enough -- a guard you shot got a few hits in first). If its cached
@@ -11125,6 +12938,18 @@ void DriveSquadVelocityGameThread()
             if (Mem::IsReadable(gb + AH::AICh_CachedTargetEnemy, sizeof(void*)) &&
                 *reinterpret_cast<UObject**>(gb + AH::AICh_CachedTargetEnemy) == player)
                 *reinterpret_cast<UObject**>(gb + AH::AICh_CachedTargetEnemy) = nullptr;
+        }
+
+        // Hook Debug does not wait for the 5 Hz selector to notice a corpse. Tear down
+        // a dead/unreadable target immediately so the next lines resume follow in this
+        // same frame instead of attacking the old location behind the guard.
+        if (hookOwned)
+        {
+            InjectState& hs = g_inject[ai];
+            UObject* cached = ReadAiTargetField(ai);
+            UObject* active = hs.target ? hs.target : cached;
+            if (active && active != player && !IsLiveCombatTarget(active))
+                ClearHookBodyguardCombat(ai, player, "fast dead-target check");
         }
 
         // A guard that's actively fighting a threat (stamped by the bodyguard injection)
@@ -11141,6 +12966,47 @@ void DriveSquadVelocityGameThread()
         if (!ReadActorLocationFast(ai, aiLoc)) continue;
         FVector to{ playerLoc.X - aiLoc.X, playerLoc.Y - aiLoc.Y, playerLoc.Z - aiLoc.Z };
         float dist = sqrtf(to.X * to.X + to.Y * to.Y + to.Z * to.Z);
+        float planarDist = sqrtf(to.X * to.X + to.Y * to.Y);
+        InjectState& followState = g_inject[ai];
+        const float memberStopU = (hookOwned ? kHookFollowStopM : stopM) * kUnitsPerMetre;
+        const float memberStartU = (hookOwned ? kHookFollowStartM : stopM) * kUnitsPerMetre;
+        bool wasMoving = followState.followMoving;
+        bool needsToMove = hookOwned
+            ? (wasMoving ? planarDist > memberStopU : planarDist > memberStartU)
+            : planarDist > memberStopU;
+        followState.followMoving = needsToMove;
+        if (hookOwned && needsToMove) ++hookMoving;
+
+        // Measure real actor displacement. AddMovementInput returning successfully only
+        // means the function ran; it does not prove CharacterMovement consumed it.
+        bool hardRecover = false;
+        if (hookOwned && needsToMove)
+        {
+            if (!followState.followSampleMs)
+            {
+                followState.followSampleLoc = aiLoc;
+                followState.followSampleMs = nowm;
+                followState.followLastProgressMs = nowm;
+            }
+            else if (nowm - followState.followSampleMs >= 500)
+            {
+                float dx = aiLoc.X - followState.followSampleLoc.X;
+                float dy = aiLoc.Y - followState.followSampleLoc.Y;
+                float movedU = sqrtf(dx * dx + dy * dy);
+                if (movedU >= 20.0f)
+                    followState.followLastProgressMs = nowm;
+                else if (nowm - followState.followLastProgressMs >= 1500 &&
+                         nowm - followState.lastMoveRecoveryMs >= 2000)
+                    hardRecover = true;
+                followState.followSampleLoc = aiLoc;
+                followState.followSampleMs = nowm;
+            }
+        }
+        else if (hookOwned)
+        {
+            followState.followSampleMs = 0;
+            followState.followLastProgressMs = 0;
+        }
 
         uint8_t* base = reinterpret_cast<uint8_t*>(ai);
 
@@ -11193,34 +13059,95 @@ void DriveSquadVelocityGameThread()
         UObject* ctrl = GetAiController(ai);
         if (ctrl)
         {
-            bool needsToMove = dist > stopU;
             FVector goal;
             if (needsToMove)
             {
-                float inv = 1.0f / dist;
-                FVector dir{ to.X * inv, to.Y * inv, to.Z * inv };
-                goal = { playerLoc.X - dir.X * stopU, playerLoc.Y - dir.Y * stopU, playerLoc.Z - dir.Z * stopU };
+                float inv = planarDist > 1.0f ? 1.0f / planarDist : 0.0f;
+                FVector dir{ to.X * inv, to.Y * inv, 0.0f };
+                goal = { playerLoc.X - dir.X * memberStopU, playerLoc.Y - dir.Y * memberStopU, playerLoc.Z };
             }
             else
             {
                 goal = aiLoc; // already within the ring -> destination == her position -> stop
             }
-            SetControllerTargetAlly(ctrl, player);
-            SetControllerFollowLocation(ctrl, goal);                          // native setter (FollowLocation key)
-            SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal); // belt-and-braces raw key
-            SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
-            SetControllerForceFollow(ctrl, needsToMove);                      // only force the move while beyond the ring
-            SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);  // tell the BT the point is reachable
-            SetControllerFollowSpeed(ctrl);
-            FocusControllerOnActor(ctrl, player);
+            bool refreshGoal = !hookOwned || wasMoving != needsToMove ||
+                               nowm - followState.lastFollowGoalMs >= 250;
+            if (refreshGoal)
+            {
+                followState.lastFollowGoalMs = nowm;
+                SetControllerFollowLocation(ctrl, goal);
+                SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal);
+                SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
+                SetControllerForceFollow(ctrl, needsToMove);
+                SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
+                SetControllerFollowSpeed(ctrl);
+                if (hookOwned && needsToMove)
+                    ClearControllerFocus(ctrl); // face velocity, not backwards toward the player
+                else
+                    FocusControllerOnActor(ctrl, player);
+            }
+
+            // Start one direct, non-pathfinding controller request. Do not restart an
+            // active request; if measured displacement stalls, StopMovement + recovery
+            // below deliberately replaces it.
+            if (hookOwned && needsToMove && nowm - followState.lastMoveMs >= 750)
+            {
+                uint8_t moveStatus = ControllerMoveStatus(ctrl);
+                bool requestNeeded = !wasMoving || moveStatus != 3;
+                if (requestNeeded)
+                {
+                    followState.lastMoveMs = nowm;
+                    MoveControllerToActor(ctrl, ai, player, memberStopU);
+                }
+            }
             ++followed;
         }
 
-        // (LAYER 3) Mercuna nav bonus for pawns that have a nav component (no-op for Larisa).
-        if (dist > stopU)
+        // Hook Debug fallback/primary mover: this enters CharacterMovement through the
+        // engine's own AddMovementInput path, so animation remains native. It is driven
+        // every game frame and cannot go idle merely because the BT ignored follow keys.
+        if (hookOwned && needsToMove && planarDist > 1.0f)
+        {
+            FVector dir{ to.X / planarDist, to.Y / planarDist, 0.0f };
+            if (AddPawnMovementInput(ai, dir, 1.0f))
+            {
+                ++directMoves;
+                g_hookDirectMoveInputs.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (hardRecover)
+            {
+                followState.lastMoveRecoveryMs = nowm;
+                followState.followLastProgressMs = nowm;
+                UObject* ctrl = GetAiController(ai);
+                RecoverHookFollowerMovement(ai, ctrl);
+                if (ctrl) MoveControllerToActor(ctrl, ai, player, memberStopU);
+                if (!followState.velocityFallback)
+                {
+                    followState.velocityFallback = true;
+                    g_hookVelocityFallbacks.fetch_add(1, std::memory_order_relaxed);
+                }
+                ++followState.movementRecoveries;
+                ++recoveries;
+                uint64_t total = g_hookMovementRecoveries.fetch_add(1, std::memory_order_relaxed) + 1;
+                LOG("[AI-FOLLOW] zero displacement recovery: guard=%p dist=%.1fm recoveries=%u total=%llu -> walking + velocity fallback",
+                    (void*)ai, planarDist / kUnitsPerMetre, followState.movementRecoveries,
+                    (unsigned long long)total);
+            }
+            if (followState.velocityFallback && WriteHookFollowVelocity(ai, dir, 450.0f))
+            {
+                ++velocityMoves;
+            }
+        }
+        else if (hookOwned && followState.velocityFallback)
+        {
+            WriteHookFollowVelocity(ai, FVector{}, 0.0f); // stop cleanly at the 2 m ring
+        }
+
+        // (LAYER 3) Mercuna nav bonus for pawns that have a nav component.
+        if (planarDist > memberStopU)
         {
             ULONGLONG& last = g_navReissueMs[ai];
-            if (nowm - last > 900) { last = nowm; if (MercunaMoveToPlayer(ai, player, stopU, 600.0f)) ++mercuna; }
+            if (nowm - last > 900) { last = nowm; if (MercunaMoveToPlayer(ai, player, memberStopU, 600.0f)) ++mercuna; }
         }
     }
 
@@ -11242,8 +13169,8 @@ void DriveSquadVelocityGameThread()
     if (nowm - lastLog > 3000)
     {
         lastLog = nowm;
-        LOG("SquadFollow(GT): followed=%d mercuna=%d unpinned=%d /%zu, nearest=%.1fm vel=%.0f sched=%s",
-            followed, mercuna, unpinned, squad.size(),
+        LOG("SquadFollow(GT): followed=%d hookMoving=%d input=%d velocity=%d recoveries=%d mercuna=%d unpinned=%d /%zu, nearest=%.1fm vel=%.0f sched=%s",
+            followed, hookMoving, directMoves, velocityMoves, recoveries, mercuna, unpinned, squad.size(),
             nearest >= 0.0f ? nearest / kUnitsPerMetre : -1.0f, nearVel, nearSched.c_str());
     }
 
@@ -11608,3 +13535,7 @@ void Features::Tick()
     try { TickImpl(); }
     catch (...) {}
 }
+
+
+
+

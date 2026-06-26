@@ -47,6 +47,55 @@ namespace
         return true;
     }
 
+    // One contiguous scan range.
+    struct ScanRange { uint8_t* base; size_t size; };
+
+    // Executable sections of the main module only. Code signatures should never
+    // match inside .rdata/.data, and on a 400 MB image those data sections cause
+    // false "ambiguous" duplicates. Restricting to executable sections makes a
+    // genuinely-unique function prologue resolve uniquely. PE parse failure is a
+    // hard failure: silently scanning the whole image would mix data matches into
+    // code signature counts and violate the hook fail-closed policy.
+    bool GetExecRanges(std::vector<ScanRange>& out)
+    {
+        uint8_t* base = nullptr;
+        size_t   size = 0;
+        if (!GetMainModuleRange(base, size))
+            return false;
+
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+        {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE)
+            {
+                auto* sec = IMAGE_FIRST_SECTION(nt);
+                for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+                {
+                    if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                        continue;
+                    size_t vsz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize
+                                                         : sec[i].SizeOfRawData;
+                    if (vsz)
+                        out.push_back({ base + sec[i].VirtualAddress, vsz });
+                }
+            }
+        }
+        return !out.empty();
+    }
+
+    bool GetRanges(Scanner::Scope scope, std::vector<ScanRange>& out)
+    {
+        if (scope == Scanner::Scope::ExecutableSections)
+            return GetExecRanges(out);
+        uint8_t* base = nullptr;
+        size_t size = 0;
+        if (!GetMainModuleRange(base, size))
+            return false;
+        out.push_back({ base, size });
+        return true;
+    }
+
     // Parse "48 8B ?? C0" (or "??" wildcards) into a byte array + match mask.
     void ParsePattern(const char* pattern, std::vector<uint8_t>& bytes, std::vector<bool>& mask)
     {
@@ -73,31 +122,102 @@ namespace
 
 namespace Scanner
 {
-    uint8_t* Find(const char* pattern)
+    uint8_t* Find(const char* pattern, Scope scope)
     {
-        uint8_t* base = nullptr;
-        size_t   size = 0;
-        if (!GetMainModuleRange(base, size))
+        std::vector<ScanRange> ranges;
+        if (!GetRanges(scope, ranges))
             return nullptr;
 
         std::vector<uint8_t> bytes;
         std::vector<bool>    mask;
         ParsePattern(pattern, bytes, mask);
         const size_t n = bytes.size();
-        if (n == 0 || size < n)
+        if (n == 0)
             return nullptr;
 
-        for (size_t i = 0; i + n <= size; ++i)
+        for (const ScanRange& r : ranges)
         {
-            bool ok = true;
-            for (size_t j = 0; j < n; ++j)
+            if (r.size < n) continue;
+            for (size_t i = 0; i + n <= r.size; ++i)
             {
-                if (mask[j] && base[i + j] != bytes[j]) { ok = false; break; }
+                bool ok = true;
+                for (size_t j = 0; j < n; ++j)
+                    if (mask[j] && r.base[i + j] != bytes[j]) { ok = false; break; }
+                if (ok)
+                    return r.base + i;
             }
-            if (ok)
-                return base + i;
         }
         return nullptr;
+    }
+
+    int CountMatches(const char* pattern, int cap, Scope scope)
+    {
+        std::vector<ScanRange> ranges;
+        if (!GetRanges(scope, ranges))
+            return 0;
+
+        std::vector<uint8_t> bytes;
+        std::vector<bool>    mask;
+        ParsePattern(pattern, bytes, mask);
+        const size_t n = bytes.size();
+        if (n == 0)
+            return 0;
+        if (cap < 1) cap = 1;
+
+        int found = 0;
+        for (const ScanRange& r : ranges)
+        {
+            if (r.size < n) continue;
+            for (size_t i = 0; i + n <= r.size; ++i)
+            {
+                bool ok = true;
+                for (size_t j = 0; j < n; ++j)
+                    if (mask[j] && r.base[i + j] != bytes[j]) { ok = false; break; }
+                if (ok && ++found >= cap)
+                    return found; // bounded: only distinguish 0 / 1 / >=cap
+            }
+        }
+        return found;
+    }
+
+    uint8_t* FindUnique(const char* pattern, int* outCount, Scope scope)
+    {
+        std::vector<ScanRange> ranges;
+        if (!GetRanges(scope, ranges))
+        {
+            if (outCount) *outCount = 0;
+            return nullptr;
+        }
+
+        std::vector<uint8_t> bytes;
+        std::vector<bool>    mask;
+        ParsePattern(pattern, bytes, mask);
+        const size_t n = bytes.size();
+        if (n == 0)
+        {
+            if (outCount) *outCount = 0;
+            return nullptr;
+        }
+
+        uint8_t* first = nullptr;
+        int      count = 0;
+        for (const ScanRange& r : ranges)
+        {
+            if (r.size < n) continue;
+            for (size_t i = 0; i + n <= r.size; ++i)
+            {
+                bool ok = true;
+                for (size_t j = 0; j < n; ++j)
+                    if (mask[j] && r.base[i + j] != bytes[j]) { ok = false; break; }
+                if (ok)
+                {
+                    if (!first) first = r.base + i;
+                    if (++count >= 2) { if (outCount) *outCount = count; return nullptr; }
+                }
+            }
+        }
+        if (outCount) *outCount = count;
+        return (count == 1) ? first : nullptr;
     }
 
     uint8_t* ResolveRipRel(uint8_t* match, int offsetToRel32, int instructionLength)
@@ -108,9 +228,48 @@ namespace Scanner
         return match + instructionLength + rel;
     }
 
-    uint8_t* FindRipRel(const char* pattern, int offsetToRel32, int instructionLength)
+    bool IsExecutableAddress(const void* address, size_t size)
     {
-        uint8_t* match = Find(pattern);
+        if (!address || size == 0)
+            return false;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+        if (start + size < start)
+            return false;
+        std::vector<ScanRange> ranges;
+        if (!GetExecRanges(ranges))
+            return false;
+        for (const ScanRange& r : ranges)
+        {
+            const uintptr_t rb = reinterpret_cast<uintptr_t>(r.base);
+            const uintptr_t re = rb + r.size;
+            if (start >= rb && start + size <= re)
+                return true;
+        }
+        return false;
+    }
+
+    uint8_t* DecodeRel32CallTarget(uint8_t* call)
+    {
+        if (!IsExecutableAddress(call, 5) || *call != 0xE8)
+            return nullptr;
+        int32_t rel = *reinterpret_cast<int32_t*>(call + 1);
+        uint8_t* target = call + 5 + rel;
+        return IsExecutableAddress(target, 1) ? target : nullptr;
+    }
+
+    uint8_t* DecodeRel32JumpTarget(uint8_t* jump)
+    {
+        if (!IsExecutableAddress(jump, 5) || *jump != 0xE9)
+            return nullptr;
+        int32_t rel = *reinterpret_cast<int32_t*>(jump + 1);
+        uint8_t* target = jump + 5 + rel;
+        return IsExecutableAddress(target, 1) ? target : nullptr;
+    }
+
+    uint8_t* FindRipRel(const char* pattern, int offsetToRel32, int instructionLength,
+                        Scope scope)
+    {
+        uint8_t* match = Find(pattern, scope);
         return match ? ResolveRipRel(match, offsetToRel32, instructionLength) : nullptr;
     }
 }

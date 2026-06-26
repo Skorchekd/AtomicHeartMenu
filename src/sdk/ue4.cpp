@@ -81,6 +81,23 @@ namespace
         { "Function /Script/AtomicHeart.DebugSubsystem.InstantLockUnlock", 0x4098 },
         { "Function /Script/AtomicHeart.DebugSubsystem.SetInstantPuzzleResolve", 0x40BD },
         { "Function /Script/AtomicHeart.DebugSubsystem.WinQTE", 0x40F1 },
+        // --- Prewarm cold-scan eliminators -----------------------------------
+        // These /Script (engine-native) UFunctions were the ones the runtime log
+        // showed Prewarm resolving via a FULL GObjects scan (650-900ms each) on a
+        // cold cache, because they were missing from the hint table. Native
+        // /Script functions register at engine init in a fixed order, so their
+        // GObjects index is deterministic across launches -- verified identical
+        // across every captured diagnostics snapshot AND the gobjects.tsv for this
+        // build. Hinting them makes Prewarm resolve them instantly (index lookup,
+        // no sweep). Still validated by full-name match before use, so a future
+        // game patch that shifts indices just falls back to the scan -- never a
+        // misresolve. (See AtomicHeartMenu_gobjects.tsv to refresh these.)
+        { "Function /Script/Engine.Character.LaunchCharacter", 0x33EF },
+        { "Function /Script/AIModule.AIController.MoveToActor", 0x375D },
+        { "Function /Script/AtomicHeart.BaseWeapon.FullUpgrade", 0x3E6D },
+        { "Function /Script/AtomicHeart.DebugSubsystem.CompleteAllActiveQuests", 0x407E },
+        { "Function /Script/AtomicHeart.DebugSubsystem.PromoteAllActiveQuests", 0x40A9 },
+        { "Function /Script/AIModule.AIBlueprintHelperLibrary.SimpleMoveToActor", 0x55B4 },
         { "StreamingUtils AtomicHeart.Default__StreamingUtils", 0x10855 },
         { "SubsystemUtils AtomicHeart.Default__SubsystemUtils", 0x10858 },
         { "DebugSubsystem_0", 0x12A5C },
@@ -639,28 +656,37 @@ UE::UObject* UE::FindObject(const char* name)
     int n = NumObjects();
     for (int i = 0; i < n; ++i)
     {
-        UObject* o = GetObjectByIndex(i);
-        if (!o) continue;
-
-        if (!token.empty())
+        // Per-slot guard: every read below is IsReadable-gated, but the region
+        // cache trades a tiny staleness window for its huge speedup, so a slot
+        // freed mid-scan could still fault. /EHa turns that into a catchable
+        // throw here -> we skip the one poisoned slot instead of aborting the
+        // whole resolve. Matches the per-object guards in the other scan loops.
+        try
         {
-            std::string objectName = o->GetName();
-            if (objectName != token)
-                continue;
-        }
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
 
-        ++candidates;
-        if (o->GetFullName().find(needle) != std::string::npos)
-        {
-            g_findObjectCache[needle] = o;
-            int objectIndex = o->Index();
-            if (objectIndex >= 0)
-                g_findObjectIndexCache[needle] = objectIndex;
-            ULONGLONG elapsed = GetTickCount64() - startMs;
-            if (elapsed > 250)
-                LOG("FindObject slow: %s took %llums scanned=%d candidates=%d", needle.c_str(), elapsed, n, candidates);
-            return o;
+            if (!token.empty())
+            {
+                std::string objectName = o->GetName();
+                if (objectName != token)
+                    continue;
+            }
+
+            ++candidates;
+            if (o->GetFullName().find(needle) != std::string::npos)
+            {
+                g_findObjectCache[needle] = o;
+                int objectIndex = o->Index();
+                if (objectIndex >= 0)
+                    g_findObjectIndexCache[needle] = objectIndex;
+                ULONGLONG elapsed = GetTickCount64() - startMs;
+                if (elapsed > 250)
+                    LOG("FindObject slow: %s took %llums scanned=%d candidates=%d", needle.c_str(), elapsed, n, candidates);
+                return o;
+            }
         }
+        catch (...) { /* one poisoned slot must not abort the whole resolve */ }
     }
 
     ULONGLONG elapsed = GetTickCount64() - startMs;

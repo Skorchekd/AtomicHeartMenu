@@ -16,6 +16,8 @@
 #include "../core/globals.h"
 #include "../core/log.h"
 #include "../features/features.h"
+#include "../hooks/native_hooks.h"
+#include "../hooks/ai_movement_hooks.h"
 #include "../sdk/ue4.h"
 #include "imgui.h"
 #include <Windows.h>
@@ -528,6 +530,360 @@ namespace
     }
 }
 
+// ---- Hook Testing tab: pretest native detours + AI stability ----------------
+// Free function (internal linkage) so Menu::Render can call it unqualified.
+static void RenderHookTestingTab()
+{
+    using NativeHooks::State;
+    using NativeHooks::Kind;
+
+    ImGui::TextWrapped("Hook Diagnostics and the experimental hook-driven bodyguard controller. "
+                       "Code hooks scan executable PE sections only; ambiguous or semantically "
+                       "invalid targets are refused. This tab owns its bodyguard experiment and "
+                       "does not enable the normal AI/Squad tab's controls.");
+    ImGui::Spacing();
+
+    // ---- crash-guard headline -------------------------------------------
+    ImGui::SeparatorText("Crash guard  (the random AI null-target crash)");
+    if (NativeHooks::CrashGuardActive())
+        ImGui::TextColored(ImVec4(0.40f, 0.95f, 0.55f, 1.0f),
+                           "* ACTIVE  -  null-this AI crash neutralised by a live detour");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f),
+                           "* NOT ACTIVE  -  signature unresolved; running SDK-only (crash still possible)");
+    ImGui::Text("Null-target derefs caught: %llu", (unsigned long long)NativeHooks::TotalGuarded());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(each one would have been an EXCEPTION_ACCESS_VIOLATION)");
+    ImGui::TextWrapped("CrashGuard.ContextAllyComp is the required crash firewall. Other helper "
+                       "hooks are optional diagnostics/friendship helpers and are refused until "
+                       "uniquely resolved. Optional ambiguity does not mean the active crash guard "
+                       "is broken.");
+    ImGui::TextWrapped("Historical root cause: player was written into TargetAlly even though the "
+                       "player is AHBaseCharacter, not AHAICharacter. The hook-debug bodyguard path "
+                       "now follows/focuses/protects the player without storing player in TargetAlly.");
+
+    // ---- signature table -------------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Hook resolution");
+    if (ImGui::Button("Rescan Signatures"))
+    {
+        LOG("UI: native hook rescan requested");
+        NativeHooks::Rescan();
+        Features::RescanHookMovementResolvers();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Dump AI Hook Status"))
+        Features::DumpHookAiStatus();
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Hook Logs"))
+        Log::Clear();
+    ImGui::TextDisabled("code signatures: executable sections only; ambiguous targets fail closed");
+
+    if (ImGui::BeginTable("hooks", 10,
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX |
+        ImGuiTableFlags_SizingFixedFit, ImVec2(0, 260)))
+    {
+        ImGui::TableSetupColumn("Hook", ImGuiTableColumnFlags_WidthFixed, 260.0f);
+        ImGui::TableSetupColumn("Need");
+        ImGui::TableSetupColumn("State");
+        ImGui::TableSetupColumn("Resolver", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("RVA");
+        ImGui::TableSetupColumn("Matches");
+        ImGui::TableSetupColumn("Scan");
+        ImGui::TableSetupColumn("Sanity");
+        ImGui::TableSetupColumn("Calls / guarded");
+        ImGui::TableSetupColumn("Last guard / caller", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < NativeHooks::Count(); ++i)
+        {
+            const NativeHooks::Entry& e = NativeHooks::Get(i);
+            ImGui::TableNextRow();
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.name);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\n\n%s\n\nsig: %s", e.purpose, e.detail ? e.detail : "", e.sig);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.required ? "required" : "optional");
+
+            ImGui::TableNextColumn();
+            ImVec4 col; const char* st;
+            switch (e.state)
+            {
+                case State::Resolved:      col = ImVec4(0.40f, 0.95f, 0.55f, 1.0f); st = (e.kind == Kind::Detour) ? "active/detour" : "resolved"; break;
+                case State::Unresolved:    col = ImVec4(1.00f, 0.55f, 0.40f, 1.0f); st = "missing";      break;
+                case State::Ambiguous:     col = ImVec4(1.00f, 0.80f, 0.30f, 1.0f); st = "ambiguous";    break;
+                case State::Skipped:       col = ImVec4(0.65f, 0.65f, 0.65f, 1.0f); st = "skipped";      break;
+                case State::SanityFailed:  col = ImVec4(1.00f, 0.45f, 0.40f, 1.0f); st = "failed sanity"; break;
+                case State::InstallFailed: col = ImVec4(1.00f, 0.45f, 0.40f, 1.0f); st = "install failed"; break;
+                default:                   col = ImVec4(0.60f, 0.60f, 0.60f, 1.0f); st = "pending";      break;
+            }
+            ImGui::TextColored(col, "%s", st);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(NativeHooks::ResolverName(e.resolver));
+
+            ImGui::TableNextColumn();
+            if (e.addr && G::moduleBase)
+                ImGui::Text("0x%llX", (unsigned long long)((uintptr_t)e.addr - (uintptr_t)G::moduleBase));
+            else
+                ImGui::TextDisabled("-");
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", e.matches);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("direct signature matches: %d", e.directMatches);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.executableOnly ? "exec only" : "whole module");
+
+            ImGui::TableNextColumn();
+            ImGui::TextColored(e.sanityPassed ? ImVec4(0.40f,0.95f,0.55f,1.0f) : ImVec4(0.75f,0.65f,0.45f,1.0f),
+                               "%s", e.sanityPassed ? "pass" : "no");
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu / %llu", (unsigned long long)e.calls.load(), (unsigned long long)e.guarded.load());
+
+            ImGui::TableNextColumn();
+            uint64_t lastMs = e.lastGuardMs.load();
+            uintptr_t caller = e.lastCaller.load();
+            if (lastMs)
+                ImGui::Text("%llums ago", (unsigned long long)(GetTickCount64() - lastMs));
+            else
+                ImGui::TextDisabled("never");
+            if (caller && G::moduleBase)
+                ImGui::TextDisabled("caller +0x%llX", (unsigned long long)(caller - (uintptr_t)G::moduleBase));
+        }
+
+        // Reflected friendship interception: verified by SDK metadata and ReVa,
+        // but intentionally not represented as a raw prologue detour.
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("Friendship.AIUtils.AreFriendlyCharacters");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("optional");
+        ImGui::TableNextColumn();
+        if (Features::HookBodyguardModeActive()) ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "active/hook");
+        else if (Features::HookFriendshipResolved()) ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "resolved");
+        else ImGui::TextDisabled("skipped");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("SDK + ReVa");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("0x225BDA0*");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("ReVa-confirmed native exec thunk; interception uses the unique reflected UFunction.");
+        ImGui::TableNextColumn(); ImGui::Text("%d", Features::HookFriendshipResolved() ? 1 : 0);
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("metadata");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(Features::HookFriendshipResolved() ? "pass" : "no");
+        ImGui::TableNextColumn(); ImGui::Text("%llu / -", (unsigned long long)Features::HookFriendshipForceCount());
+        ImGui::TableNextColumn(); ImGui::TextDisabled("n/a");
+
+        const AiMovementHooks::Status move = AiMovementHooks::GetStatus();
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("Movement.Mercuna.MoveToLocationNative");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("optional");
+        ImGui::TableNextColumn();
+        if (move.moveHelperResolved) ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "resolved"); else ImGui::TextDisabled("missing");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("callsite-derived");
+        ImGui::TableNextColumn();
+        if (move.moveHelper && G::moduleBase) ImGui::Text("0x%llX", (unsigned long long)(move.moveHelper-(uintptr_t)G::moduleBase)); else ImGui::TextDisabled("-");
+        ImGui::TableNextColumn(); ImGui::Text("%d", move.moveHelperResolved?1:0);
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("exec only");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(move.moveHelperResolved?"pass":"no");
+        ImGui::TableNextColumn(); ImGui::Text("%llu / %llu", (unsigned long long)move.nativeMovesIssued, (unsigned long long)move.nativeStopsIssued);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("ReVa wrapper +0x275");
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("Movement.Mercuna.Ownership");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("optional");
+        ImGui::TableNextColumn();
+        if (move.mercunaDetoursLive) ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "active/detour"); else ImGui::TextDisabled("skipped");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("vtable-derived");
+        ImGui::TableNextColumn();
+        if (move.moveRequestTarget && G::moduleBase) ImGui::Text("0x%llX", (unsigned long long)(move.moveRequestTarget-(uintptr_t)G::moduleBase)); else ImGui::TextDisabled("-");
+        ImGui::TableNextColumn(); ImGui::Text("%d", move.mercunaDetoursLive?1:0);
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("exec only");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(move.mercunaDetoursLive?"pass":"no");
+        ImGui::TableNextColumn(); ImGui::Text("%llu / %llu", (unsigned long long)move.externalMovesBlocked,
+                                             (unsigned long long)(move.externalStopsBlocked+move.externalCancelsBlocked));
+        ImGui::TableNextColumn(); ImGui::Text("owned %d/%d", move.ownedComponents, move.registeredComponents);
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("Movement.AIController.Ownership");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("optional");
+        ImGui::TableNextColumn();
+        if (move.controllerDetoursLive) ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "active/detour"); else ImGui::TextDisabled("waiting");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("vtable-derived");
+        ImGui::TableNextColumn();
+        if (move.controllerMoveTarget && G::moduleBase) ImGui::Text("0x%llX", (unsigned long long)(move.controllerMoveTarget-(uintptr_t)G::moduleBase)); else ImGui::TextDisabled("-");
+        ImGui::TableNextColumn(); ImGui::Text("%d", move.controllerDetoursLive?1:0);
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("exec only");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(move.controllerDetoursLive?"pass":"no");
+        ImGui::TableNextColumn(); ImGui::Text("%llu/%llu | block %llu/%llu",
+                                             (unsigned long long)move.controllerMovesIssued,
+                                             (unsigned long long)move.controllerStopsIssued,
+                                             (unsigned long long)move.controllerMovesBlocked,
+                                             (unsigned long long)move.controllerStopsBlocked);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("Move +0x790 / Stop +0x728");
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("Movement.Twin.MixedNavigationTransition");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("optional");
+        ImGui::TableNextColumn();
+        if (move.mixedTransitionResolved) ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "resolved"); else ImGui::TextDisabled("skipped");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("callsite-derived");
+        ImGui::TableNextColumn();
+        if (move.mixedTransition && G::moduleBase) ImGui::Text("0x%llX", (unsigned long long)(move.mixedTransition-(uintptr_t)G::moduleBase)); else ImGui::TextDisabled("-");
+        ImGui::TableNextColumn(); ImGui::Text("%d", move.mixedTransitionResolved?1:0);
+        ImGui::TableNextColumn(); ImGui::TextUnformatted("exec only");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(move.mixedTransitionResolved?"pass":"no");
+        ImGui::TableNextColumn(); ImGui::Text("%llu / -", (unsigned long long)move.mixedTransitions);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("2D/3D native transition");
+        ImGui::EndTable();
+    }
+
+    // ---- dry-run validation ---------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Dry-run validation  (read-only; never mutates game state)");
+    static Features::HookBodyguardValidation validation{};
+    if (ImGui::Button("Validate Bodyguard Pair"))
+        validation = Features::ValidateHookBodyguardPair(true);
+    ImGui::SameLine();
+    if (ImGui::Button("Validate TargetAlly Assignment"))
+    {
+        LOG("[AI-DRYRUN] Validate TargetAlly Assignment requested");
+        validation = Features::ValidateHookBodyguardPair(true);
+    }
+    if (G::sdkReady.load())
+    {
+        if (!validation.player)
+            validation = Features::ValidateHookBodyguardPair(false);
+        ImGui::Text("Selected guard: %p  %s  [%s]", (void*)validation.guard,
+                    validation.guardName.c_str(), validation.guardClass.c_str());
+        ImGui::Text("Player:        %p  %s  [%s]", (void*)validation.player,
+                    validation.playerName.c_str(), validation.playerClass.c_str());
+        ImGui::Text("Guard managed / AHAICharacter: %s / %s",
+                    validation.guardManaged ? "yes" : "no", validation.guardIsAHAICharacter ? "yes" : "no");
+        ImGui::Text("Player AHBaseCharacter / AHAICharacter: %s / %s",
+                    validation.playerIsAHBaseCharacter ? "yes" : "no", validation.playerIsAHAICharacter ? "yes" : "no");
+        ImGui::Text("Legacy TargetAlly(player) unsafe: %s", validation.legacyTargetAllyWouldBeUnsafe ? "YES" : "no");
+        ImGui::TextColored(ImVec4(0.40f,0.95f,0.55f,1), "Current code would attempt unsafe TargetAlly: %s",
+                           validation.currentCodeWouldAssignUnsafeTargetAlly ? "YES" : "NO");
+        ImGui::Text("Friendship hook would force friendly: %s", validation.friendshipWouldForce ? "yes" : "no");
+        ImGui::Text("Crash guard: %s", validation.crashGuardActive ? "ACTIVE" : "INACTIVE");
+        ImGui::Text("Movement backend: %s", validation.movementBackend.empty()?"not evaluated":validation.movementBackend.c_str());
+        ImGui::Text("Nav / controller: %p / %p    owned: %s", (void*)validation.navigationComponent,
+                    (void*)validation.controller, validation.nativeMovementOwned?"yes":"no");
+        ImGui::Text("Native helper / Mercuna detours: %s / %s    mixed-nav mode: %u",
+                    validation.nativeMoveHelperResolved?"resolved":"missing",
+                    validation.nativeMercunaDetoursLive?"live":"waiting",
+                    (unsigned)validation.currentNavigationMode);
+        ImGui::Text("Unsafe TargetAlly assignments skipped: %llu",
+                    (unsigned long long)Features::UnsafeTargetAllySkipCount());
+    }
+    else
+        ImGui::TextDisabled("SDK not resolved -- live validation unavailable.");
+
+    // ---- Hook Debug experimental bodyguards ------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Experimental hook-driven bodyguards");
+    ImGui::TextWrapped("This is the Hook Diagnostics experiment, not the normal AI/Squad tab. "
+                       "Our ProcessEvent pump owns spawn scheduling, follow goals, protection, "
+                       "threat selection, attacks and native animation-driving AI calls. The player "
+                       "is used as follow/focus/protect target, never as TargetAlly.");
+    bool hookMode = Features::HookBodyguardModeActive();
+    if (ImGui::Checkbox("Enable experimental hook bodyguards", &hookMode))
+        Features::SetHookBodyguardMode(hookMode);
+    ImGui::Text("Friendship hook: %s    forced pairs: %llu",
+                Features::HookFriendshipResolved() ? "resolved" : "unavailable",
+                (unsigned long long)Features::HookFriendshipForceCount());
+    ImGui::Text("Ownership lock: %s    un-ally calls blocked: %llu",
+                Features::OwnershipLockActive() ? "active" : "inactive",
+                (unsigned long long)Features::OwnershipSwallowCount());
+    {
+        const AiMovementHooks::Status move = AiMovementHooks::GetStatus();
+        ImGui::Text("Native movement: helper %s | Mercuna %s | Controller %s | Twin mixed-nav %s",
+                    move.moveHelperResolved?"resolved":"missing",
+                    move.mercunaDetoursLive?"live":"waiting for component",
+                    move.controllerDetoursLive?"live":"waiting for controller",
+                    move.mixedTransitionResolved?"resolved":"waiting for Twin");
+        ImGui::Text("Native commands move/stop: %llu / %llu    external move/stop/cancel blocked: %llu / %llu / %llu",
+                    (unsigned long long)move.nativeMovesIssued, (unsigned long long)move.nativeStopsIssued,
+                    (unsigned long long)move.externalMovesBlocked, (unsigned long long)move.externalStopsBlocked,
+                    (unsigned long long)move.externalCancelsBlocked);
+        ImGui::Text("Controller direct Move/Stop issued: %llu / %llu    blocked: %llu / %llu",
+                    (unsigned long long)move.controllerMovesIssued,
+                    (unsigned long long)move.controllerStopsIssued,
+                    (unsigned long long)move.controllerMovesBlocked,
+                    (unsigned long long)move.controllerStopsBlocked);
+    }
+
+    // ---- stress test -----------------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Hook bodyguard spawn");
+    static int hookSpawnModel = 0;
+    int hookModelCount = Features::AiSpawnModelCount();
+    if (hookSpawnModel < 0 || hookSpawnModel >= hookModelCount) hookSpawnModel = 0;
+    const char* hookPreview = hookModelCount > 0
+        ? Features::AiSpawnModelName(hookSpawnModel) : "(no live AI classes discovered yet)";
+    ImGui::TextDisabled("Loaded runtime class (recommended for Twins and bosses)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##hookspawnmodel", hookPreview))
+    {
+        for (int i = 0; i < hookModelCount; ++i)
+        {
+            bool selected = hookSpawnModel == i;
+            if (ImGui::Selectable(Features::AiSpawnModelName(i), selected)) hookSpawnModel = i;
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::Button("Spawn selected as Hook bodyguard", ImVec2(-FLT_MIN, 0)))
+        Features::HookAiSpawnModel(hookSpawnModel);
+    ImGui::TextDisabled("Spawn queue: %d", Features::AiSpawnQueueCount());
+
+    static char hookModelSearch[80]{};
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##hookmodelsearch", "Search all character classes (Twin, boss, Vova...)",
+                             hookModelSearch, sizeof(hookModelSearch));
+    std::vector<std::string> hookSearchResults = Features::AiSearchModels(hookModelSearch, 40);
+    if (ImGui::TreeNodeEx("All discovered/loadable character classes", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::BeginChild("hook_model_results", ImVec2(0, 125), true);
+        for (int i = 0; i < (int)hookSearchResults.size(); ++i)
+        {
+            ImGui::PushID(9000 + i);
+            if (ImGui::Button("Spawn Hook", ImVec2(92, 0)))
+                Features::HookAiSpawnModelByName(hookSearchResults[i].c_str());
+            ImGui::SameLine();
+            ImGui::TextUnformatted(hookSearchResults[i].c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::TextDisabled("Loaded runtime classes are safest. On-demand boss classes remain guarded by the existing spawn queue.");
+        ImGui::TreePop();
+    }
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Hook bodyguard controls");
+    ImGui::TextWrapped("These controls activate the experimental hook mode before mutating state. "
+                       "Follow uses a fixed 2 m hold ring with native Mercuna ownership, or one protected "
+                       "AIController move request when Mercuna is absent. There is no shared squad blackboard, "
+                       "per-frame movement-input, raw velocity, or periodic path flush in this mode. Threat perception is 360 degrees but only engages the "
+                       "12 m protection perimeter (or an active attacker); native attacks retain "
+                       "their animations and the first confirmed hit kills the robot.");
+    const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+    if (ImGui::Button("Recruit nearby -> hook roster", ImVec2(bw, 0)))
+    { LOG("UI: [hooktest] recruit nearby"); Features::HookAiRecruitNearby(); }
+    ImGui::SameLine();
+    if (ImGui::Button("Hook roster follow me", ImVec2(-FLT_MIN, 0)))
+    { LOG("UI: [hooktest] follow player"); Features::HookAiFollow(); }
+    if (ImGui::Button("Spawn nearest as bodyguard", ImVec2(bw, 0)))
+    { LOG("UI: [hooktest] spawn bodyguard"); Features::HookAiSpawnBodyguard(); }
+    ImGui::SameLine();
+    if (ImGui::Button("Hook roster attack", ImVec2(-FLT_MIN, 0)))
+    { LOG("UI: [hooktest] dispatch attack"); Features::HookAiAttack(); }
+    if (ImGui::Button("Release hook roster", ImVec2(-FLT_MIN, 0)))
+    { LOG("UI: [hooktest] release squad"); Features::HookAiRelease(); }
+    ImGui::Text("Hook roster: %d    Global squad: %d", Features::HookAiCount(), Features::AiSquadCount());
+}
+
 void Menu::Render()
 {
     auto& f = Features::Get();
@@ -955,6 +1311,12 @@ void Menu::Render()
                 LOG("UI: dump nearby volumes");
                 Features::DumpNearbyVolumes();
             }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Hook Diagnostics"))
+        {
+            RenderHookTestingTab();
             ImGui::EndTabItem();
         }
 

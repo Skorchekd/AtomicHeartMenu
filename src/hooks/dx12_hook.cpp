@@ -63,6 +63,7 @@ namespace
     ID3D12DescriptorHeap*       g_rtvHeap = nullptr;
     ID3D12DescriptorHeap*       g_srvHeap = nullptr;
     ID3D12CommandQueue*         g_commandQueue = nullptr;
+    bool                        g_ownCommandQueue = false; // true if WE created it (DLSS-FG fallback)
     ID3D12GraphicsCommandList*  g_commandList = nullptr;
     ID3D12Fence*                g_fence = nullptr;
     HANDLE                      g_fenceEvent = nullptr;
@@ -459,11 +460,61 @@ namespace
         g_init = false;
     }
 
+    // DLSS Frame Generation / Streamline cache the original d3d12 vtable pointers at
+    // THEIR init (which runs before we inject), so they submit through the real queue
+    // without ever calling our ExecuteCommandLists hook. The result: hkExecuteCommandLists
+    // never sees the game's queue, so InitImGui (and the WndProc hook it installs) can
+    // never run -> no overlay, and no key can open the menu. When that happens, create
+    // our own DIRECT queue from the swapchain's device so the overlay can still come up.
+    // Normal (non-FG) titles still capture and use the game's own queue.
+    bool EnsureOwnCommandQueue(IDXGISwapChain3* sc)
+    {
+        if (g_commandQueue) return true;
+
+        ID3D12Device* dev = nullptr;
+        if (FAILED(sc->GetDevice(IID_PPV_ARGS(&dev))) || !dev)
+        {
+            static bool logged = false;
+            if (!logged) { logged = true; LOG("hkPresent: fallback queue: GetDevice failed."); }
+            return false;
+        }
+
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        HRESULT hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_commandQueue));
+        dev->Release();
+
+        if (FAILED(hr) || !g_commandQueue)
+        {
+            static bool logged = false;
+            if (!logged) { logged = true; LOG("hkPresent: fallback queue: CreateCommandQueue failed hr=0x%lX", hr); }
+            return false;
+        }
+
+        g_ownCommandQueue = true;
+        LOG("hkPresent: no game queue captured (DLSS-FG/Streamline?); created own DIRECT queue %p so the overlay can initialise.", g_commandQueue);
+        return true;
+    }
+
     // ---- hooked Present ----------------------------------------------------
     HRESULT WINAPI hkPresent(IDXGISwapChain3* sc, UINT sync, UINT flags)
     {
         if (!oPresent) return DXGI_ERROR_INVALID_CALL;
         if (!G::running.load()) return oPresent(sc, sync, flags);
+
+        // One-time proof that the swapchain Present we hooked is actually the one
+        // the game drives. If this never logs, our vtable hook is being bypassed
+        // (e.g. DLSS Frame Generation / Streamline proxy swapchain, or another
+        // overlay owning Present) and the overlay/WndProc subsystem can never come
+        // up -> no key (INSERT/F7/anything) can ever open the menu.
+        static bool firstPresentLogged = false;
+        if (!firstPresentLogged)
+        {
+            firstPresentLogged = true;
+            LogStreamlineStateOnce();
+            LOG("hkPresent: first present observed (sc=%p).", sc);
+        }
 
         // Everything below touches D3D + game state. /EHa means catch(...)
         // also traps access violations, so injecting during a loading screen or
@@ -472,7 +523,23 @@ namespace
         {
             if (!g_init)
             {
-                if (!g_commandQueue) return oPresent(sc, sync, flags); // wait for queue capture
+                if (!g_commandQueue)
+                {
+                    // Present is firing but ExecuteCommandLists hasn't handed us a
+                    // DIRECT queue yet. Give it a brief window to arrive (the ideal,
+                    // perfectly game-synchronised path), then fall back to our own
+                    // queue so DLSS-FG/Streamline users aren't locked out forever.
+                    static ULONGLONG firstNoQueueMs = 0;
+                    ULONGLONG nowMs = GetTickCount64();
+                    if (firstNoQueueMs == 0)
+                    {
+                        firstNoQueueMs = nowMs;
+                        LOG("hkPresent: present is live but no command queue captured yet; waiting for ExecuteCommandLists.");
+                    }
+
+                    if (nowMs - firstNoQueueMs < 2000 || !EnsureOwnCommandQueue(sc))
+                        return oPresent(sc, sync, flags); // still waiting, or fallback not ready
+                }
                 if (InitImGui(sc)) g_init = true;
                 else
                 {
@@ -810,6 +877,7 @@ void DX12Hook::Remove()
 
     ReleaseOverlayResources();
     SafeRelease(g_commandQueue);
+    g_ownCommandQueue = false;
 
     g_init = false;
     LOG("DX12 hooks removed");

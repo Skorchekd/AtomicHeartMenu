@@ -172,6 +172,32 @@ namespace Features
         std::string name;
     };
 
+    struct HookBodyguardValidation
+    {
+        std::uintptr_t guard = 0;
+        std::uintptr_t player = 0;
+        std::string guardName;
+        std::string guardClass;
+        std::string playerName;
+        std::string playerClass;
+        bool guardManaged = false;
+        bool guardIsAHAICharacter = false;
+        bool playerIsAHBaseCharacter = false;
+        bool playerIsAHAICharacter = false;
+        bool legacyTargetAllyWouldBeUnsafe = false;
+        bool currentCodeWouldAssignUnsafeTargetAlly = false;
+        bool friendshipWouldForce = false;
+        bool crashGuardActive = false;
+        std::uintptr_t navigationComponent = 0;
+        std::uintptr_t controller = 0;
+        std::string movementBackend;
+        bool nativeMoveHelperResolved = false;
+        bool nativeMercunaDetoursLive = false;
+        bool nativeMovementOwned = false;
+        bool mixedNavigation = false;
+        std::uint8_t currentNavigationMode = 0;
+    };
+
     void Prewarm();           // resolve UFunctions on the worker thread (off the render path)
     void WorkerTick();        // worker-thread heartbeat: discover puzzles + refresh ESP actors
     void Tick();              // called every frame from the Present hook
@@ -289,6 +315,38 @@ namespace Features
     const char* HordeLocationName(int i);
     void HordeSaveLocationHere(const char* name); // capture current pawn position as a new arena
     void HordeDeleteLocation(int i);              // delete a saved arena (i >= 1; "Here" can't be deleted)
+
+    // ---- AI ownership lock (native, ProcessEvent-level) --------------------
+    // Arms a guard inside the ProcessEvent detour that swallows the exact UFunctions
+    // the engine would use to turn a squad unit against us (re-attitude to hostile,
+    // or target the player). This is what makes "ours" PERMANENT instead of fragile:
+    // we stop the game from changing our settings rather than constantly re-writing
+    // them. Class-agnostic, so it covers every AI including the Twins. In Hook Debug
+    // mode it is scoped to the dedicated Hook Diagnostics roster.
+    void     SetOwnershipLock(bool on);
+    bool     OwnershipLockActive();
+    uint64_t OwnershipSwallowCount(); // total game "un-ally" calls blocked this session
+    bool     OwnershipResolved();     // true once the 3 guarded UFunctions are resolved
+
+    // Hook Debug-only experimental bodyguard controller. The reflected friendship
+    // hook is narrow: player <-> managed bodyguard only; every other pair calls the
+    // original game behavior.
+    void     SetHookBodyguardMode(bool on);
+    bool     HookBodyguardModeActive();
+    bool     HookFriendshipResolved();
+    uint64_t HookFriendshipForceCount();
+    uint64_t UnsafeTargetAllySkipCount();
+    HookBodyguardValidation ValidateHookBodyguardPair(bool writeLog);
+    void     DumpHookAiStatus();
+    void     RescanHookMovementResolvers();
+    int      HookAiRecruitNearby();
+    bool     HookAiSpawnBodyguard();
+    bool     HookAiSpawnModel(int index);
+    bool     HookAiSpawnModelByName(const char* prettyName);
+    void     HookAiFollow();
+    void     HookAiAttack();
+    void     HookAiRelease();
+    int      HookAiCount();
 
     void MaxWeaponUpgrades();     // BaseWeapon::FullUpgrade on the current weapon
     void RunConsoleCommand(const char* command); // queue a console command to the game thread

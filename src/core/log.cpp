@@ -24,6 +24,7 @@ namespace
     bool        g_console = false;
     bool        g_allocatedConsole = false;
     HANDLE      g_consoleOut = nullptr;
+    char        g_path[MAX_PATH]{};
     std::mutex  g_mtx;
 
     void DisableConsoleCloseButton()
@@ -99,6 +100,7 @@ void Log::Init(bool allocConsole)
         }
     }
 
+    if (logPath[0]) strcpy_s(g_path, logPath);
     Write("==== AtomicHeartMenu log start ====");
     if (g_file) Write("Log path: %s", logPath);
 }
@@ -110,6 +112,16 @@ void Log::Shutdown()
     if (g_allocatedConsole) { FreeConsole(); g_allocatedConsole = false; }
     g_console = false;
     g_consoleOut = nullptr;
+}
+
+void Log::Clear()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        if (g_file) { fclose(g_file); g_file = nullptr; }
+        if (g_path[0]) fopen_s(&g_file, g_path, "w");
+    }
+    Write("==== AtomicHeartMenu log cleared from Hook Diagnostics ====");
 }
 
 void Log::Write(const char* fmt, ...)

@@ -18,6 +18,8 @@
 #include "core/log.h"
 #include "sdk/ue4.h"
 #include "hooks/dx12_hook.h"
+#include "hooks/native_hooks.h"
+#include "hooks/ai_movement_hooks.h"
 #include "features/features.h"
 #include <exception>
 
@@ -36,6 +38,10 @@ namespace
 
     void SafeRemoveHooks()
     {
+        try { AiMovementHooks::Shutdown(); }
+        catch (...) { LOG("AiMovementHooks::Shutdown threw during shutdown."); }
+        try { NativeHooks::Shutdown(); }
+        catch (...) { LOG("NativeHooks::Shutdown threw during shutdown."); }
         try { DX12Hook::Remove(); }
         catch (...) { LOG("DX12Hook::Remove threw during shutdown."); }
     }
@@ -53,6 +59,12 @@ namespace
         if (!DX12Hook::Install())
             LOG("WARNING: DX12 hook install failed - menu will not draw.");
 
+        // Native code-byte hooks (separate from the SDK reflection layer below).
+        // Pure module signature scan + MinHook detours; does NOT need the SDK, so
+        // we bring the crash guard live as early as possible. Fails safe per-hook.
+        try { NativeHooks::Init(); }
+        catch (...) { LOG_HOOK("NativeHooks::Init threw -- continuing without native detours."); }
+
         bool sdkPrewarmed = false;
         bool sdkWarningLogged = false;
         ULONGLONG firstSdkAttemptMs = GetTickCount64();
@@ -63,7 +75,7 @@ namespace
             if (!UE::ResolveGlobals())
                 return false;
 
-            LOG("SDK ready.");
+            LOG_SDK("ready (GObjects/GNames/GWorld resolved).");
             Features::Prewarm();
             sdkPrewarmed = true;
             return true;
@@ -82,7 +94,7 @@ namespace
                 tryResolveSdk();
                 if (!sdkPrewarmed && !sdkWarningLogged && nowMs - firstSdkAttemptMs > 10000)
                 {
-                    LOG("WARNING: SDK not resolved yet - fix signatures/offsets in offsets.h if this persists.");
+                    LOG_SDK("WARNING: not resolved yet - fix signatures/offsets in offsets.h if this persists.");
                     sdkWarningLogged = true;
                 }
             }

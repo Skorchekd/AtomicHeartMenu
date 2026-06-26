@@ -144,8 +144,8 @@ namespace
         Features::NoteGameThread();
         try
         {
-            // Toggle on key-down of INSERT.
-            if (msg == WM_KEYDOWN && wParam == VK_INSERT)
+            // Toggle on key-down of INSERT or F7.
+            if (msg == WM_KEYDOWN && (wParam == VK_INSERT || wParam == VK_F7))
             {
                 if ((lParam & 0x40000000) == 0)
                 {
@@ -163,7 +163,7 @@ namespace
                 }
                 return 0;
             }
-            if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && wParam == VK_INSERT)
+            if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && (wParam == VK_INSERT || wParam == VK_F7))
                 return 0;
 
             if (G::menuOpen.load())
