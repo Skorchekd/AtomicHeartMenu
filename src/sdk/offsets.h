@@ -364,6 +364,10 @@ namespace Offsets
         constexpr const char* Fn_AHAICharacter_SetTargetAlly = "Function /Script/AtomicHeart.AHAICharacter.SetTargetAlly";
         constexpr const char* Fn_AHAICharacter_SetTargetEnemy = "Function /Script/AtomicHeart.AHAICharacter.SetTargetEnemy";
         constexpr const char* Fn_AHAICharacter_Suicide = "Function /Script/AtomicHeart.AHAICharacter.Suicide";
+        constexpr const char* Fn_AHAICharacter_K2_OnDeath = "Function /Script/AtomicHeart.AHAICharacter.K2_OnDeath";
+        constexpr const char* Fn_AHAICharacter_K2_OnLoadDeathState = "Function /Script/AtomicHeart.AHAICharacter.K2_OnLoadDeathState";
+        constexpr const char* Fn_AHAICharacter_LoadDeadState = "Function /Script/AtomicHeart.AHAICharacter.LoadDeadState";
+        constexpr const char* Fn_AHAICharacter_TryActivateFightStagingAbility = "Function /Script/AtomicHeart.AHAICharacter.TryActivateFightStagingAbility";
         constexpr const char* Fn_AHAICharacter_SwitchTeamToMatchCharacterAttitude = "Function /Script/AtomicHeart.AHAICharacter.SwitchTeamToMatchCharacterAttitude";
         constexpr const char* Fn_AHAICharacter_GetAIController = "Function /Script/AtomicHeart.AHAICharacter.GetAIController";
         constexpr const char* Fn_AHAIController_PauseBehaviorTree = "Function /Script/AtomicHeart.AHAIController.PauseBehaviorTree";
@@ -493,6 +497,16 @@ namespace Offsets
         constexpr const char* Fn_AIUtils_SetCharacterPassive    = "Function /Script/AtomicHeart.AIUtils.SetCharacterPassive";
         constexpr const char* Fn_AIUtils_RestartLogic           = "Function /Script/AtomicHeart.AIUtils.RestartLogic";
         constexpr const char* Fn_AIUtils_AreFriendlyCharacters  = "Function /Script/AtomicHeart.AIUtils.AreFriendlyCharacters";
+
+        // ReVa 2026-06-26: these are the reflected death/fight-staging/QTE event
+        // choke points that can push a Hook Twin into the campaign downed pose.
+        constexpr const char* Fn_AHCharacterEventUtils_SendDeathEvent = "Function /Script/AtomicHeart.AHCharacterEventUtils.SendDeathEvent";
+        constexpr const char* Fn_AHCharacterEventUtils_SendLoadDeathStateEvent = "Function /Script/AtomicHeart.AHCharacterEventUtils.SendLoadDeathStateEvent";
+        constexpr const char* Fn_GameplayEventSubsystem_SendCharacterDiedEvent = "Function /Script/AtomicHeart.GameplayEventSubsystem.SendCharacterDiedEvent";
+        constexpr const char* Fn_QTESubsystem_StartVersusQTE = "Function /Script/AtomicHeart.QTESubsystem.StartVersusQTE";
+        constexpr const char* Fn_QTESubsystem_CacheDeathPose = "Function /Script/AtomicHeart.QTESubsystem.CacheDeathPose";
+        constexpr const char* Fn_AIDeathAbility_DestroyOwnerCharacter = "Function /Script/AtomicHeart.AIDeathAbility.DestroyOwnerCharacter";
+        constexpr int AIAbility_CachedAIOwner = 0x658; // UAHAICharacterAbility::CachedAIOwner
 
         // AHAICharacter helper for placement (short name; children walk).
         constexpr const char* Fn_AHAICharacter_SnapCapsuleToGround = "Function /Script/AtomicHeart.AHAICharacter.SnapCapsuleToGround";

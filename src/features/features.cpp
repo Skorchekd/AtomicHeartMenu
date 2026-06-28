@@ -14,6 +14,7 @@
 #include "features.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
+#include "../sdk/scanner.h"
 #include "../core/globals.h"
 #include "../core/log.h"
 #include "../core/memory.h"
@@ -90,6 +91,157 @@ namespace
     typedef void (*ProcessEvent_t)(void*, void*, void*); // x64: this=RCX, fn=RDX, parms=R8
     ProcessEvent_t            oProcessEvent = nullptr;
     void*                     g_peTarget = nullptr;
+    // Trampoline for AHAICharacter::TryActivateFightStagingAbility native detour.
+    // Ghidra reversal at RVA 0x1B93A50: void(AHAICharacter*, void* params, bool flag).
+    using TryFightStagingFn = void(__fastcall*)(void* thisptr, void* params, bool);
+    TryFightStagingFn         g_oTryFightStaging = nullptr;
+
+    // Trampoline for action-container factory (RVA 0x1CA06E0). Logs containers
+    // spawned after fight-staging selection on Hook Twins.
+    using ActionContainerFactoryFn = void*(__fastcall*)(void* thisptr, void* params);
+    ActionContainerFactoryFn  g_oActionContainerFactory = nullptr;
+
+    // Downed/final-stage token list. If the selected fight-staging object's
+    // name contains any of these (case-insensitive), the native is blocked.
+    // Normal movement / combat stages are allowed through.
+    constexpr const char* kDownedTokens[] = {
+        "twin", "chelomey", "downed", "final", "death", "qte", "finale",
+    };
+
+    static bool MatchesDownedToken(const std::string& name)
+    {
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        for (const char* tok : kDownedTokens)
+        {
+            if (lower.find(tok) != std::string::npos)
+                return true;
+        }
+        return false;
+    }
+
+    // Walk the character's outer chain + AbilitySystemComponent to find the
+    // UAIFightStagingAbility instance and read the selected-object pointer
+    // stored at offsets +0x690 / +0x6A0 / +0x6A1 (per ReVa reversal).
+    static void ClearFightStagingAbilityObject(UObject* ab)
+    {
+        if (!ab || !Mem::IsReadable(ab, 0x6A2))
+            return;
+        uint8_t* b = reinterpret_cast<uint8_t*>(ab);
+        *reinterpret_cast<void**>(b + 0x690) = nullptr; // selected object
+        *reinterpret_cast<uint8_t*>(b + 0x6A0) = 0;     // selected/active flags from ReVa reversal
+        *reinterpret_cast<uint8_t*>(b + 0x6A1) = 0;
+    }
+
+    static bool ClearFightStagingSelectedObject(UObject* character)
+    {
+        bool cleared = false;
+        if (!character || !Mem::IsReadable(character, 0x30))
+            return false;
+
+        auto maybeClear = [&](UObject* ab)
+        {
+            if (!ab || !Mem::IsReadable(ab, 0x30) || !ab->Class())
+                return;
+            std::string name = ab->Class()->GetName();
+            if (name.find("FightStaging") != std::string::npos)
+            {
+                ClearFightStagingAbilityObject(ab);
+                cleared = true;
+            }
+        };
+
+        if (Mem::IsReadable(character, 0x738 + sizeof(void*)))
+        {
+            UObject* asc = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(character) + 0x738);
+            if (asc && Mem::IsReadable(asc, 0x130))
+            {
+                int count = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(asc) + 0x130);
+                void** arr = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(asc) + 0x128);
+                if (arr && count > 0 && count < 1024 && Mem::IsReadable(arr, sizeof(void*) * (size_t)count))
+                    for (int i = 0; i < count; ++i)
+                        maybeClear(reinterpret_cast<UObject*>(arr[i]));
+            }
+        }
+
+        UObject* o = character->Outer();
+        for (int d = 0; o && d < 64; ++d)
+        {
+            maybeClear(o);
+            o = o->Outer();
+        }
+        return cleared;
+    }
+
+    static void* GetFightStagingSelectedObject(UObject* character)
+    {
+        void* result = nullptr;
+        // Helper: read a pointer from an offset if readable.
+        auto tryRead = [](UObject* base, int offset) -> void*
+        {
+            if (!base || !Mem::IsReadable(base, offset + sizeof(void*)))
+                return nullptr;
+            return *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(base) + offset);
+        };
+
+        // 1. Check the character's AbilitySystemComponent (offset 0x738).
+        if (Mem::IsReadable(character, 0x738 + sizeof(void*)))
+        {
+            UObject* asc = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(character) + 0x738);
+            if (asc)
+            {
+                // Walk ActiveAbilities (ASC ActiveAbilities array, offset 0x128,
+                // count at 0x130). Up to 256 entries.
+                if (Mem::IsReadable(asc, 0x130))
+                {
+                    int count = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(asc) + 0x130);
+                    if (count > 0 && count < 1024)
+                    {
+                        void** arr = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(asc) + 0x128);
+                        if (arr)
+                        {
+                            for (int i = 0; i < count; ++i)
+                            {
+                                UObject* ab = reinterpret_cast<UObject*>(arr[i]);
+                                if (!ab || !ab->Class()) continue;
+                                std::string abName = ab->Class()->GetName();
+                                if (abName.find("FightStaging") != std::string::npos)
+                                {
+                                    // Read the selected-object pointer from the ability.
+                                    // The note says offsets +0x690, +0x6A0, +0x6A1 are used.
+                                    result = tryRead(ab, 0x690);
+                                    if (!result) result = tryRead(ab, 0x6A0);
+                                    if (!result) result = tryRead(ab, 0x6A1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: scan the character's outer chain for a UAIFightStagingAbility.
+        if (!result)
+        {
+            UObject* o = character->Outer();
+            for (int d = 0; o && d < 64; ++d)
+            {
+                if (!o->Class()) { o = o->Outer(); continue; }
+                std::string cn = o->Class()->GetName();
+                if (cn.find("FightStaging") != std::string::npos)
+                {
+                    result = tryRead(o, 0x690);
+                    if (!result) result = tryRead(o, 0x6A0);
+                    break;
+                }
+                o = o->Outer();
+            }
+        }
+
+        return result;
+    }
     std::atomic<unsigned long> g_renderThreadId{ 0 };
     std::atomic<unsigned long> g_gameThreadId{ 0 };
     std::mutex                g_gtQueueMutex;
@@ -105,6 +257,14 @@ namespace
     // here so ApplyAiRelease (above the drive function) can restore it. See
     // DriveSquadVelocityGameThread.
     std::unordered_map<UObject*, UObject*> g_stashedSchedule;
+    // Death/event tombstones: some robots stay readable with stale health after K2_OnDeath,
+    // so health-only threat filtering can make Hook Twins keep attacking a corpse/spot.
+    std::unordered_map<UObject*, ULONGLONG> g_aiDeathEventMs;
+    std::unordered_map<UObject*, ULONGLONG> g_hookSuppressedThreatUntilMs;
+    // Set by combat teardown, consumed by the native follow driver after
+    // HookNativeFollowState exists. This stops any outstanding enemy MoveTo/path before
+    // a follow route is allowed to reacquire the controller.
+    std::unordered_set<UObject*> g_hookCombatRouteAbortPending;
 
     // ---- No-save guard (Horde Rounds arena) --------------------------------
     // While a horde run is active we must guarantee the game NEVER checkpoints --
@@ -149,6 +309,42 @@ namespace
     std::atomic<void*>    g_fnHookStopMovement{ nullptr };
     std::atomic<void*>    g_fnHookSetCharacterAggressive{ nullptr };
     std::atomic<void*>    g_fnHookSetCharacterPassive{ nullptr };
+    std::atomic<void*>    g_fnHookK2OnDeath{ nullptr };
+    std::atomic<void*>    g_fnHookK2OnLoadDeathState{ nullptr };
+    std::atomic<void*>    g_fnHookLoadDeadState{ nullptr };
+    // Reflected UFunction pointer for AHAICharacter::TryActivateFightStagingAbility.
+    // This is what ProcessEvent receives as `fn`.
+    std::atomic<void*>    g_fnHookTryFightStaging{ nullptr };
+    // Native helper detoured by MinHook. Ghidra shows RVA 0x1B93A50 is NOT the
+    // reflected AHAICharacter bool function; it is a 3-arg fight-staging ability
+    // selection writer: void(UAIFightStagingAbility*, void* selectedObj, bool).
+    std::atomic<void*>    g_fnHookTryFightStagingNative{ nullptr };
+    std::atomic<void*>    g_fnHookSendDeathEvent{ nullptr };
+    std::atomic<void*>    g_fnHookSendLoadDeathStateEvent{ nullptr };
+    std::atomic<void*>    g_fnHookSendCharacterDiedEvent{ nullptr };
+    std::atomic<void*>    g_fnHookStartVersusQTE{ nullptr };
+    std::atomic<void*>    g_fnHookCacheDeathPose{ nullptr };
+    std::atomic<void*>    g_fnHookDestroyOwnerCharacter{ nullptr };
+    std::atomic<uint64_t> g_hookTwinDeathPipelineBlocks{ 0 };
+    std::atomic<uint64_t> g_hookTwinQtePipelineBlocks{ 0 };
+    std::atomic<uint64_t> g_hookTwinFightStagingSelections{ 0 };
+    std::atomic<uint64_t> g_hookTwinFightStagingBlocks{ 0 };
+    std::atomic<uint64_t> g_hookTwinFightStagingContainerLogs{ 0 };
+    std::atomic<bool>     g_hookTwinFightStagingHookAttempted{ false };
+    std::atomic<bool>     g_hookTwinFightStagingSelectorHookLive{ false };
+    std::atomic<bool>     g_hookTwinActionContainerHookLive{ false };
+    std::atomic<bool>     g_hookTwinForensicsActive{ false };
+    std::atomic<bool>     g_hookTwinForensicsWasOn{ false };
+    std::atomic<bool>     g_hookTwinForensicsSnapshotInFlight{ false };
+    std::ofstream         g_hookTwinForensicsFile;
+    std::string           g_hookTwinForensicsDir;
+    std::atomic<int>      g_hookTwinForensicsSeq{ 0 };
+    std::atomic<unsigned long long> g_hookTwinForensicsLastSnapshotMs{ 0 };
+    std::atomic<unsigned long long> g_hookTwinForensicsEvents{ 0 };
+    std::atomic<unsigned long long> g_hookTwinDeathPoseBlockUntilMs{ 0 };
+    std::atomic<void*>    g_hookTwinDeathPoseGuard{ nullptr };
+    std::atomic<void*>    g_hookTwinRecentFightStagingGuard{ nullptr };
+    std::atomic<unsigned long long> g_hookTwinRecentFightStagingUntilMs{ 0 };
     std::atomic<uint64_t> g_hookCombatTargetEvents{ 0 };
     std::atomic<uint64_t> g_hookCombatStateEvents{ 0 };
     std::atomic<uint64_t> g_hookControllerMovesBlocked{ 0 };
@@ -158,10 +354,24 @@ namespace
     // Defined far below (needs the param structs + IsSquadMember); declared here so
     // hkProcessEvent can call it. Returns true => swallow this dispatch (block it).
     bool OwnershipShouldSwallow(void* obj, void* fn, void* params);
-
+    bool IsHookBodyguard(UObject* ai);
+    bool IsMixedNavCharacter(UObject* ai);
+    bool ReadCharacterHealth(UObject* ch, float& cur, float& mx);
+    bool SetCharacterHealthFull(UObject* ai);
+    void ResolveHookTwinDeathPipelineFns();
+    bool EnsureHookTwinFightStagingNativeHook();
+    bool EnsureHookTwinActionContainerFactory();
+    bool IsHookTwinBodyguard(UObject* ai);
+    UObject* HookTwinOwnerFromDeathAbility(void* ability);
+    bool HookTwinDeathPipelineShouldSwallow(void* obj, void* fn, void* params);
+    void HookTwinForensicsProcessEvent(void* obj, void* fn, void* params);
+    void UpdateHookTwinForensics();
+    std::string SafeObjectFullName(UObject* o);
+    void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params);
 
     bool HookFriendshipShouldForce(void* fn, void* params);
     bool HookMovementShouldSwallow(void* obj, void* fn);
+    bool HookStaleCombatTargetShouldSwallow(void* obj, void* fn, void* params);
     void HookCombatTrace(void* obj, void* fn, void* params);
 
     void DiagnosticTraceProcessEvent(void* obj, void* fn, void* params);
@@ -246,6 +456,40 @@ namespace
                 if (nowB - lastBlockLogMs > 1000) { lastBlockLogMs = nowB; LOG("Horde: swallowed a game save (arena active)"); }
                 return; // depthGuard restores t_peDepth
             }
+        }
+
+        // Track real death events globally so stale cached corpses never remain threats.
+        if (fn && obj)
+        {
+            try { TrackAiDeathEventFromProcessEvent(obj, fn, params); } catch (...) {}
+        }
+
+        // Hook Twin root-cause forensics. When armed, dump every relevant ProcessEvent
+        // around managed Twins before any guard below can swallow or mutate it.
+        if (g_hookTwinForensicsActive.load(std::memory_order_relaxed) && fn)
+        {
+            try { HookTwinForensicsProcessEvent(obj, fn, params); } catch (...) {}
+        }
+
+        // Hook Twin death/QTE pipeline guard. ReVa traced the downed pose to the
+        // reflected death/load-death/fight-staging/QTE chain, not to follow movement.
+        // Swallow those dispatches only when the affected pawn is a managed Hook Twin.
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && fn)
+        {
+            bool swallow = false;
+            try { swallow = HookTwinDeathPipelineShouldSwallow(obj, fn, params); } catch (...) { swallow = false; }
+            if (swallow)
+                return;
+        }
+
+        // If a latent Twin/gameplay ability tries to re-assign a killed/suppressed robot
+        // as TargetEnemy after our stand-down, refuse it before it reaches the AI script.
+        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && fn && params)
+        {
+            bool swallowStale = false;
+            try { swallowStale = HookStaleCombatTargetShouldSwallow(obj, fn, params); } catch (...) { swallowStale = false; }
+            if (swallowStale)
+                return;
         }
 
         // Hook Bodyguard combat-chain observer. This is read-only and records the game's
@@ -881,6 +1125,28 @@ namespace
         uint8_t _pad0[6];
     };
     static_assert(sizeof(P_AreFriendlyCharacters) == 0x18, "AIUtils.AreFriendlyCharacters params must match Dumper-7");
+    struct P_HookDeathEventOwner { void* EventOwnerCharacter; };
+    struct P_HookGameplayCharacterDied { void* DeadCharacter; };
+    struct P_HookTryFightStaging { bool ReturnValue; };
+    struct P_HookModifyIncomingDamage { float InDamage; float OutDamage; };
+    struct P_HookProcessIncomingDamage
+    {
+        float DamageDone;
+        uint8_t _pad0[0x13C]; // FHitParameters lives at +0x08; we don't need to parse it here.
+        float ReturnValue;
+        uint8_t _pad1[4];
+    };
+    static_assert(sizeof(P_HookProcessIncomingDamage) == 0x148, "AHBaseCharacter.ProcessIncomingDamage params must match Dumper-7");
+    struct P_HookStartVersusQTE
+    {
+        void* InQTEData;
+        void* InAssaulter;
+        void* InVictim;
+        TArray<void*> InAdditionalActors;
+    };
+    static_assert(sizeof(P_HookDeathEventOwner) == 0x08, "AHCharacterEventUtils death owner param must match SDK");
+    static_assert(sizeof(P_HookGameplayCharacterDied) == 0x08, "GameplayEventSubsystem death owner param must match SDK prefix");
+    static_assert(sizeof(P_HookStartVersusQTE) == 0x28, "QTESubsystem.StartVersusQTE params must match Dumper-7");
 
     struct P_SetActorHiddenInGame { bool bNewHidden; };
     struct P_SetActorTickEnabled  { bool bEnabled; };
@@ -1762,6 +2028,62 @@ namespace
         return g_hookControllerOwned.find(pawn) != g_hookControllerOwned.end();
     }
 
+    bool HookStaleCombatTargetShouldSwallow(void* obj, void* fn, void* params)
+    {
+        if (!g_hookBodyguardMode.load(std::memory_order_relaxed) || !fn || !params)
+            return false;
+        void* fCharTarget = g_fnOwnSetTargetEnemy.load(std::memory_order_relaxed);
+        void* fBbTarget = g_fnOwnSetBbTargetEnemy.load(std::memory_order_relaxed);
+        void* fAggressive = g_fnHookSetCharacterAggressive.load(std::memory_order_relaxed);
+        if (fn != fCharTarget && fn != fBbTarget && fn != fAggressive)
+            return false;
+
+        UObject* guard = nullptr;
+        UObject* target = nullptr;
+        bool activeAggressive = false;
+        if (fn == fCharTarget && Mem::IsReadable(params, sizeof(P_SetTargetEnemy)))
+        {
+            guard = reinterpret_cast<UObject*>(obj);
+            target = reinterpret_cast<UObject*>(reinterpret_cast<P_SetTargetEnemy*>(params)->TargetEnemy);
+        }
+        else if (fn == fBbTarget && Mem::IsReadable(params, sizeof(P_SetBlackboardTargetEnemy)))
+        {
+            guard = OwnershipControllerPawn(obj);
+            target = reinterpret_cast<UObject*>(reinterpret_cast<P_SetBlackboardTargetEnemy*>(params)->NewTarget);
+        }
+        else if (fn == fAggressive && Mem::IsReadable(params, sizeof(P_SetCharacterAggressive)))
+        {
+            auto* p = reinterpret_cast<P_SetCharacterAggressive*>(params);
+            guard = reinterpret_cast<UObject*>(p->InAICharacter);
+            target = reinterpret_cast<UObject*>(p->InTargetEnemy);
+            activeAggressive = p->bShouldBeActive;
+        }
+        if (!guard || !IsHookBodyguard(guard) || !target)
+            return false;
+
+        ULONGLONG now = GetTickCount64();
+        auto sup = g_hookSuppressedThreatUntilMs.find(target);
+        bool suppressed = (sup != g_hookSuppressedThreatUntilMs.end() && sup->second > now);
+        bool tombstoned = (g_aiDeathEventMs.find(target) != g_aiDeathEventMs.end());
+        if (!suppressed && !tombstoned)
+            return false;
+
+        // This is the important part: do not let the game's latent AI/fight-staging
+        // script rehydrate the just-killed robot back into TargetEnemy after our
+        // stand-down. Swallow the stale target write / stale aggressive kick entirely;
+        // the follow driver will issue a clean player-follow route next frame.
+        if (IsHookTwinBodyguard(guard))
+            ClearFightStagingSelectedObject(guard);
+        static ULONGLONG lastLog = 0;
+        if (now - lastLog > 500)
+        {
+            lastLog = now;
+            LOG("[AI-HOOK] swallowed stale combat target dispatch guard=%p target=%p fn=%p active=%d suppressed=%d tombstoned=%d",
+                (void*)guard, (void*)target, fn, activeAggressive ? 1 : 0, suppressed ? 1 : 0, tombstoned ? 1 : 0);
+        }
+        return true;
+    }
+
     void HookCombatTrace(void* obj, void* fn, void* params)
     {
         void* fCharTarget = g_fnOwnSetTargetEnemy.load(std::memory_order_relaxed);
@@ -2354,6 +2676,35 @@ namespace
         return true;
     }
 
+    bool CharacterAbilityControl(UObject* ai, const char* fnName, uint8_t ability)
+    {
+        UFunction* fn = CachedObjectClassFn(ai, fnName);
+        if (!AiUsable(ai) || !Mem::IsReadable(fn, 0x30))
+            return false;
+        struct { uint8_t Ability; } p{ ability };
+        ai->ProcessEvent(fn, &p);
+        return true;
+    }
+
+    void HardStopHookTwinCombatAbilities(UObject* guard, const char* reason)
+    {
+        if (!IsHookTwinBodyguard(guard))
+            return;
+        // ECharacterAbilities: MeleeAttack=13, WeaponSpecialAbility=46. End first,
+        // then Cancel as belt/suspenders. This is used only after target death/stale
+        // combat; normal active attacks are untouched.
+        CharacterAbilityControl(guard, "EndAbility", 13);
+        CharacterAbilityControl(guard, "CancelAbility", 13);
+        CharacterAbilityControl(guard, "EndAbility", 46);
+        CharacterAbilityControl(guard, "CancelAbility", 46);
+        static ULONGLONG lastLog = 0; ULONGLONG now = GetTickCount64();
+        if (now - lastLog > 750)
+        {
+            lastLog = now;
+            LOG("[AI-HOOK] hard-stopped Hook Twin combat abilities guard=%p reason=%s", (void*)guard, reason ? reason : "stand-down");
+        }
+    }
+
     bool SwitchAiTeamFriendlyTo(UObject* ai, UObject* player)
     {
         UFunction* fn = CachedClassFn(AH::Cls_AICharacter, "SwitchTeamToMatchCharacterAttitude");
@@ -2448,7 +2799,9 @@ namespace
         UFunction* fn = CachedObjectClassFn(ctrl, "SetFollowLocationSpeed");
         if (!ControllerBlackboardReady(ctrl) || !fn)
             return false;
-        P_SetFollowLocationSpeed p{ 900.0f, 0.75f, { 0.0f, 720.0f, 0.0f } };
+        // Lower speed/rotation keeps Twins in their native walk-cycle range instead
+        // of the stiff Recast jog/snap-turn look. Combat paths override max speed.
+        P_SetFollowLocationSpeed p{ 260.0f, 1.25f, { 0.0f, 240.0f, 0.0f } };
         ctrl->ProcessEvent(fn, &p);
         return true;
     }
@@ -2525,6 +2878,21 @@ namespace
         UFunction* fn = CachedObjectClassFn(bb, "SetValueAsFloat");
         if (!fn) return false;
         struct { FName KeyName; float Value; } p{ key, value };
+        bb->ProcessEvent(fn, &p);
+        return true;
+    }
+
+    bool SetControllerObjectKeyAt(UObject* ctrl, int keyNameOffset, UObject* value)
+    {
+        if (!ControllerBlackboardReady(ctrl)) return false;
+        uint8_t* base = reinterpret_cast<uint8_t*>(ctrl);
+        UObject* bb = *reinterpret_cast<UObject**>(base + AH::AICtrl_Blackboard);
+        if (!Mem::IsReadable(bb, 0x30) || !Mem::IsReadable(base + keyNameOffset, sizeof(FName))) return false;
+        FName key = *reinterpret_cast<FName*>(base + keyNameOffset);
+        if (key.ComparisonIndex <= 0) return false;
+        UFunction* fn = CachedObjectClassFn(bb, "SetValueAsObject");
+        if (!fn) return false;
+        struct { FName KeyName; void* ObjectValue; } p{ key, value };
         bb->ProcessEvent(fn, &p);
         return true;
     }
@@ -2811,18 +3179,470 @@ namespace
         return *reinterpret_cast<UObject**>(base + AH::AICh_CachedTargetEnemy);
     }
 
+    void MarkAiDeathTombstone(UObject* actor, const char* reason)
+    {
+        if (!actor || !Mem::IsReadable(actor, 0x30) || IsHookBodyguard(actor))
+            return;
+        ULONGLONG now = GetTickCount64();
+        bool first = (g_aiDeathEventMs.find(actor) == g_aiDeathEventMs.end());
+        g_aiDeathEventMs[actor] = now;
+        if (first)
+            LOG("[AI-DEATH] tombstone actor=%p reason=%s", (void*)actor, reason ? reason : "unknown");
+        if (g_aiDeathEventMs.size() > 512)
+        {
+            for (auto it = g_aiDeathEventMs.begin(); it != g_aiDeathEventMs.end(); )
+                if (!Mem::IsReadable(it->first, 0x30) || now - it->second > 10 * 60 * 1000ULL) it = g_aiDeathEventMs.erase(it);
+                else ++it;
+        }
+    }
+
     bool IsLiveCombatTarget(UObject* target)
     {
         if (!target || !AiUsable(target))
             return false;
+        auto dit = g_aiDeathEventMs.find(target);
+        if (dit != g_aiDeathEventMs.end())
+        {
+            // Tombstone is authoritative for this session. Do not let a stale corpse
+            // with readable/nonzero health keep a Twin in combat forever.
+            return false;
+        }
         uint8_t* base = reinterpret_cast<uint8_t*>(target);
         if (Mem::IsReadable(base + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(base + AH::Char_bIsDead))
+        {
+            MarkAiDeathTombstone(target, "Char_bIsDead");
             return false;
+        }
         float cur = 0.0f, mx = 0.0f;
         if (ReadCharacterHealth(target, cur, mx) && mx > 0.001f)
-            return std::isfinite(cur) && cur > 0.001f;
+        {
+            bool alive = std::isfinite(cur) && cur > 0.001f;
+            if (!alive)
+                MarkAiDeathTombstone(target, "health<=0");
+            return alive;
+        }
         // Some special combat actors expose no normal health attribute. Keep them
         // eligible only while the object is still a valid, not-dead AHAICharacter.
+        return true;
+    }
+
+    void ResolveHookTwinDeathPipelineFns()
+    {
+        auto cache = [](std::atomic<void*>& slot, const char* fullName)
+        {
+            if (!slot.load(std::memory_order_relaxed))
+                slot.store(CachedFn(fullName), std::memory_order_relaxed);
+        };
+        cache(g_fnHookK2OnDeath, AH::Fn_AHAICharacter_K2_OnDeath);
+        cache(g_fnHookK2OnLoadDeathState, AH::Fn_AHAICharacter_K2_OnLoadDeathState);
+        cache(g_fnHookLoadDeadState, AH::Fn_AHAICharacter_LoadDeadState);
+        // Keep the reflected UFunction separate from the native helper RVA. The old
+        // code overwrote this with moduleBase+0x1B93A50, so ProcessEvent comparisons
+        // against AHAICharacter.TryActivateFightStagingAbility could never match.
+        cache(g_fnHookTryFightStaging, AH::Fn_AHAICharacter_TryActivateFightStagingAbility);
+        // Ghidra-verified RVA 0x1B93A50: 3-arg native fight-staging selection writer
+        // void(UAIFightStagingAbility*, void* selectedObj, bool), not the reflected
+        // AHAICharacter::TryActivateFightStagingAbility bool/no-arg UFunction.
+        if (G::moduleBase)
+            g_fnHookTryFightStagingNative.store(
+                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1B93A50),
+                std::memory_order_relaxed);
+        cache(g_fnHookSendDeathEvent, AH::Fn_AHCharacterEventUtils_SendDeathEvent);
+        cache(g_fnHookSendLoadDeathStateEvent, AH::Fn_AHCharacterEventUtils_SendLoadDeathStateEvent);
+        cache(g_fnHookSendCharacterDiedEvent, AH::Fn_GameplayEventSubsystem_SendCharacterDiedEvent);
+        cache(g_fnHookStartVersusQTE, AH::Fn_QTESubsystem_StartVersusQTE);
+        cache(g_fnHookCacheDeathPose, AH::Fn_QTESubsystem_CacheDeathPose);
+        cache(g_fnHookDestroyOwnerCharacter, AH::Fn_AIDeathAbility_DestroyOwnerCharacter);
+    }
+
+    // Native detour for TryActivateFightStagingAbility.
+    // Ghidra reversal at RVA 0x1B93A50: void(UAIFightStagingAbility* ability, void* params, bool flag).
+    // param_1 = UAIFightStagingAbility* (not AHAICharacter*).
+    // Character (CachedAIOwner) is at ability + 0x658 (AH::AIAbility_CachedAIOwner).
+    // param_2 = the new selected object being set (passed to FUN_14277c040 as lookup key).
+    // param_1 + 0x690 is READ (current selection) then WRITTEN (new selection) by the native.
+    // Logs every call and blocks only if the selected fight-staging object matches a
+    // downed/final/QTE token. Normal movement/combat stages pass through.
+    void __fastcall hkTryFightStaging(void* ability, void* params, bool param_3)
+    {
+        // param_1 is UAIFightStagingAbility*, not AHAICharacter*.
+        // Get the character from CachedAIOwner at offset +0x658.
+        UObject* ch = HookTwinOwnerFromDeathAbility(ability);
+        std::string chName = ch && ch->Class() ? ch->Class()->GetName() : "(null)";
+
+        // param_2 is the new selected object being set (verified via FUN_14277c040 call).
+        // Do NOT read from ability + 0x690 — that is the write destination, not the input.
+        void* selObj = params;
+        UObject* selUObj = reinterpret_cast<UObject*>(selObj);
+        std::string selName = selUObj && selUObj->Class() ? selUObj->Class()->GetName() : "(none)";
+
+        // Check the CHARACTER (CachedAIOwner), not the ability itself.
+        bool isTwin = ch && IsHookTwinBodyguard(ch);
+        bool block = false;
+
+        if (isTwin)
+        {
+            block = MatchesDownedToken(selName);
+        }
+
+        if (isTwin)
+        {
+            g_hookTwinFightStagingSelectorHookLive.store(true, std::memory_order_relaxed);
+            g_hookTwinFightStagingSelections.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        LOG("[AI-FSTAGE] TryActivateFightStagingAbility ability=%p char=%p charClass=%s selObj=%p selClass=%s block=%d", 
+            ability, ch, chName.c_str(), selObj, selName.c_str(), block ? 1 : 0);
+
+        if (block)
+        {
+            g_hookTwinFightStagingBlocks.fetch_add(1, std::memory_order_relaxed);
+            LOG("[AI-FSTAGE] BLOCKED Hook Twin campaign/downed fight-stage select: %s -> %s", chName.c_str(), selName.c_str());
+            // Do NOT call the trampoline -- the native function at RVA 0x1B93A50
+            // writes the new selection to ability + 0x690 and sets flags at +0x6A0/+0x6A1.
+            // Returning early prevents that write, so the downed pose logic never executes.
+            return;
+        }
+
+        g_oTryFightStaging(ability, params, param_3);
+    }
+
+    // Action-container factory detour (RVA 0x1CA06E0). Logs containers spawned
+    // after fight-staging selection on Hook Twins.
+    void* __fastcall hkActionContainerFactory(void* obj, void* params)
+    {
+        void* container = g_oActionContainerFactory(obj, params);
+        if (container && IsHookTwinBodyguard(reinterpret_cast<UObject*>(obj)))
+        {
+            g_hookTwinActionContainerHookLive.store(true, std::memory_order_relaxed);
+            g_hookTwinFightStagingContainerLogs.fetch_add(1, std::memory_order_relaxed);
+            UObject* cont = reinterpret_cast<UObject*>(container);
+            std::string contName = cont && cont->Class() ? cont->Class()->GetName() : "(none)";
+            std::string objName = reinterpret_cast<UObject*>(obj) && 
+                                  reinterpret_cast<UObject*>(obj)->Class() ? 
+                                  reinterpret_cast<UObject*>(obj)->Class()->GetName() : "(none)";
+            LOG("[AI-FSTAGE] Hook Twin action-container create obj=%p objClass=%s container=%p containerClass=%s",
+                obj, objName.c_str(), container, contName.c_str());
+        }
+        return container;
+    }
+
+    // Ensure a MinHook detour is active on AHAICharacter::TryActivateFightStagingAbility.
+    // Idempotent: if the hook is already live, returns true immediately.
+    bool EnsureHookTwinFightStagingNativeHook()
+    {
+        void* target = g_fnHookTryFightStagingNative.load(std::memory_order_relaxed);
+        if (!target && G::moduleBase)
+        {
+            target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1B93A50);
+            g_fnHookTryFightStagingNative.store(target, std::memory_order_relaxed);
+        }
+        if (!target || !Scanner::IsExecutableAddress(target, 8))
+        {
+            bool already = g_hookTwinFightStagingHookAttempted.exchange(true, std::memory_order_relaxed);
+            if (!already)
+                LOG_HOOK("TryActivateFightStagingAbility native hook unavailable target=%p moduleBase=%p", target, (void*)G::moduleBase);
+            return false;
+        }
+
+        // Already hooked.
+        if (g_hookTwinFightStagingSelectorHookLive.load(std::memory_order_relaxed))
+            return true;
+
+        MH_STATUS status = MH_CreateHook(target,
+            reinterpret_cast<void*>(&hkTryFightStaging),
+            reinterpret_cast<void**>(&g_oTryFightStaging));
+        if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED)
+        {
+            LOG_HOOK("TryActivateFightStagingAbility native hook: MH_CreateHook failed %d", status);
+            return false;
+        }
+
+        status = MH_EnableHook(target);
+        if (status != MH_OK && status != MH_ERROR_ENABLED)
+        {
+            LOG_HOOK("TryActivateFightStagingAbility native hook: MH_EnableHook failed %d", status);
+            return false;
+        }
+
+        g_hookTwinFightStagingSelectorHookLive.store(true, std::memory_order_relaxed);
+        LOG_HOOK("TryActivateFightStagingAbility native hook LIVE @ %p", target);
+        return true;
+    }
+
+    // Ensure a MinHook detour is active on the action-container factory (RVA 0x1CA06E0).
+    // The game module base is looked up from G::moduleBase; RVA 0x1CA06E0 is the
+    // factory that spawns AHActionContainer instances after fight-staging selection.
+    bool EnsureHookTwinActionContainerFactory()
+    {
+        if (g_hookTwinActionContainerHookLive.load(std::memory_order_relaxed))
+            return true;
+        if (!G::moduleBase)
+            return false;
+
+        void* target = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1CA06E0);
+        if (!Scanner::IsExecutableAddress(target, 8))
+            return false;
+
+        MH_STATUS status = MH_CreateHook(target,
+            reinterpret_cast<void*>(&hkActionContainerFactory),
+            reinterpret_cast<void**>(&g_oActionContainerFactory));
+        if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED)
+        {
+            LOG_HOOK("ActionContainerFactory native hook: MH_CreateHook failed %d", status);
+            return false;
+        }
+
+        status = MH_EnableHook(target);
+        if (status != MH_OK && status != MH_ERROR_ENABLED)
+        {
+            LOG_HOOK("ActionContainerFactory native hook: MH_EnableHook failed %d", status);
+            return false;
+        }
+
+        g_hookTwinActionContainerHookLive.store(true, std::memory_order_relaxed);
+        LOG_HOOK("ActionContainerFactory native hook LIVE @ %p", target);
+        return true;
+    }
+
+    bool IsHookTwinBodyguard(UObject* ai)
+    {
+        return Mem::IsReadable(ai, 0x30) && IsHookBodyguard(ai) && IsMixedNavCharacter(ai);
+    }
+
+    UObject* HookTwinOwnerFromDeathAbility(void* ability)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ability);
+        if (!Mem::IsReadable(base + AH::AIAbility_CachedAIOwner, sizeof(void*)))
+            return nullptr;
+        return *reinterpret_cast<UObject**>(base + AH::AIAbility_CachedAIOwner);
+    }
+
+    void RestoreHookTwinAfterDeathPipelineBlock(UObject* guard)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(guard);
+        if (!Mem::IsReadable(base, 0x30))
+            return;
+        if (Mem::IsReadable(base + AH::Char_bIsDead, 1))
+            *reinterpret_cast<bool*>(base + AH::Char_bIsDead) = false;
+        SetCharacterHealthFull(guard);
+        if (Mem::IsReadable(base + AH::AICh_bActorTickEnabled, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bActorTickEnabled) = true;
+        if (Mem::IsReadable(base + AH::AICh_bMeshTickEnabled, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bMeshTickEnabled) = true;
+    }
+
+    void ArmHookTwinDeathPoseCacheGuard(UObject* guard, ULONGLONG now)
+    {
+        g_hookTwinDeathPoseBlockUntilMs.store((unsigned long long)(now + 5000), std::memory_order_relaxed);
+        if (guard)
+            g_hookTwinDeathPoseGuard.store(guard, std::memory_order_relaxed);
+    }
+
+    bool HookTwinArrayContainsManagedBodyguard(const TArray<void*>& arr, UObject*& guard)
+    {
+        if (!arr.Data || arr.Count <= 0 || arr.Count > 32)
+            return false;
+        if (!Mem::IsReadable(arr.Data, sizeof(void*) * (size_t)arr.Count))
+            return false;
+        for (int32_t i = 0; i < arr.Count; ++i)
+        {
+            UObject* candidate = reinterpret_cast<UObject*>(arr.Data[i]);
+            if (IsHookTwinBodyguard(candidate))
+            {
+                guard = candidate;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void LogHookTwinDeathBlock(const char* stage, UObject* guard, void* obj, void* fn, bool qte, uint64_t total)
+    {
+        static ULONGLONG lastLogMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (total > 12 && now - lastLogMs < 750)
+            return;
+        lastLogMs = now;
+
+        float cur = -1.0f, mx = -1.0f;
+        bool hasHealth = guard && ReadCharacterHealth(guard, cur, mx);
+        int dead = -1;
+        uint8_t* base = reinterpret_cast<uint8_t*>(guard);
+        if (Mem::IsReadable(base + AH::Char_bIsDead, 1))
+            dead = *reinterpret_cast<bool*>(base + AH::Char_bIsDead) ? 1 : 0;
+
+        if (qte)
+        {
+            LOG("[AI-DEATH] blocked Hook Twin QTE/death-pose stage=%s guard=%p obj=%p fn=%p total=%llu health=%s%.1f/%.1f dead=%d",
+                stage, (void*)guard, obj, fn, (unsigned long long)total, hasHealth ? "" : "?",
+                cur, mx, dead);
+        }
+        else
+        {
+            LOG("[AI-DEATH] blocked Hook Twin death pipeline stage=%s guard=%p obj=%p fn=%p total=%llu health=%s%.1f/%.1f dead=%d",
+                stage, (void*)guard, obj, fn, (unsigned long long)total, hasHealth ? "" : "?",
+                cur, mx, dead);
+        }
+    }
+
+    bool HookTwinDeathPipelineShouldSwallow(void* obj, void* fn, void* params)
+    {
+        ResolveHookTwinDeathPipelineFns();
+        EnsureHookTwinFightStagingNativeHook();
+        EnsureHookTwinActionContainerFactory();
+
+        void* fK2Death = g_fnHookK2OnDeath.load(std::memory_order_relaxed);
+        void* fK2Load = g_fnHookK2OnLoadDeathState.load(std::memory_order_relaxed);
+        void* fLoadDead = g_fnHookLoadDeadState.load(std::memory_order_relaxed);
+        void* fStaging = g_fnHookTryFightStaging.load(std::memory_order_relaxed);
+        void* fStagingNative = g_fnHookTryFightStagingNative.load(std::memory_order_relaxed);
+        void* fSendDeath = g_fnHookSendDeathEvent.load(std::memory_order_relaxed);
+        void* fSendLoad = g_fnHookSendLoadDeathStateEvent.load(std::memory_order_relaxed);
+        void* fDied = g_fnHookSendCharacterDiedEvent.load(std::memory_order_relaxed);
+        void* fStartQte = g_fnHookStartVersusQTE.load(std::memory_order_relaxed);
+        void* fCachePose = g_fnHookCacheDeathPose.load(std::memory_order_relaxed);
+        void* fDestroyOwner = g_fnHookDestroyOwnerCharacter.load(std::memory_order_relaxed);
+
+        // Forensics pass #2: after a Twin kills with laser/explosive ability, the game
+        // immediately delivers self/AOE damage to the Twin, runs ProcessIncomingDamage,
+        // then BP_AIHitReactions_Twins_Default and montage interruption kick her into the
+        // floor pose. Hook Twins are supposed to be invincible bodyguards, so fail all
+        // reflected incoming-damage paths closed BEFORE hit reactions/ability interrupts.
+        if (obj && IsHookTwinBodyguard(reinterpret_cast<UObject*>(obj)) && fn)
+        {
+            std::string fnName = SafeObjectFullName(static_cast<UObject*>(fn));
+            if (fnName.find("K2_ModifyIncomingDamageWithSpecialDamageResistance") != std::string::npos)
+            {
+                if (Mem::IsReadable(params, sizeof(P_HookModifyIncomingDamage)))
+                {
+                    auto* p = reinterpret_cast<P_HookModifyIncomingDamage*>(params);
+                    p->OutDamage = 0.0f;
+                }
+                static ULONGLONG lastDmgLog = 0; ULONGLONG nowD = GetTickCount64();
+                if (nowD - lastDmgLog > 500) { lastDmgLog = nowD; LOG("[AI-DEATH] blocked Hook Twin incoming damage modifier obj=%p fn=%p", obj, fn); }
+                return true;
+            }
+            if (fnName.find("ProcessIncomingDamage") != std::string::npos)
+            {
+                if (Mem::IsReadable(params, sizeof(P_HookProcessIncomingDamage)))
+                {
+                    auto* p = reinterpret_cast<P_HookProcessIncomingDamage*>(params);
+                    p->DamageDone = 0.0f;
+                    p->ReturnValue = 0.0f;
+                }
+                RestoreHookTwinAfterDeathPipelineBlock(reinterpret_cast<UObject*>(obj));
+                static ULONGLONG lastProcDmgLog = 0; ULONGLONG nowD = GetTickCount64();
+                if (nowD - lastProcDmgLog > 500) { lastProcDmgLog = nowD; LOG("[AI-DEATH] blocked Hook Twin ProcessIncomingDamage obj=%p fn=%p", obj, fn); }
+                return true;
+            }
+        }
+
+        const bool objectBound = (fn == fK2Death || fn == fK2Load || fn == fLoadDead || fn == fStaging);
+        const bool ownerEvent = (fn == fSendDeath || fn == fSendLoad);
+        const bool gameplayDied = (fn == fDied);
+        const bool qteStart = (fn == fStartQte);
+        const bool qteCachePose = (fn == fCachePose);
+        const bool destroyOwner = (fn == fDestroyOwner);
+        if (fn == fStaging && obj && IsHookTwinBodyguard(reinterpret_cast<UObject*>(obj)))
+        {
+            static ULONGLONG lastStagingPeLogMs = 0;
+            ULONGLONG nowS = GetTickCount64();
+            if (nowS - lastStagingPeLogMs > 1000)
+            {
+                lastStagingPeLogMs = nowS;
+                LOG("[AI-FSTAGE] reflected TryActivateFightStagingAbility observed for Hook Twin; native selector hook owns the decision obj=%p fn=%p", obj, fn);
+            }
+            // Do not return here. This reflected UFunction is the AAHAICharacter
+            // bool/no-arg TryActivateFightStagingAbility, and for Hook Twins we want
+            // to fail it closed below by setting ReturnValue=false and swallowing.
+        }
+        if (!objectBound && !ownerEvent && !gameplayDied && !qteStart && !qteCachePose && !destroyOwner)
+            return false;
+
+        ULONGLONG now = GetTickCount64();
+        UObject* guard = nullptr;
+        const char* stage = "unknown";
+        bool qte = false;
+
+        if (objectBound)
+        {
+            guard = reinterpret_cast<UObject*>(obj);
+            if (!IsHookTwinBodyguard(guard))
+                return false;
+            if (fn == fK2Death) stage = "AHAICharacter.K2_OnDeath";
+            else if (fn == fK2Load) stage = "AHAICharacter.K2_OnLoadDeathState";
+            else if (fn == fLoadDead) stage = "AHAICharacter.LoadDeadState";
+            else
+            {
+                stage = "AHAICharacter.TryActivateFightStagingAbility";
+                if (Mem::IsReadable(params, sizeof(P_HookTryFightStaging)))
+                    reinterpret_cast<P_HookTryFightStaging*>(params)->ReturnValue = false;
+                g_hookTwinFightStagingBlocks.fetch_add(1, std::memory_order_relaxed);
+                LOG("[AI-FSTAGE] BLOCKED reflected Hook Twin TryActivateFightStagingAbility obj=%p fn=%p native=%p", obj, fn, fStagingNative);
+            }
+        }
+        else if (ownerEvent)
+        {
+            if (!Mem::IsReadable(params, sizeof(P_HookDeathEventOwner)))
+                return false;
+            guard = reinterpret_cast<UObject*>(reinterpret_cast<P_HookDeathEventOwner*>(params)->EventOwnerCharacter);
+            if (!IsHookTwinBodyguard(guard))
+                return false;
+            stage = (fn == fSendDeath) ? "AHCharacterEventUtils.SendDeathEvent" : "AHCharacterEventUtils.SendLoadDeathStateEvent";
+        }
+        else if (gameplayDied)
+        {
+            if (!Mem::IsReadable(params, sizeof(P_HookGameplayCharacterDied)))
+                return false;
+            guard = reinterpret_cast<UObject*>(reinterpret_cast<P_HookGameplayCharacterDied*>(params)->DeadCharacter);
+            if (!IsHookTwinBodyguard(guard))
+                return false;
+            stage = "GameplayEventSubsystem.SendCharacterDiedEvent";
+        }
+        else if (destroyOwner)
+        {
+            guard = HookTwinOwnerFromDeathAbility(obj);
+            if (!IsHookTwinBodyguard(guard))
+                return false;
+            stage = "AIDeathAbility.DestroyOwnerCharacter";
+        }
+        else if (qteStart)
+        {
+            if (!Mem::IsReadable(params, sizeof(P_HookStartVersusQTE)))
+                return false;
+            auto* p = reinterpret_cast<P_HookStartVersusQTE*>(params);
+            UObject* assaulter = reinterpret_cast<UObject*>(p->InAssaulter);
+            UObject* victim = reinterpret_cast<UObject*>(p->InVictim);
+            if (IsHookTwinBodyguard(assaulter)) guard = assaulter;
+            else if (IsHookTwinBodyguard(victim)) guard = victim;
+            else HookTwinArrayContainsManagedBodyguard(p->InAdditionalActors, guard);
+            if (!guard)
+                return false;
+            qte = true;
+            stage = "QTESubsystem.StartVersusQTE";
+        }
+        else
+        {
+            unsigned long long until = g_hookTwinDeathPoseBlockUntilMs.load(std::memory_order_relaxed);
+            if ((unsigned long long)now > until)
+                return false;
+            guard = reinterpret_cast<UObject*>(g_hookTwinDeathPoseGuard.load(std::memory_order_relaxed));
+            if (guard && !IsHookTwinBodyguard(guard))
+                guard = nullptr;
+            qte = true;
+            stage = "QTESubsystem.CacheDeathPose";
+        }
+
+        if (guard)
+            RestoreHookTwinAfterDeathPipelineBlock(guard);
+        ArmHookTwinDeathPoseCacheGuard(guard, now);
+
+        uint64_t total = qte
+            ? g_hookTwinQtePipelineBlocks.fetch_add(1, std::memory_order_relaxed) + 1
+            : g_hookTwinDeathPipelineBlocks.fetch_add(1, std::memory_order_relaxed) + 1;
+        LogHookTwinDeathBlock(stage, guard, obj, fn, qte, total);
         return true;
     }
 
@@ -3013,10 +3833,12 @@ namespace
     // She's fast and overshoots, so finish a bit early and stand off: aim the MoveTo at a
     // 2.5 m ring (her braking/momentum then coasts her to ~2 m) and only (re)chase once you're
     // past 3.5 m. The 1 m hysteresis band keeps her parked instead of jittering at the edge.
-    constexpr float     kHookFollowStopM = 2.5f;   // hold ring + MoveTo acceptance (finish point)
-    constexpr float     kHookFollowStartM = 3.5f;  // re-chase ring (hysteresis)
-    constexpr float     kHookPerimeterM = 12.0f;
-    constexpr float     kHookAttackerAwarenessM = 35.0f;
+    constexpr float     kHookFollowStopM = 4.0f;   // wider hold ring = less twitchy recast/turn spam
+    constexpr float     kHookFollowStartM = 6.0f;  // re-chase ring (hysteresis)
+    constexpr float     kHookTwinPrettyWalkSpeed = 260.0f; // keep Twin in walk-cycle range instead of rigid run
+    constexpr float     kHookTwinCombatWalkSpeed = 650.0f; // restore combat-capable movement while engaging
+    constexpr float     kHookPerimeterM = 8.0f;   // Hook Twin only engages enemies very close to the player
+    constexpr float     kHookAttackerAwarenessM = 18.0f; // or active attackers in a wider-but-bounded bubble
     constexpr float     kHookFirstHitContactM = 4.5f;
 
     bool ApplyAiKill(UObject* ai);
@@ -3365,32 +4187,79 @@ namespace
         if (clearTarget)
             WriteAiTargetField(guard, nullptr);
 
+        const bool twinSoftClear = IsHookTwinBodyguard(guard);
+
         if (heavyClear)
         {
-            SetAiTargetEnemy(guard, nullptr, true);
-            if (UObject* ctrl = GetAiController(guard))
-                SetControllerTargetEnemy(ctrl, nullptr, true);
+            if (twinSoftClear)
+            {
+                // For the Twins, reflected AHAICharacter.SetTargetEnemy(nullptr) and
+                // AHAIController.SetBlackboardTargetEnemy(nullptr) fire GA_FightStaging_Twins
+                // K2_OnCharacterEvent, K2_OnEndAbility and PlayAnimMontage interruption.
+                // That is the bad/stuck pose root cause from forensics. Clear only the raw
+                // cached target + raw BlackboardComponent key, bypassing AHAI wrappers.
+                if (UObject* ctrl = GetAiController(guard))
+                    SetControllerObjectKeyAt(ctrl, AH::AICtrl_Key_TargetEnemy, nullptr);
+            }
+            else
+            {
+                SetAiTargetEnemy(guard, nullptr, true);
+                if (UObject* ctrl = GetAiController(guard))
+                    SetControllerTargetEnemy(ctrl, nullptr, true);
+            }
             s.lastClearHeavyMs = now;
         }
 
         if (firstClear)
         {
+            if (clearTarget)
+                g_hookSuppressedThreatUntilMs[clearTarget] = now + 120000; // never reacquire the corpse/stale actor this fight
             if (UObject* ctrl = GetAiController(guard))
-                SetControllerAggressive(ctrl, false);
+            {
+                if (twinSoftClear)
+                    SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_IsAggressive, false);
+                else
+                    SetControllerAggressive(ctrl, false);
+            }
+            // Yes: if the target is dead/gone, remove the Twin's aggressive state too.
+            // We still avoid reflected target-clear wrappers, but SetCharacterAggressive(false)
+            // plus ending melee/special abilities is the proper state-machine exit so
+            // she doesn't keep looping attacks/circling a corpse in place.
             StopCharacterAggressive(guard);
-            SwitchAiTeamFriendlyTo(guard, player);
-            s.lastFriendlyMs = now;
+            if (twinSoftClear)
+            {
+                ClearFightStagingSelectedObject(guard);
+                HardStopHookTwinCombatAbilities(guard, reason);
+            }
+            if (!twinSoftClear)
+            {
+                SwitchAiTeamFriendlyTo(guard, player);
+                s.lastFriendlyMs = now;
+            }
             g_hookStaleTargetsCleared.fetch_add(1, std::memory_order_relaxed);
-            LOG("[AI-HOOK] combat target cleared immediately: guard=%p target=%p reason=%s",
-                (void*)guard, (void*)clearTarget, reason ? reason : "stand-down");
+            LOG("[AI-HOOK] combat target cleared immediately: guard=%p target=%p reason=%s%s",
+                (void*)guard, (void*)clearTarget, reason ? reason : "stand-down",
+                twinSoftClear ? " (Twin soft-clear: no reflected target clear)" : "");
         }
 
         bool standDown = firstClear || heavyClear || (!clearTarget && (hadEngaged || hadThreatHold || s.hitTarget || s.targetArmedMs || s.lastTargetHealth > 0.0f));
         if (standDown)
         {
+            if (twinSoftClear)
+                g_hookCombatRouteAbortPending.insert(guard);
             if (UObject* ctrl = GetAiController(guard))
-                SetControllerAggressive(ctrl, false);
+            {
+                if (twinSoftClear)
+                    SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_IsAggressive, false);
+                else
+                    SetControllerAggressive(ctrl, false);
+            }
             StopCharacterAggressive(guard);
+            if (twinSoftClear)
+            {
+                ClearFightStagingSelectedObject(guard);
+                HardStopHookTwinCombatAbilities(guard, reason);
+            }
             ClearAiAggressiveLatch(guard);
         }
         g_engagedUntilMs.erase(guard);
@@ -3438,9 +4307,8 @@ namespace
         if (killed)
         {
             uint64_t total = g_hookFirstHitKills.fetch_add(1, std::memory_order_relaxed) + 1;
-            LOG("[AI-HIT] first-hit kill: guard=%p target=%p source=%s distance=%.1fm total=%llu",
-                (void*)guard, (void*)target, source, targetDistance, (unsigned long long)total);
-        }
+            LOG("[AI-HIT] first-hit kill CONFIRMED: guard=%p target=%p source=%s distance=%.1fm total=%llu",
+                (void*)guard, (void*)target, source, targetDistance, (unsigned long long)total);        }
         return killed;
     }
 
@@ -3471,9 +4339,11 @@ namespace
             float dPlayer = DistanceMetres(playerLoc, threatLoc);
             float dGuard = DistanceMetres(guardLoc, threatLoc);
             bool continuing = g_inject[guard].target == threat;
-            engage = forceEngage || dPlayer <= kHookPerimeterM || dGuard <= kHookPerimeterM ||
-                     (continuing && dGuard <= kHookAttackerAwarenessM) ||
-                     (attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM);
+            // Strict bodyguard policy: protect, don't initiate. A Hook guard may attack
+            // only a robot that is actively targeting the player / managed guard. Do not
+            // continue just because this was the old target or is near the player; that is
+            // exactly how the Twin stayed latched to the first corpse/fight spot.
+            engage = forceEngage || (attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM);
         }
 
         if (!engage)
@@ -3759,6 +4629,8 @@ namespace
         UFunction* suicide = CachedClassFn(AH::Cls_AICharacter, "Suicide");
         if (suicide && ProcessNoParams(ai, suicide))
             ok = true;
+        if (ok)
+            MarkAiDeathTombstone(ai, "ApplyAiKill");
         return ok;
     }
 
@@ -3972,27 +4844,6 @@ namespace
         UFunction* fn = CachedClassFn(AH::Cls_AICharacter, "SnapCapsuleToGround");
         if (AiUsable(ai) && fn)
             ProcessNoParams(ai, fn);
-    }
-
-    // One game-frame fixup pass; re-queues itself so the actor is force-shown a
-    // few frames running (significance re-hides on the frame it spawns). Hook
-    // bodyguards snap only once: repeated grounding fights the native mixed-nav
-    // transition and can leave a Twin's locomotion state pinned.
-    void SpawnFixupPass(UObject* actor, UObject* player, int passesLeft)
-    {
-        try
-        {
-            if (!Mem::IsReadable(actor, 0x30))
-                return;
-            ForceActorVisible(actor);
-            if (!IsHookBodyguard(actor) || passesLeft == 5)
-                SnapAiToGround(actor);
-            if (Mem::IsReadable(player, 0x30))
-                ApplyAiBodyguard(actor, player, {}); // keep it friendly while it settles
-            if (passesLeft > 1)
-                QueueGameThread([actor, player, passesLeft]() { SpawnFixupPass(actor, player, passesLeft - 1); });
-        }
-        catch (...) {}
     }
 
     // Clone source = the NEAREST live, healthy enemy's exact RUNTIME class. The
@@ -4491,16 +5342,28 @@ namespace
             if (!n.ok || n.actor == guard || n.actor == player || IsHookBodyguard(n.actor) ||
                 !IsLiveCombatTarget(n.actor) || !AiIsCombatCapable(n.actor))
                 continue;
+            ULONGLONG now = GetTickCount64();
+            auto suppressed = g_hookSuppressedThreatUntilMs.find(n.actor);
+            if (suppressed != g_hookSuppressedThreatUntilMs.end())
+            {
+                if (suppressed->second > now)
+                    continue;
+                g_hookSuppressedThreatUntilMs.erase(suppressed);
+            }
             float dPlayer = DistanceMetres(n.loc, playerLoc);
             float dGuard = DistanceMetres(n.loc, guardLoc);
             UObject* currentTarget = ReadAiTargetField(n.actor);
             bool attacksProtected = currentTarget == player ||
                                     (currentTarget && IsHookBodyguard(currentTarget));
-            bool eligible = dPlayer <= kHookPerimeterM || dGuard <= kHookPerimeterM ||
-                            (attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM);
+            // Strict bodyguard policy: do NOT chase robots just because they are near.
+            // Hook bodyguards protect the player, they don't initiate fights. A robot is
+            // eligible only while its current AI target is the player / managed guard,
+            // and only inside a bounded bubble so stale far-away perception can't pull
+            // the Twin back to a corpse or old fight spot.
+            bool eligible = attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM;
             if (!eligible)
                 continue;
-            float nearestProtected = std::min(dPlayer, dGuard);
+            float nearestProtected = dPlayer;
             float score = nearestProtected - (attacksProtected ? 1000.0f : 0.0f);
             if (score < bestScore)
             {
@@ -4718,10 +5581,24 @@ namespace
                 InjectState& hs = g_inject[ally];
                 if (IsLiveCombatTarget(hs.target))
                 {
+                    auto sup = g_hookSuppressedThreatUntilMs.find(hs.target);
+                    if (sup != g_hookSuppressedThreatUntilMs.end() && sup->second > now)
+                    {
+                        hs.target = nullptr;
+                    }
+                    else
+                    {
                     FVector retainedLoc{};
-                    if (ReadActorLocationFast(hs.target, retainedLoc) &&
-                        DistanceMetres(loc, retainedLoc) <= kHookAttackerAwarenessM)
-                        threat = hs.target;
+                    if (ReadActorLocationFast(hs.target, retainedLoc))
+                    {
+                        float dPlayer = DistanceMetres(playerLoc, retainedLoc);
+                        float dGuard = DistanceMetres(loc, retainedLoc);
+                        UObject* tgtTarget = ReadAiTargetField(hs.target);
+                        bool attacksProtected = tgtTarget == player || (tgtTarget && IsHookBodyguard(tgtTarget));
+                        if (attacksProtected && std::min(dPlayer, dGuard) <= kHookAttackerAwarenessM)
+                            threat = hs.target;
+                    }
+                    }
                 }
                 if (!threat)
                     threat = SelectHookThreat360(threats, ally, loc, player, playerLoc, &bestAttackerD);
@@ -5045,15 +5922,6 @@ namespace
     }
 
     // Register a freshly spawned ally into the squad (locked, dedup + cap).
-    void RegisterSpawnedAlly(UObject* ally, bool hookOwned)
-    {
-        SquadAdd(ally);
-        if (hookOwned)
-        {
-            HookBodyguardAdd(ally);
-            LOG("[AI-HOOK] spawned bodyguard registered in Hook Diagnostics roster: %p", (void*)ally);
-        }
-    }
 
     // =======================================================================
     //  SHARED SPAWN  --  clone a class into a permanent bodyguard (game thread)
@@ -5120,8 +5988,6 @@ namespace
 
         // Register FIRST (so the squad tracks it and Stand-down can remove it even if
         // the fixup throws), then run the fixup. Fixup is best-effort and self-guarded.
-        RegisterSpawnedAlly(spawned, hookOwned);
-        try { SpawnFixupPass(spawned, player, 5); } catch (...) { LOG("SpawnAndRegisterAlly: fixup threw (ignored)"); }
         RequestAiDiscovery();
         LOG("SpawnAndRegisterAlly: spawned ally actor=%p", (void*)spawned);
     }
@@ -8648,6 +9514,66 @@ namespace
         catch (...) { return {}; }
     }
 
+    void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params)
+    {
+        if (!fn)
+            return;
+        // Hot ProcessEvent path: use cached death UFunction pointers. Refresh at most
+        // once a second so subsystem death events with params are caught without doing
+        // global object lookups on every dispatch.
+        static ULONGLONG lastResolveMs = 0;
+        ULONGLONG nowResolve = GetTickCount64();
+        if (nowResolve - lastResolveMs > 1000)
+        {
+            lastResolveMs = nowResolve;
+            ResolveHookTwinDeathPipelineFns();
+        }
+        void* fK2Death = g_fnHookK2OnDeath.load(std::memory_order_relaxed);
+        void* fK2Load = g_fnHookK2OnLoadDeathState.load(std::memory_order_relaxed);
+        void* fLoadDead = g_fnHookLoadDeadState.load(std::memory_order_relaxed);
+        void* fSendDeath = g_fnHookSendDeathEvent.load(std::memory_order_relaxed);
+        void* fSendLoad = g_fnHookSendLoadDeathStateEvent.load(std::memory_order_relaxed);
+        void* fDied = g_fnHookSendCharacterDiedEvent.load(std::memory_order_relaxed);
+        void* fDestroyOwner = g_fnHookDestroyOwnerCharacter.load(std::memory_order_relaxed);
+
+        UObject* actor = nullptr;
+        const char* reason = nullptr;
+        if (fn == fK2Death || fn == fK2Load || fn == fLoadDead)
+        {
+            actor = Mem::IsReadable(obj, 0x30) ? static_cast<UObject*>(obj) : nullptr;
+            reason = (fn == fK2Death) ? "K2_OnDeath" : (fn == fK2Load ? "K2_OnLoadDeathState" : "LoadDeadState");
+        }
+        else if ((fn == fSendDeath || fn == fSendLoad) && Mem::IsReadable(params, sizeof(P_HookDeathEventOwner)))
+        {
+            actor = reinterpret_cast<UObject*>(reinterpret_cast<P_HookDeathEventOwner*>(params)->EventOwnerCharacter);
+            reason = (fn == fSendDeath) ? "SendDeathEvent" : "SendLoadDeathStateEvent";
+        }
+        else if (fn == fDied && Mem::IsReadable(params, sizeof(P_HookGameplayCharacterDied)))
+        {
+            actor = reinterpret_cast<UObject*>(reinterpret_cast<P_HookGameplayCharacterDied*>(params)->DeadCharacter);
+            reason = "SendCharacterDiedEvent";
+        }
+        else if (fn == fDestroyOwner)
+        {
+            actor = HookTwinOwnerFromDeathAbility(obj);
+            reason = "DestroyOwnerCharacter";
+        }
+        else
+        {
+            std::string name = SafeObjectFullName(static_cast<UObject*>(fn));
+            std::string lower = LowerCopy(name);
+            if (lower.find("k2_ondeath") != std::string::npos || lower.find(".ondeath") != std::string::npos)
+            {
+                actor = Mem::IsReadable(obj, 0x30) ? static_cast<UObject*>(obj) : nullptr;
+                reason = "death-name-fallback";
+            }
+        }
+
+        if (!actor || !AiUsable(actor) || IsHookBodyguard(actor))
+            return;
+        MarkAiDeathTombstone(actor, reason);
+    }
+
     void WriteVectorJson(std::ostream& os, const FVector& v)
     {
         os << "{\"x\":" << v.X << ",\"y\":" << v.Y << ",\"z\":" << v.Z << "}";
@@ -10137,6 +11063,234 @@ namespace
         CloseHandle(t);
     }
 
+    bool HookTwinForensicsRelevantObject(void* obj)
+    {
+        UObject* u = Mem::IsReadable(obj, 0x30) ? static_cast<UObject*>(obj) : nullptr;
+        if (!u) return false;
+        if (IsHookTwinBodyguard(u)) return true;
+        // Controller dispatches are just as important as pawn dispatches.
+        UObject* pawn = ReadUObjectAt(u, Offsets::O_BaseController_Pawn);
+        if (pawn && IsHookTwinBodyguard(pawn)) return true;
+        // Ability/task/subobject dispatches often carry CachedAIOwner.
+        UObject* owner = HookTwinOwnerFromDeathAbility(u);
+        if (owner && IsHookTwinBodyguard(owner)) return true;
+        // Outer-chain fallback for transient ability tasks/actions spawned under the ability.
+        UObject* outer = nullptr;
+        try { outer = u->Outer(); } catch (...) { outer = nullptr; }
+        for (int d = 0; outer && d < 16; ++d)
+        {
+            if (IsHookTwinBodyguard(outer)) return true;
+            UObject* oo = HookTwinOwnerFromDeathAbility(outer);
+            if (oo && IsHookTwinBodyguard(oo)) return true;
+            try { outer = outer->Outer(); } catch (...) { break; }
+        }
+        return false;
+    }
+
+    bool HookTwinForensicsSuspiciousFunctionName(const std::string& s)
+    {
+        std::string n = LowerCopy(s);
+        static const char* needles[] = {
+            "fightstaging", "staging", "death", "dead", "qte", "ability", "montage",
+            "anim", "pose", "ragdoll", "target", "blackboard", "aggressive", "passive",
+            "movement", "moveto", "path", "behavior", "behaviour", "state", "team", "attitude",
+            "loaddeath", "destroyowner", "conditionalaction", "timerrelatedaction"
+        };
+        for (const char* k : needles)
+            if (n.find(k) != std::string::npos) return true;
+        return false;
+    }
+
+    void HookTwinForensicsProcessEvent(void* obj, void* fn, void* params)
+    {
+        UObject* fnObj = static_cast<UObject*>(fn);
+        std::string fnFull = SafeObjectFullName(fnObj);
+        const bool relevantObj = HookTwinForensicsRelevantObject(obj);
+        const bool suspiciousFn = HookTwinForensicsSuspiciousFunctionName(fnFull);
+        if (!relevantObj && !suspiciousFn)
+            return;
+
+        uint64_t n = g_hookTwinForensicsEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::ostringstream os;
+        os << "{\"seq\":" << n
+           << ",\"t_ms\":" << GetTickCount64()
+           << ",\"thread\":" << GetCurrentThreadId()
+           << ",\"relevant_object\":" << (relevantObj ? "true" : "false")
+           << ",\"suspicious_function\":" << (suspiciousFn ? "true" : "false")
+           << ",\"object\":"; WriteObjectJson(os, static_cast<UObject*>(obj));
+        os << ",\"controller_pawn\":"; WriteObjectJson(os, ReadUObjectAt(static_cast<UObject*>(obj), Offsets::O_BaseController_Pawn));
+        os << ",\"ability_owner_guess\":"; WriteObjectJson(os, HookTwinOwnerFromDeathAbility(obj));
+        os << ",\"function\":\"" << JsonEscape(fnFull) << "\"";
+        os << ",\"ufunction\":"; WriteObjectJson(os, fnObj);
+        uint32_t funcFlags = 0;
+        if (Mem::IsReadable(reinterpret_cast<uint8_t*>(fn) + Offsets::O_UFunction_FunctionFlags, 4))
+            funcFlags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(fn) + Offsets::O_UFunction_FunctionFlags);
+        void* execNative = nullptr;
+        if (Mem::IsReadable(reinterpret_cast<uint8_t*>(fn) + Offsets::O_UFunction_ExecFunction, sizeof(void*)))
+            execNative = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(fn) + Offsets::O_UFunction_ExecFunction);
+        os << ",\"func_flags\":\"0x" << std::hex << funcFlags << std::dec << "\"";
+        os << ",\"exec_native\":"; WriteCodeAddrJson(os, execNative);
+        int paramSize = 0;
+        if (Mem::IsReadable(reinterpret_cast<uint8_t*>(fn) + Offsets::O_UStruct_PropertiesSize, 4))
+            paramSize = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(fn) + Offsets::O_UStruct_PropertiesSize);
+        if (paramSize < 0) paramSize = 0;
+        if (paramSize > 512) paramSize = 512;
+        os << ",\"param_size\":" << paramSize << ",\"params_hex\":\"";
+        if (params && paramSize > 0 && Mem::IsReadable(params, (size_t)paramSize))
+        {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(params);
+            char hx[4];
+            for (int i = 0; i < paramSize; ++i) { sprintf_s(hx, "%02X", b[i]); os << hx; }
+        }
+        os << "\"}";
+
+        std::lock_guard<std::mutex> lk(g_diagMutex);
+        if (g_hookTwinForensicsFile)
+        {
+            g_hookTwinForensicsFile << os.str() << "\n";
+            g_hookTwinForensicsFile.flush();
+        }
+    }
+
+    struct HookTwinForensicsWriteJob { std::string path, json, hex; };
+    DWORD WINAPI HookTwinForensicsWriteThread(LPVOID param)
+    {
+        HookTwinForensicsWriteJob* job = reinterpret_cast<HookTwinForensicsWriteJob*>(param);
+        try
+        {
+            WriteTextFile(job->path, job->json);
+            if (!job->hex.empty()) WriteTextFile(job->path + "_hex.txt", job->hex);
+        }
+        catch (...) { LOG("Hook Twin forensics: write exception (ignored)"); }
+        delete job;
+        g_hookTwinForensicsSnapshotInFlight = false;
+        return 0;
+    }
+
+    void ScheduleHookTwinForensicsSnapshot(const std::string& dir, int seq, bool full)
+    {
+        if (dir.empty() || g_hookTwinForensicsSnapshotInFlight.exchange(true))
+            return;
+        QueueGameThread([dir, seq, full]()
+        {
+            bool spawned = false;
+            try
+            {
+                UObject* player = GetLocalPawn();
+                FVector playerLoc{}; ReadLocalPawnLocationFast(playerLoc, &player);
+                std::vector<UObject*> guards = HookBodyguardSnapshot();
+                std::ostringstream os, hex;
+                os << "{\"schema\":\"AtomicHeartMenu.hook_twin_forensics.v1\""
+                   << ",\"seq\":" << seq
+                   << ",\"full\":" << (full ? "true" : "false")
+                   << ",\"time_local\":\"" << JsonEscape(LocalTimestampIso()) << "\""
+                   << ",\"t_ms\":" << GetTickCount64()
+                   << ",\"events\":" << g_hookTwinForensicsEvents.load(std::memory_order_relaxed)
+                   << ",\"hook_mode\":" << (g_hookBodyguardMode.load(std::memory_order_relaxed) ? "true" : "false")
+                   << ",\"player\":"; WriteObjectJson(os, player);
+                os << ",\"function_ptrs\":{\"staging_ufn\":"; WriteObjectJson(os, static_cast<UObject*>(g_fnHookTryFightStaging.load(std::memory_order_relaxed)));
+                os << ",\"staging_native\":"; WriteCodeAddrJson(os, g_fnHookTryFightStagingNative.load(std::memory_order_relaxed));
+                os << ",\"k2_death\":"; WriteObjectJson(os, static_cast<UObject*>(g_fnHookK2OnDeath.load(std::memory_order_relaxed)));
+                os << ",\"load_dead_state\":"; WriteObjectJson(os, static_cast<UObject*>(g_fnHookLoadDeadState.load(std::memory_order_relaxed)));
+                os << ",\"qte\":"; WriteObjectJson(os, static_cast<UObject*>(g_fnHookStartVersusQTE.load(std::memory_order_relaxed)));
+                os << "},\"counters\":{\"death_blocks\":" << g_hookTwinDeathPipelineBlocks.load(std::memory_order_relaxed)
+                   << ",\"qte_blocks\":" << g_hookTwinQtePipelineBlocks.load(std::memory_order_relaxed)
+                   << ",\"fstaging_selections\":" << g_hookTwinFightStagingSelections.load(std::memory_order_relaxed)
+                   << ",\"fstaging_blocks\":" << g_hookTwinFightStagingBlocks.load(std::memory_order_relaxed)
+                   << ",\"containers\":" << g_hookTwinFightStagingContainerLogs.load(std::memory_order_relaxed)
+                   << "},\"guards\":[";
+                for (size_t i = 0; i < guards.size(); ++i)
+                {
+                    if (i) os << ",";
+                    UObject* g = guards[i];
+                    os << "{\"ai\":";
+                    WriteAiJson(os, hex, g, player, playerLoc, false);
+                    os << ",\"fight_staging_selected\":"; WriteObjectJson(os, static_cast<UObject*>(GetFightStagingSelectedObject(g)));
+                    if (full && i < 2)
+                    {
+                        os << ",\"reflection\":"; Reflect::DumpObjectJson(os, g);
+                        UObject* ctrl = ReadUObjectAt(g, Offsets::O_Pawn_Controller);
+                        os << ",\"controller_reflection\":"; Reflect::DumpObjectJson(os, ctrl);
+                    }
+                    os << "}";
+                    DumpHexWindow(hex, "hook_guard", g, 0x900);
+                    DumpHexWindow(hex, "hook_guard_ctrl", ReadUObjectAt(g, Offsets::O_Pawn_Controller), 0x500);
+                }
+                os << "]}\n";
+                std::ostringstream name;
+                name << "hook_twin_state_" << std::setw(5) << std::setfill('0') << seq << ".json";
+                HookTwinForensicsWriteJob* job = new HookTwinForensicsWriteJob{ PathJoin(dir, name.str()), os.str(), hex.str() };
+                HANDLE t = CreateThread(nullptr, 0, HookTwinForensicsWriteThread, job, 0, nullptr);
+                if (t) { CloseHandle(t); spawned = true; }
+                else delete job;
+            }
+            catch (...) { LOG("Hook Twin forensics: snapshot exception (ignored)"); }
+            if (!spawned) g_hookTwinForensicsSnapshotInFlight = false;
+        });
+    }
+
+    void StartHookTwinForensics()
+    {
+        std::string dir = CreateToggleDiagnosticsDir();
+        if (dir.empty()) { LOG("Hook Twin forensics: failed to create directory"); return; }
+        ResolveHookTwinDeathPipelineFns();
+        EnsureHookTwinFightStagingNativeHook();
+        EnsureHookTwinActionContainerFactory();
+        WriteDiagnosticsManifest(dir, "hook-twin-forensics");
+        {
+            std::lock_guard<std::mutex> lk(g_diagMutex);
+            if (g_hookTwinForensicsFile) g_hookTwinForensicsFile.close();
+            g_hookTwinForensicsFile.open(PathJoin(dir, "hook_twin_events.jsonl"), std::ios::out | std::ios::trunc | std::ios::binary);
+            g_hookTwinForensicsDir = dir;
+            g_diagLastDir = dir;
+        }
+        g_hookTwinForensicsEvents = 0;
+        g_hookTwinForensicsSeq = 0;
+        g_hookTwinForensicsLastSnapshotMs = 0;
+        g_hookTwinForensicsActive = true;
+        LOG("Hook Twin FORENSICS ON. Dumping ProcessEvent/state to: %s", dir.c_str());
+        ScheduleHookTwinForensicsSnapshot(dir, 0, true);
+    }
+
+    void StopHookTwinForensics()
+    {
+        std::string dir;
+        { std::lock_guard<std::mutex> lk(g_diagMutex); dir = g_hookTwinForensicsDir; }
+        if (!dir.empty())
+            ScheduleHookTwinForensicsSnapshot(dir, 99999, true);
+        g_hookTwinForensicsActive = false;
+        {
+            std::lock_guard<std::mutex> lk(g_diagMutex);
+            if (g_hookTwinForensicsFile)
+            {
+                g_hookTwinForensicsFile << "{\"event\":\"forensics_stop\",\"t_ms\":" << GetTickCount64() << "}\n";
+                g_hookTwinForensicsFile.flush();
+                g_hookTwinForensicsFile.close();
+            }
+            g_hookTwinForensicsDir.clear();
+        }
+        LOG("Hook Twin FORENSICS OFF. Last directory: %s", dir.c_str());
+    }
+
+    void UpdateHookTwinForensics()
+    {
+        bool want = Features::Get().hookTwinForensics;
+        bool was = g_hookTwinForensicsWasOn.load(std::memory_order_relaxed);
+        if (want && !was) StartHookTwinForensics();
+        else if (!want && was) StopHookTwinForensics();
+        g_hookTwinForensicsWasOn = want;
+        if (!want || !g_hookTwinForensicsActive.load(std::memory_order_relaxed))
+            return;
+        ULONGLONG now = GetTickCount64();
+        if (now - g_hookTwinForensicsLastSnapshotMs.load(std::memory_order_relaxed) < 500)
+            return;
+        g_hookTwinForensicsLastSnapshotMs = now;
+        std::string dir;
+        { std::lock_guard<std::mutex> lk(g_diagMutex); dir = g_hookTwinForensicsDir; }
+        int seq = ++g_hookTwinForensicsSeq;
+        ScheduleHookTwinForensicsSnapshot(dir, seq, (seq % 10) == 0);
+    }
+
     void UpdateDebugDiagnostics()
     {
         bool want = Features::Get().debugLiveDump;
@@ -11088,10 +12242,24 @@ bool     Features::OwnershipResolved()
     return g_fnOwnSwitchTeamAttitude.load() && g_fnOwnSetTargetEnemy.load() && g_fnOwnSetBbTargetEnemy.load();
 }
 
+void Features::SetHookTwinForensics(bool on)
+{
+    Get().hookTwinForensics = on;
+    LOG("Hook Twin forensics requested: %s", on ? "ON" : "OFF");
+}
+
+bool Features::HookTwinForensicsActive()
+{
+    return g_hookTwinForensicsActive.load(std::memory_order_relaxed);
+}
+
 void Features::SetHookBodyguardMode(bool on)
 {
     if (on && g_hookBodyguardMode.load(std::memory_order_relaxed) && HookFriendshipResolved())
+    {
+        ResolveHookTwinDeathPipelineFns();
         return;
+    }
     if (!on)
     {
         g_hookBodyguardMode.store(false, std::memory_order_relaxed);
@@ -11118,6 +12286,9 @@ void Features::SetHookBodyguardMode(bool on)
     g_fnHookStopMovement.store(CachedFn(AH::Fn_AIController_StopMovement), std::memory_order_relaxed);
     g_fnHookSetCharacterAggressive.store(CachedFn(AH::Fn_AIUtils_SetCharacterAggressive), std::memory_order_relaxed);
     g_fnHookSetCharacterPassive.store(CachedFn(AH::Fn_AIUtils_SetCharacterPassive), std::memory_order_relaxed);
+    ResolveHookTwinDeathPipelineFns();
+    bool fsHook = EnsureHookTwinFightStagingNativeHook();
+    EnsureHookTwinActionContainerFactory();
     AiMovementHooks::ResolveHelpers(CachedFn(AH::Fn_Mercuna_MoveToLocation), nullptr);
 
     const bool ready = peReady && exactMetadata;
@@ -11130,6 +12301,16 @@ void Features::SetHookBodyguardMode(bool on)
         LOG("[AI-HOOK] experimental bodyguard mode ACTIVE (follow/protect/attack driven by our hook pump; TargetAlly never receives player)");
         LOG("[AI-MOVE] controller ownership resolved moveActor=%p moveLocation=%p stop=%p",
             g_fnHookMoveToActor.load(), g_fnHookMoveToLocation.load(), g_fnHookStopMovement.load());
+        LOG("[AI-DEATH] Hook Twin death/QTE guard resolved death=%p load=%p loadState=%p stagingUFn=%p stagingNative=%p sendDeath=%p sendLoad=%p died=%p qte=%p cachePose=%p destroyOwner=%p",
+            g_fnHookK2OnDeath.load(), g_fnHookK2OnLoadDeathState.load(), g_fnHookLoadDeadState.load(),
+            g_fnHookTryFightStaging.load(), g_fnHookTryFightStagingNative.load(), g_fnHookSendDeathEvent.load(), g_fnHookSendLoadDeathStateEvent.load(),
+            g_fnHookSendCharacterDiedEvent.load(), g_fnHookStartVersusQTE.load(), g_fnHookCacheDeathPose.load(),
+            g_fnHookDestroyOwnerCharacter.load());
+        LOG("[AI-FSTAGE] Hook Twin fight-staging hooks selector=%d container=%d selections=%llu blocked=%llu containers=%llu",
+            fsHook ? 1 : 0, g_hookTwinActionContainerHookLive.load(std::memory_order_relaxed) ? 1 : 0,
+            (unsigned long long)g_hookTwinFightStagingSelections.load(std::memory_order_relaxed),
+            (unsigned long long)g_hookTwinFightStagingBlocks.load(std::memory_order_relaxed),
+            (unsigned long long)g_hookTwinFightStagingContainerLogs.load(std::memory_order_relaxed));
     }
     else
     {
@@ -11246,6 +12427,25 @@ void Features::DumpHookAiStatus()
     LOG("[AI-MOVE] controller external Move/Stop replacements blocked=%llu native-follow-states=%d",
         (unsigned long long)g_hookControllerMovesBlocked.load(std::memory_order_relaxed),
         HookAiCount());
+    LOG("[AI-DEATH] Hook Twin deathPipelineBlocked=%llu qtePoseBlocked=%llu fns[death=%p load=%p stagingUFn=%p stagingNative=%p sendDeath=%p died=%p qte=%p cache=%p destroy=%p]",
+        (unsigned long long)g_hookTwinDeathPipelineBlocks.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookTwinQtePipelineBlocks.load(std::memory_order_relaxed),
+        g_fnHookK2OnDeath.load(std::memory_order_relaxed),
+        g_fnHookLoadDeadState.load(std::memory_order_relaxed),
+        g_fnHookTryFightStaging.load(std::memory_order_relaxed),
+        g_fnHookTryFightStagingNative.load(std::memory_order_relaxed),
+        g_fnHookSendDeathEvent.load(std::memory_order_relaxed),
+        g_fnHookSendCharacterDiedEvent.load(std::memory_order_relaxed),
+        g_fnHookStartVersusQTE.load(std::memory_order_relaxed),
+        g_fnHookCacheDeathPose.load(std::memory_order_relaxed),
+        g_fnHookDestroyOwnerCharacter.load(std::memory_order_relaxed));
+    LOG("[AI-FSTAGE] selectorLive=%d containerLive=%d selections=%llu blocked=%llu containers=%llu recentGuard=%p",
+        g_hookTwinFightStagingSelectorHookLive.load(std::memory_order_relaxed) ? 1 : 0,
+        g_hookTwinActionContainerHookLive.load(std::memory_order_relaxed) ? 1 : 0,
+        (unsigned long long)g_hookTwinFightStagingSelections.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookTwinFightStagingBlocks.load(std::memory_order_relaxed),
+        (unsigned long long)g_hookTwinFightStagingContainerLogs.load(std::memory_order_relaxed),
+        g_hookTwinRecentFightStagingGuard.load(std::memory_order_relaxed));
 }
 
 void Features::RescanHookMovementResolvers()
@@ -11993,6 +13193,11 @@ void Features::Prewarm()
         CachedFn(AH::Fn_AIController_StopMovement);
         CachedFn(AH::Fn_AIBlueprintHelper_SimpleMoveToActor);
         CachedFn(AH::Fn_Pawn_AddMovementInput);
+        // Pre-arm the fight-staging native hook after SDK/module globals are ready.
+        // Previously this was only attempted when Hook Bodyguard mode was toggled, so
+        // a clean startup log could misleadingly miss the expected LIVE line.
+        ResolveHookTwinDeathPipelineFns();
+        EnsureHookTwinFightStagingNativeHook();
         // Mercuna (the game's real ground-AI mover). Resolve on the worker thread so the
         // game-thread squad walk never triggers a slow GObjects scan.
         FindObjectFast(AH::Cls_MercunaNavComponent);
@@ -12509,6 +13714,7 @@ static void ForgetHookBodyguardRuntimeState(UObject* guard, bool eraseReleaseBoo
     g_engagedUntilMs.erase(guard);
     g_lastThreatMs.erase(guard);
     g_twin.erase(guard);
+    g_hookCombatRouteAbortPending.erase(guard);
 
     for (auto& pair : g_inject)
     {
@@ -12606,6 +13812,8 @@ static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
             if(Mem::IsReadable(mv+AH::Move_MovementMode,1))mode=*reinterpret_cast<uint8_t*>(mv+AH::Move_MovementMode);
             if(Mem::IsReadable(mv+AH::Move_Velocity,sizeof(FVector)))
             { FVector v=*reinterpret_cast<FVector*>(mv+AH::Move_Velocity); speed=sqrtf(v.X*v.X+v.Y*v.Y+v.Z*v.Z); }
+            if(Mem::IsReadable(mv+AH::Move_MaxWalkSpeed,sizeof(float)))
+                *reinterpret_cast<float*>(mv+AH::Move_MaxWalkSpeed)=kHookTwinCombatWalkSpeed;
         }
 
         s.navigationMode=AiMovementHooks::CurrentMixedNavigation(guard);
@@ -12620,7 +13828,9 @@ static bool DriveHookCombatApproach(UObject* guard, HookNativeFollowState& s,
         }
         UnpinTwinSchedule(guard);
         bool forceOk=SetControllerForceFollow(ctrl,false);
-        bool aggrOk=SetControllerAggressive(ctrl,true);
+        // Do not use AHAIController.SetBlackboardIsAggressive(false) here: that wrapper
+        // broadcasts character events into GA_FightStaging_Twins. Write the BB key only.
+        bool aggrOk=SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_IsAggressive, false);
         bool use3dOk=SetControllerBoolKeyAt(ctrl,AH::AICtrl_Key_Uses3DNavigation,false);
         bool can2dOk=SetControllerBoolKeyAt(ctrl,AH::AICtrl_Key_CanReach2D,true);
         bool can3dOk=SetControllerBoolKeyAt(ctrl,AH::AICtrl_Key_CanReach3D,false);
@@ -12713,6 +13923,21 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
         }
         HookNativeFollowState& s = g_hookNativeFollow[guard];
         s.mixed = IsMixedNavCharacter(guard);
+
+        if (g_hookCombatRouteAbortPending.erase(guard) > 0)
+        {
+            // Combat teardown is earlier than this native movement state type. Consume
+            // its request here and kill the old enemy path before follow can fight it.
+            YieldHookMovement(guard, s, true);
+            s.wasEngaged = false;
+            s.commandActive = false;
+            s.restartPending = false;
+            s.lastIssueMs = 0;
+            s.sampleMs = 0;
+            s.lastProgressMs = 0;
+            s.movementTarget = nullptr;
+            LOG("[AI-MOVE] aborted stale combat route before follow reacquire guard=%p", (void*)guard);
+        }
 
         // Never retain the player or a corpse as a combat target while follow owns movement.
         uint8_t* base = reinterpret_cast<uint8_t*>(guard);
@@ -12826,6 +14051,8 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 mode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
             if (Mem::IsReadable(mv + AH::Move_Velocity, sizeof(FVector)))
             { FVector v = *reinterpret_cast<FVector*>(mv + AH::Move_Velocity); moveSpeed = sqrtf(v.X*v.X + v.Y*v.Y + v.Z*v.Z); }
+            if (Mem::IsReadable(mv + AH::Move_MaxWalkSpeed, sizeof(float)))
+                *reinterpret_cast<float*>(mv + AH::Move_MaxWalkSpeed) = kHookTwinPrettyWalkSpeed;
             if (mode == AH::MOVE_Flying) ++mixed3D;
 
             UnpinTwinSchedule(guard);
@@ -12850,7 +14077,7 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                 bool stopped = false;
                 if (s.commandActive)
                     stopped = StopHookControllerMovement(ctrl);
-                bool aggrOk = SetControllerAggressive(ctrl, false);
+                bool aggrOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_IsAggressive, false);
                 ClearAiAggressiveLatch(guard);
                 if (s.followState != 2)
                 {
@@ -12896,13 +14123,17 @@ static void DriveHookBodyguardsNativeGameThread(UObject* player, const FVector& 
                               SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_FollowLocation, goal);
             SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
             bool reachOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
-            bool aggrOk = SetControllerAggressive(ctrl, true);
+            // Follow is NOT combat. Keep the Twin out of the aggressive/fight-staging
+            // branch while issuing normal follow/path requests. Use raw BB write only:
+            // the reflected wrapper itself wakes GA_FightStaging_Twins every frame.
+            bool aggrOk = SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_IsAggressive, false);
             bool speedOk = true;
             if (s.followState != 1)
             {
                 WriteAiTargetField(guard, nullptr);
-                SetAiTargetEnemy(guard, nullptr, true);
-                SetControllerTargetEnemy(ctrl, nullptr, true);
+                // Do not call reflected SetTargetEnemy(nullptr) / SetBlackboardTargetEnemy(nullptr)
+                // here for Twins: it ends GA_FightStaging_Twins and interrupts montages.
+                SetControllerObjectKeyAt(ctrl, AH::AICtrl_Key_TargetEnemy, nullptr);
                 ClearControllerFocus(ctrl);
                 EnsureFollowerCanMove(guard);
                 speedOk = SetControllerFollowSpeed(ctrl);
@@ -13552,6 +14783,7 @@ static void TickImpl()
     UpdateGameInputBlock();
     UpdateInstantPuzzleResolveToggle();
     UpdateDebugDiagnostics();
+    UpdateHookTwinForensics();
     // Fire any puzzle completions the worker thread discovered (render thread).
     DrainPuzzleCompletions();
     // World-level toggles that don't need the pawn.

@@ -276,3 +276,23 @@ Known future gap: native Twin attack montages can look correct but still fail to
 ## 2026-06-26 Hook roster lifecycle note
 
 Post-test issue: deleting a Hook bodyguard and spawning a new one could leave follow broken because the Hook tab had no dedicated delete manager and old per-actor maps survived the actor destruction. Cleanup must cover `g_hookNativeFollow`, `g_inject`, `g_engagedUntilMs`, `g_lastThreatMs`, `g_twin`, movement hook registration, controller ownership, saved schedule/original team bookkeeping, and references from other Hook guards. New Hook registration clears stale state for the same pointer before adding the actor, so UE pointer reuse cannot inherit old follow/combat state.
+
+## 2026-06-26 Hook Twin downed-pose root cause
+
+Discord correlation matched the pose to the campaign first-Twin injured/downed state. ReVa confirmed the root path is the reflected death/load-death/fight-staging/QTE pipeline, not the working Hook follow mover.
+
+Relevant ReVa chain:
+
+- `AHCharacterEventUtils.SendDeathEvent` (`0x1421EB000`) builds a character event with byte `8` and dispatches through `FUN_141DCC500`.
+- `AHCharacterEventUtils.SendLoadDeathStateEvent` (`0x1421E9B70`) builds a character event with byte `0xE` and dispatches through the same event bus.
+- `GameplayEventSubsystem.SendCharacterDiedEvent` (`0x14230C090`) broadcasts the gameplay death event with dead character, hit params, killer, and killed-by data.
+- `QTESubsystem.CacheDeathPose` (`0x142371720 -> FUN_141F824A0`) caches the pose into QTE subsystem state and marks the cache valid.
+- `AHAICharacter.TryActivateFightStagingAbility`, `LoadDeadState`, `K2_OnDeath`, `K2_OnLoadDeathState`, `QTESubsystem.StartVersusQTE`, and `AIDeathAbility.DestroyOwnerCharacter` are the reflected ProcessEvent choke points around that chain.
+
+Patch direction: keep the validated controller/Recast walking logic unchanged. In Hook Diagnostics mode only, ProcessEvent blocks those death/QTE dispatches when the affected actor is a managed Hook Twin (`IsHookBodyguard && IsMixedNavCharacter`). The block also clears `Char_bIsDead`, tops health, keeps tick/mesh tick enabled, and arms a short `CacheDeathPose` suppression window because that specific QTE call has no actor parameter. Test logs to watch: `[AI-DEATH] blocked Hook Twin death pipeline ...` and `[AI-DEATH] blocked Hook Twin QTE/death-pose ...` with stage names.
+
+## 2026-06-27 - Hook Twin Campaign Downed Pose Root Cause Patch
+
+Static ReVa and SDK reversal showed the pose is not a generic death bit. The relevant path is `AHAICharacter::TryActivateFightStagingAbility` -> `UAIFightStagingAbility` vtable `+0x550` (`FUN_141B93A50`, RVA `0x1B93A50`), which writes the selected fight-staging object at ability offsets `+0x690/+0x6A0/+0x6A1`. The campaign Chelomey/Twin audio theme also consumes `FAHCharacterEvent` damage context and health, so explosion/damage history can select a story fight-stage before `K2_OnDeath`/`LoadDeadState` fire.
+
+Implementation direction: stop treating reflected `TryActivateFightStagingAbility` as the root fix. The hook now installs runtime MinHook detours on the native selector (`0x1B93A50`) and action-container factory (`0x1CA06E0`). For managed Hook Twins it logs selected fight-staging objects and the action containers spawned after selection. It blocks only selected objects whose class/name matches Twin/Chelomey downed/final/death/QTE/finale tokens, leaving normal movement and normal combat stages alone. Test logs to watch: `[AI-FSTAGE] Hook Twin fight-stage select`, `[AI-FSTAGE] Hook Twin action-container create`, and `[AI-FSTAGE] BLOCKED Hook Twin campaign/downed fight-stage select`.

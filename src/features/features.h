@@ -139,6 +139,7 @@ namespace Features
         // Misc/debug helpers
         bool  instantPuzzleResolve = false;
         bool  debugLiveDump = false; // Debug tab: stream togglelogsN snapshots + ProcessEvent trace
+        bool  hookTwinForensics = false; // Hook Diagnostics: aggressive root-cause recorder for Twin state changes
 
         // Saved teleport point
         UE::FVector savedLocation{};
@@ -341,6 +342,8 @@ namespace Features
     uint64_t UnsafeTargetAllySkipCount();
     HookBodyguardValidation ValidateHookBodyguardPair(bool writeLog);
     void     DumpHookAiStatus();
+    void     SetHookTwinForensics(bool on);
+    bool     HookTwinForensicsActive();
     void     RescanHookMovementResolvers();
     int      HookAiRecruitNearby();
     bool     HookAiSpawnBodyguard();
@@ -352,6 +355,15 @@ namespace Features
     void     HookAiRelease();
     void     HookAiDeleteRoster();
     int      HookAiCount();
+
+    // Hook Twin animation test bench. These intentionally target the selected Hook
+    // guard (or first Hook guard) and run on the game thread so we can safely test
+    // locomotion/combat/death-pose assets and reset back to the AnimBlueprint.
+    std::vector<std::string> HookTwinAnimSearch(const char* query, int maxResults);
+    bool     HookTwinAnimPlayByName(const char* objectFullName, const char* slotName, float playRate, bool loop);
+    void     HookTwinAnimStopReset();
+    void     HookTwinAnimMovementPreset(int preset); // 0 pretty walk, 1 normal follow, 2 combat, 3 freeze
+    void     HookTwinAnimCombatPose(bool aggressive);
 
     void MaxWeaponUpgrades();     // BaseWeapon::FullUpgrade on the current weapon
     void RunConsoleCommand(const char* command); // queue a console command to the game thread

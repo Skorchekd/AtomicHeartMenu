@@ -813,6 +813,13 @@ static void RenderHookTestingTab()
     bool hookMode = Features::HookBodyguardModeActive();
     if (ImGui::Checkbox("Enable experimental hook bodyguards", &hookMode))
         Features::SetHookBodyguardMode(hookMode);
+    bool forensics = Features::HookTwinForensicsActive() || Features::Get().hookTwinForensics;
+    if (ImGui::Checkbox("NUKE Twin root-cause forensics (continuous dumps)", &forensics))
+        Features::SetHookTwinForensics(forensics);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Writes hook_twin_events.jsonl plus 2 Hz state snapshots under AtomicHeartMenu_diagnostics\\togglelogsN. Use when the Twin enters the bad pose/state.");
+    if (const char* dir = Features::DebugLastDumpDir(); dir && *dir)
+        ImGui::TextDisabled("Last dump dir: %s", dir);
     ImGui::Text("Friendship hook: %s    forced pairs: %llu",
                 Features::HookFriendshipResolved() ? "resolved" : "unavailable",
                 (unsigned long long)Features::HookFriendshipForceCount());
