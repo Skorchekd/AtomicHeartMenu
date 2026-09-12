@@ -110,6 +110,7 @@ namespace UE
 
     UObject*  FindObject(const char* name);           // substring of full name
     UObject*  FindObjectFast(const char* name);       // dumped index/name-index only; never scans
+    bool      WaitForObjectNameIndex(); // called after stopping hooks, before DLL unload
     void      StartObjectNameIndex();                 // background short-name index for fast assets
     bool      WriteObjectMapDump(const char* reason); // writes AtomicHeartMenu_gobjects.tsv beside the game exe
     UClass*   FindClass(const char* className);       // "Class Package.Name" or short

@@ -1,3 +1,4 @@
+#include "../../deps/nlohmann/json.hpp"
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Atomic Heart Menu - internal mod menu for single-player Atomic Heart.
@@ -24,6 +25,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 namespace
 {
@@ -39,6 +43,9 @@ namespace
     std::atomic<bool> g_nameIndexReady{ false };
     std::atomic<int> g_nameIndexObjectCount{ 0 };
     std::atomic<UE::UObject*> g_nameIndexWorld{ nullptr };
+    std::atomic<ULONGLONG> g_nameIndexRefreshMs{ 0 };
+    std::mutex g_nameThreadMutex;
+    HANDLE g_nameIndexThread = nullptr;
     std::mutex g_fnamePoolMutex;
     std::unordered_map<std::string, UE::FName> g_fnamePoolIndex;
     bool g_fnamePoolIndexed = false;
@@ -376,7 +383,7 @@ namespace
 
         for (UE::UObject* object : candidates)
         {
-            if (!Mem::IsReadable(object, 0x30))
+            if (!UE::IsLiveObject(object))
                 continue;
             if (object->GetFullName().find(needle) != std::string::npos)
             {
@@ -387,40 +394,128 @@ namespace
         return nullptr;
     }
 
-    DWORD WINAPI BuildNameIndexThread(LPVOID)
+    std::filesystem::path NameCachePath()
     {
-        ULONGLONG startMs = GetTickCount64();
-        std::unordered_map<std::string, std::vector<UE::UObject*>> local;
-        int n = UE::NumObjects();
-        local.reserve((size_t)n / 2);
+        wchar_t path[32768]{};
+        DWORD length = GetModuleFileNameW(static_cast<HMODULE>(G::hModule), path, 32768);
+        if (!length || length >= 32768) return {};
+        return std::filesystem::path(path).parent_path() / "AtomicHeartMenu.cache" / "object-names.json";
+    }
 
-        for (int i = 0; i < n && G::running.load(); ++i)
+    std::string NameCacheBuildKey()
+    {
+        if (!Mem::IsReadable(G::moduleBase, sizeof(IMAGE_DOS_HEADER))) return {};
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(G::moduleBase);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x100000) return {};
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(G::moduleBase + dos->e_lfanew);
+        if (!Mem::IsReadable(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE) return {};
+        return "AHM-NAMES-2 " + std::to_string(nt->FileHeader.TimeDateStamp) + " " +
+            std::to_string(nt->OptionalHeader.SizeOfImage);
+    }
+
+    DWORD WINAPI BuildNameIndexThread(LPVOID parameter)
+    {
+        const bool refresh = parameter != nullptr;
+        // Disk access and full scans stay off the game/render threads. Persist
+        // names and slot hints only; a cached address is never reused across runs.
+        try
         {
-            try
+            ULONGLONG startMs = GetTickCount64();
+            std::unordered_map<std::string, std::vector<UE::UObject*>> local;
+            const int count = UE::NumObjects();
+            local.reserve((size_t)count / 2);
+            auto path = NameCachePath();
+            auto key = NameCacheBuildKey();
+            bool fromCache = false;
+            int savedCount = 0, checked = 0, matches = 0;
+            if (!refresh && !path.empty() && !key.empty())
             {
-                UE::UObject* object = UE::GetObjectByIndex(i);
-                if (!Mem::IsReadable(object, 0x30))
-                    continue;
-
-                std::string name = object->GetName();
-                if (!name.empty())
-                    local[name].push_back(object);
+                std::error_code error;
+                auto bytes = std::filesystem::file_size(path, error);
+                if (!error && bytes <= 128 * 1024 * 1024)
+                {
+                    std::ifstream input(path);
+                    auto cached = nlohmann::json::parse(input, nullptr, false);
+                    if (cached.is_object() && cached.contains("build") && cached["build"].is_string() &&
+                        cached.contains("object_count") && cached["object_count"].is_number_integer() &&
+                        cached.value("build", std::string{}) == key &&
+                        cached.contains("objects") && cached["objects"].is_array())
+                    {
+                        savedCount = cached.value("object_count", 0);
+                        const auto& rows = cached["objects"];
+                        if (savedCount > 0 && savedCount <= 2000000 && rows.size() <= 2000000)
+                        {
+                            size_t rowNumber = 0;
+                            for (const auto& row : rows)
+                            {
+                                ++rowNumber;
+                                if (!row.is_array() || row.size() != 2 || !row[0].is_number_integer() || !row[1].is_string()) continue;
+                                int index = row[0].get<int>();
+                                auto name = row[1].get<std::string>();
+                                if (index < 0 || index >= count || name.empty() || name.size() > 1024) continue;
+                                UE::UObject* object = UE::GetObjectByIndex(index);
+                                if (!UE::IsLiveObject(object)) continue;
+                                if (rowNumber % 4096 == 1)
+                                { ++checked; if (object->GetName() == name) ++matches; }
+                                local[name].push_back(object);
+                            }
+                            fromCache = checked >= 8 && matches * 100 >= checked * 95;
+                        }
+                    }
+                }
             }
-            catch (...) { /* one bad UObject slot must not kill the index thread */ }
+            int first = 0;
+            if (fromCache)
+            {
+                first = (std::min)(savedCount, count);
+                LOG("Object name cache reused: validated samples=%d/%d; new slots=%d", matches, checked, count - first);
+            }
+            else local.clear();
+            for (int i = first; i < count && G::running.load(); ++i)
+            {
+                try
+                {
+                    UE::UObject* object = UE::GetObjectByIndex(i);
+                    if (!UE::IsLiveObject(object)) continue;
+                    std::string name = object->GetName();
+                    if (!name.empty()) local[name].push_back(object);
+                }
+                catch (...) {}
+            }
+            if (!G::running.load()) { g_nameIndexBuilding = false; return 0; }
+            if (!path.empty() && !key.empty() && (!fromCache || count != savedCount))
+            {
+                std::error_code error;
+                std::filesystem::create_directories(path.parent_path(), error);
+                auto temp = path; temp += ".tmp";
+                std::ofstream output(temp, std::ios::trunc);
+                output << "{\"build\":" << nlohmann::json(key).dump() << ",\"object_count\":" << count << ",\"objects\":[";
+                bool firstRow = true;
+                for (const auto& entry : local)
+                    for (auto* object : entry.second)
+                        if (UE::IsLiveObject(object))
+                        {
+                            if (!firstRow) output << ',';
+                            firstRow = false;
+                            output << nlohmann::json::array({ object->Index(), entry.first }).dump();
+                        }
+                output << "]}\n";
+                output.close();
+                if (output.good()) MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+            }
+            const size_t names = local.size();
+            {
+                std::lock_guard<std::mutex> lock(g_nameIndexMutex);
+                g_nameIndex.swap(local);
+            }
+            g_nameIndexReady = true;
+            g_nameIndexObjectCount = count;
+            g_nameIndexWorld = UE::GetWorld();
+            LOG("Object name index %s in %llums (objects=%d names=%zu)", fromCache ? "reused" : "scanned and saved",
+                GetTickCount64() - startMs, count, names);
         }
-
-        {
-            std::lock_guard<std::mutex> lock(g_nameIndexMutex);
-            g_nameIndex.swap(local);
-        }
-        g_nameIndexReady = true;
-        g_nameIndexObjectCount = n;
-        g_nameIndexWorld = UE::GetWorld();
+        catch (...) { LOG("Object name cache failed; lookup can retry without trusting cached pointers."); }
         g_nameIndexBuilding = false;
-        LOG("Object name index ready in %llums (objects=%d names=%zu)",
-            GetTickCount64() - startMs,
-            n,
-            g_nameIndex.size());
         return 0;
     }
 }
@@ -759,7 +854,9 @@ UE::UObject* UE::GetObjectByIndex(int index)
     if (!Mem::IsReadable(chunk, SIZE_FUObjectItem)) return nullptr;
 
     uint8_t* item = chunk + (size_t)within * SIZE_FUObjectItem;
-    if (!Mem::IsReadable(item, O_ObjectItem_Object + 8)) return nullptr;
+    if (!Mem::IsReadable(item, O_ObjectItem_Flags + 4)) return nullptr;
+    // Current game native weak-object checks reject EInternalObjectFlags::PendingKill.
+    if (Read<uint32_t>(item, O_ObjectItem_Flags) & (1u << 29)) return nullptr;
     return Read<UObject*>(item, O_ObjectItem_Object);
 }
 
@@ -772,6 +869,11 @@ bool UE::IsLiveObject(UObject* object)
         // On a recycled block the index read here is whatever the new occupant
         // wrote, which either fails GetObjectByIndex's bounds check or resolves
         // to some other object -- both give the right answer.
+        // September 2026 SDK EObjectFlags: objects can remain in GObjects
+        // while BeginDestroy/FinishDestroy has already torn down their state.
+        constexpr uint32_t destroyedFlags = 0x00008000u | 0x00010000u;
+        if (Read<uint32_t>(object, Offsets::O_UObject_Flags) & destroyedFlags)
+            return false;
         int index = object->Index();
         if (index < 0)
             return false;
@@ -936,21 +1038,37 @@ bool UE::WriteObjectMapDump(const char* reason)
 
 void UE::StartObjectNameIndex()
 {
-    if (g_nameIndexReady.load() || g_nameIndexBuilding.exchange(true))
-        return;
-
-    g_nameIndexReady = false;
-
-    HANDLE thread = CreateThread(nullptr, 0, BuildNameIndexThread, nullptr, 0, nullptr);
-    if (thread)
+    if (!G::running.load()) return;
+    std::lock_guard<std::mutex> lock(g_nameThreadMutex);
+    if (g_nameIndexBuilding.load()) return;
+    const bool refresh = g_nameIndexReady.load();
+    ULONGLONG now = GetTickCount64();
+    if (refresh && now - g_nameIndexRefreshMs.load() < 10000) return;
+    if (g_nameIndexThread)
     {
-        CloseHandle(thread);
+        if (WaitForSingleObject(g_nameIndexThread, 0) != WAIT_OBJECT_0) return;
+        CloseHandle(g_nameIndexThread);
+        g_nameIndexThread = nullptr;
     }
-    else
+    g_nameIndexBuilding = true;
+    g_nameIndexRefreshMs = now;
+    g_nameIndexThread = CreateThread(nullptr, 0, BuildNameIndexThread,
+        refresh ? reinterpret_cast<void*>(1) : nullptr, 0, nullptr);
+    if (!g_nameIndexThread)
     {
         g_nameIndexBuilding = false;
         LOG("Object name index thread create failed err=%lu", GetLastError());
     }
+}
+
+bool UE::WaitForObjectNameIndex()
+{
+    std::lock_guard<std::mutex> lock(g_nameThreadMutex);
+    if (!g_nameIndexThread) return true;
+    if (WaitForSingleObject(g_nameIndexThread, 5000) != WAIT_OBJECT_0) return false;
+    CloseHandle(g_nameIndexThread);
+    g_nameIndexThread = nullptr;
+    return true;
 }
 
 bool UE::TryGetFName(const char* shortName, FName& out)
@@ -976,7 +1094,7 @@ bool UE::TryGetFName(const char* shortName, FName& out)
 
         for (UObject* o : candidates)
         {
-            if (!Mem::IsReadable(o, Offsets::O_UObject_Name + (int)sizeof(FName)))
+            if (!IsLiveObject(o) || o->GetName() != shortName)
                 continue;
             FName fn = *o->NamePtr();
             // Only accept a Number==0 FName so the parameter name matches exactly

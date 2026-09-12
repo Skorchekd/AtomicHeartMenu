@@ -344,4 +344,165 @@ violations. Layered defenses:
 - This is what makes injecting at the **loading screen / menu** safe - if the renderer
   or object graph isn't ready, we skip our frame instead of taking the game down.
 
-**Eject** any time with **END**.
+**Eject** with **END** after closing Nora and disabling fly/noclip. Cleanup is
+queued on the verified game thread; an unsafe or unavailable cleanup defers eject.
+
+
+## September 2026 official-build investigation
+
+Steam build 24534183, image size 0x78F0000, UE 4.27.2-18319896.
+Fresh Dumper-7 captures (ignored `work/`):
+
+- `dump-2026-09-11`: main menu, 6471 ms.
+- `dump-world-2026-09-11`: loaded world, 12968 ms, automatic dumper unload.
+- GObjects RVA 0x06EC2BC0, GNames 0x070F7BC0, GWorld 0x070F43C0.
+- ProcessEvent RVA 0x02750AB0, vtable index 0x44.
+- FUObjectItem flags +0x08: native PlayOpenWorld checks PendingKill bit 29.
+  Object liveness also rejects BeginDestroyed/FinishDestroyed EObjectFlags.
+
+Native disassembly found shipping stubs at RVA 0x00F824B0 for DebugSubsystem
+ToggleFreeResources, ToggleNoRecipesRequires, UnlockAllSkills and ToggleDebugMenu.
+These dispatches cannot implement the advertised features. Workbench instead uses
+FInventoryData Amount (+0x30, stride 0x50) in DA_ItemBase.ItemsToCraft,
+WeaponUpgradeData.Price and SkillOwningConditionsForResources.PriceToBeOwned;
+TryToGiveAllSkillsInCategory on the current CharacterSkillsComponent; and the
+loaded WBP_MainMenuLevelSwitcher_C widget. Its GetIsShippingBuild override is
+restricted to the owned widget, preserving normal entitlement checks.
+
+Nora uses deferred Blueprint spawning, normal construction/BeginPlay,
+LoadItemsFromSettings, and polls AreItemsFromSettingsLoaded before Used. No
+synchronous wait or ToggleCraftWindow call is used. Voice and visual acceptance
+remain runtime tests; component presence alone does not prove audible playback.
+
+Free roam currently exposes native PlayOpenWorld, requiring an eligible save.
+There is no verified arbitrary campaign-to-sandbox transition. Hide objective is
+display-only and preserves the original tracked quest for restoration.
+
+### Local agent harness
+
+Disabled by default. Enable in Tests, or place `enable` in
+`AtomicHeartMenu.tests/enable.once` beside the DLL before a development injection.
+The marker is consumed once. Worker-thread file I/O and bounded game-thread
+observations run twice a second; normal feature execution remains on its existing
+thread. `status.json` is atomically replaced and carries protocol, session, PID,
+write/sample timestamps, accepted/processed IDs and observations. A stale sample
+timestamp means the game-thread pump stopped; it is not a passing result.
+
+Write a complete `command.txt` using an atomic rename. Format:
+`SESSION ID COMMAND VALUE` with an increasing positive ID and a finite number.
+Only the current session token is accepted. Limit 256 bytes. Commands:
+`observe`, `menu`, `nora_spawn`, `nora_use`, `nora_close`, `nora_choice` (1..6),
+`nora_remove`, `prices` (0..2), `skills_unlock`, `fly`, `noclip`,
+`fly_forward`, `fly_backward`, `fly_up`, `fly_down` (>0..2 seconds),
+`fly_return`, `turn` (-180..180 degrees), `streaming`, `squad_spawn`,
+`squad_recruit`, `squad_release`, `squad_aggressive`,
+`verify_offsets`, `snapshot`, `stage_open`, `stage_close`, `open_world`,
+`objective_hide`. Boolean controls take 0 or 1. Pulses require fly and a closed
+mod menu. No arbitrary console commands, process execution, memory writes or
+user-supplied paths are accepted. Dispatch acknowledgement is separate from
+observations. Price verification samples up to 64 lists; squad samples up to 32.
+
+Validation: Release builds pass. Live feature acceptance is pending and must
+cover companion movement/player safety, Nora construction/use/voice/close/remove,
+price change/restoration, skills, fly movement/restoration, and stage UI.
+
+### Live validation checkpoint and remaining work
+
+- `work/test-results/12-offsets-recheck.json` corresponds to the shared log's
+  29 matching member offsets / zero moved / Level.Actors unreflected, and all 13
+  parameter-frame checks passing. The mixed-navigation property names were fixed.
+- The portable Nora and two existing world fridges share `SK_CraftMachine`,
+  `ABP_CraftMachine_C`, `D_Craft`, `DA_Base_CraftMachine`, and `A_UI_Craft_Open`.
+  Mesh visibility is enabled and the animation instance is live. In-world dialogue
+  appeared and the game-thread heartbeat continued. This does not verify sound.
+- Construction collision mode 3 rejected Nora because her composite component
+  shapes overlap. Mode 2 permits engine adjustment. The latest source also checks
+  floor slope and line of sight using two bounded LineTraceSingle calls. These
+  new placement checks have compiled but have not yet run in game.
+- Blueprint `InScen` remained false during dialogue. The latest guard additionally
+  checks AHBaseCharacter.GetCurrentDialogComponent and the component's current
+  widget. Response controls call only that portable Nora widget's OnVariantNPressed
+  methods; StopDialog is an explicit close request. Never destroy an active Nora.
+- New calls validate reflected parameter element size, array dimension and frame
+  bounds. The harness observes mesh/animation presence, owned skill entry count,
+  and restored/skipped/mismatched price values. These additions await live reload.
+- Price scan reached 281 lists, with 64 sampled and zero mismatches; restoration
+  was dispatched and logged. Actual purchases and final restoration counts need
+  verification in the new build. Skill acquisition has not yet been exercised.
+- Fly moved upward in a short indoor test and restored walking mode and height
+  without a crash or health loss. Long-distance streaming/lighthouse reproduction
+  remains untested. Do not call that issue fully resolved from an indoor test.
+- RTSS overwrote a DXGI Present hook in one session. The compatibility resolver
+  follows an observed RTSS trampoline to its validated function entry, but a fresh
+  game restart with both overlays is still needed to validate coexistence.
+- Optional experimental Twin selector/factory RVAs 0x1B93A50 and 0x1CA06E0 fail
+  function-entry checks on this image and remain refused, not silently relocated.
+- Ground companion follow/player safety, full Nora craft/skill/voice lifecycle,
+  stage selector, and the revised sidebar still need live acceptance.
+
+For a staged build while the active DLL is locked, MSBuild supports an isolated
+`/p:OutDir=.../work/staging/` override. The client accepts `--directory` to select
+that DLL's harness directory. Its default remains `bin/AtomicHeartMenu.tests`.
+Do not inject a second copy while the current menu is loaded.
+
+
+### September 12 continuation: regular companions and Nora regressions
+
+Regular companion policy now lives in `src/features/bodyguards.cpp`. The
+`SpawnAndRegisterAlly` regular path was logging registration without calling it;
+it now registers before friendship/follow initialization. Hook Diagnostics remains
+on its separate controller. The simplified roster exposes Follow + defend,
+Follow only, Hold position and explicit attack; release controls on that page
+exclude Hook Bodyguards. Player and roster members are rejected as attack targets.
+The actual player's team is read back after conversion, and unconfirmed allegiance
+keeps combat/movement disabled. Native team-switch exec RVA 0x21D0E10 copies the
+other character's team for Friendly on build 24534183. Native movement, retaliation
+and damage acceptance still require a loaded-save test.
+
+The opt-in CMake `AHM_BUILD_TESTS` target `bodyguard_policy_tests` contains 28 fake
+engine policy checks, including autonomous target reacquisition during Hold and
+Follow only. Compilation succeeds; Windows Defender ASR rule
+01443614-CD74-433A-B99E-2ECDC07BFC25 blocked launching this executable. These tests
+have NOT passed execution yet and cannot substitute for native movement tests.
+
+Object lookup persists build-keyed `AtomicHeartMenu.cache/object-names.json`;
+crafting discovery persists `crafting.json`. Both cache names and index hints,
+never live pointers or engine-owned arrays. Identity validation precedes use;
+invalid/stale hints fall back to bounded worker discovery. File I/O stays off the
+game thread. Price application consumes bounded batches instead of rescanning the
+object array on the game thread. The name worker is joined before DLL unload.
+
+`Unlock recipe requirements` learns loaded recipe assets through
+AHInventory.AddItemsToInventory(asset,1). Reversed AHInventoryPlayer virtual +0x4A0
+(RVA 0x1EE87E0) handles category Recipe=10 by adding RecipeDataAsset to the saved
+PlayerItemsToCraft array. HasRecipeFor is checked before and after each grant;
+there is no arbitrary TArray replacement or display-only permission flag.
+This persists through the game's normal save behavior; disabling stops further
+grants and does not unlearn recipes. Runtime grants/purchases remain unverified.
+Harness commands now include recipes_unlock (0/1), squad_order (0 defend, 1 follow
+only, 2 hold), and weapon_rgb (0/1). Observations include regular_companions and
+recipe success/failure counts.
+
+RGB now traverses MaterialInstance parents and the root Material's
+CachedExpressionData.Parameters.RuntimeEntries[1].ParameterInfos. Live examples
+matched vector-value counts. It preserves layer/blend associations and calls
+SetVectorParameterValueByInfo; guessed names and non-colour vectors (hit locations,
+UV transforms) are excluded. Replaced material slots trigger rebuilding; restoration
+only touches slots still owned by the menu. Visible colour remains unverified.
+
+Nora weapon-menu hitches are NOT fixed by the cache changes alone. Captured in
+PID 1556: 10610 ms in BP_Base_CraftMachine_C.MultipleOptionUse while choosing the
+weapon response, and 9453 ms in WBP_CraftWindowMain_C.OnBackToPreviousMenu on exit.
+The deepest ProcessEvent timing still includes native work that does not dispatch
+through ProcessEvent. A real stalled-thread capture is still required; the earlier
+500 ms sampler threshold captured normal frames and is not root-cause evidence.
+Free costs were present in sampled live arrays; both native resource precheck
+0x1EEB900 and consumption 0x1EEB6A0 skip nonpositive amounts. Added native
+UpdateCraftItemCount refresh, but actual successful crafting still needs testing.
+
+The stage selector remains experimental. Its shipping query's native exec
+0x1A26110 returns true; a ProcessEvent-only override does not establish that native
+Blueprint VM calls are intercepted. The current process also lacks the loaded
+selector Blueprint. No arbitrary mission-free campaign transition is implemented.
+The desktop is locked and the current game is in MainMenuScene. Latest source
+build is in bin, not injected into PID 22048; runtime acceptance is pending.

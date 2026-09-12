@@ -209,15 +209,13 @@ The game-interaction layer depends on values that are unique to your exact game 
 These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
 - **God mode** - freezes incoming damage multiplier at `0`, tops health, clears `bIsDead`;
   disabling restores the captured incoming-damage and health attribute values.
-  If an old save/session already has the cheat value persisted, disabled state
-  normalizes the damage multiplier back to `1.0`
+  The disabled state preserves damage values owned by the current scene.
 - **One-hit kill** - boosts outgoing damage multiplier; disabling restores the
-  captured multiplier. If an old save/session already has the cheat value
-  persisted, disabled state normalizes it back to `1.0`
+  captured multiplier; the disabled state does not normalize story-owned values.
 - **Infinite stamina / energy / air** - tops GAS attribute values every frame;
   disabling restores the captured resource attribute values
 - **Fly** - `MOVE_Flying` plus manual camera-relative free-fly movement and
-  Atomic Heart streaming invalidation/update assist; disabling restores the
+  bounded Atomic Heart streaming assistance; disabling restores the
   captured movement mode and fly speed
 - **Noclip** - same free-fly movement as Fly plus
   `Function /Script/Engine.Actor.SetActorEnableCollision(false)` so the player
@@ -384,6 +382,66 @@ you can trigger from here once the SDK resolves.
   The three engine globals are handled for you where possible, and **Debug → Verify
   member offsets** checks the member layer against the running game - see "After a
   game patch" above.
-- To ship without the debug console, change `Log::Init(true)` to `false` in
-  `dllmain.cpp`.
-```
+- Logging uses the game-directory `AtomicHeartMenu.log`, with a temporary-directory
+  fallback. No console steals focus; the file supports live readers.
+
+
+## September 2026 release candidate (in development)
+
+Targets Steam build 24534183 / UE 4.27.2-18319896. Fresh main-menu and in-world
+Dumper-7 captures verified the global offsets. The changes below compile;
+in-game acceptance testing is still in progress. This is not a validated release.
+
+- Nora page: spawns the game's complete `BP_Base_CraftMachine_C`, preloads its
+  crafting assets, shows readiness, and starts its normal interaction. Move or
+  remove only the portable instance. Normal Nora assets must already be loaded.
+- Real crafting, weapon-upgrade and skill price data, with original prices
+  restored on request/eject. Skill grants use the character's real skill tree.
+  Purchases and acquired skills can persist with normal game saves.
+- Ground followers use a stop/start distance band and paced navigation requests.
+  Companions retain friendly allegiance while fighting. Idle hovering Twins
+  continue to receive follow navigation.
+- Fly movement runs on the verified game thread, requires a confirmed movement
+  mode transition, discards stale input, and sweeps collisions unless noclip is on.
+  Streaming assistance no longer repeatedly invalidates scripted volume state.
+- World page contains an experimental stage-selector request for the title main menu. It also
+  exposes the game's open-world continuation, which requires an eligible save.
+  Hiding the tracked objective only changes its display; campaign scripts continue.
+- END eject restores portable Nora, price data and the tracked objective on the
+  game thread. Close Nora and disable fly/noclip first. Logging stays in the file
+  without opening a console over the game.
+- Agent tests page provides an opt-in local agent harness with session-scoped commands,
+  observed positions, movement mode, ally targets, Nora state and sampled prices.
+  A dispatched command is not a passed test. See `PROJECT_AND_SDK.md` for protocol.
+
+The stage selector is implemented using the game's loaded Blueprint; no assets
+from the Nexus MainMenu Hidden Debug Menu mod are bundled.
+
+The menu now has a sidebar, larger text, and a text-scale control under Tools.
+Nora placement checks nearby floor and line of sight before construction. The
+portable dialogue exposes numbered response controls plus a close request. Its
+in-use guard covers dialogue as well as the crafting scene and blocks removal or
+eject while either remains active.
+
+Latest observed results: 29 reflected member offsets match, none moved, one
+unreflected Level field; all 13 checked call-frame sizes match. Nora spawned with
+the same mesh, animation, dialogue and opening-sound assets as two existing world
+fridges, and opened her dialogue without a stalled game thread. A short indoor
+fly test moved vertically and returned to walking without losing health. Price
+patching reached 281 lists, with no mismatches in the sampled 64 lists.
+
+The latest build is in `bin/AtomicHeartMenu.dll` and still needs live acceptance.
+The regular companion controller now has its own file, immediate spawn registration,
+verified team readback, and a simpler orders/roster page. Hook Bodyguards retain
+separate control. Recipe requirements can be unlocked by learning real recipes;
+these follow normal save persistence. Object names and crafting discovery now use
+build-keyed JSON caches. RGB reads actual inherited shader colour parameters and
+preserves material-layer associations.
+
+Known unresolved issues: Nora weapons entry/exit still needs a fix for measured
+10.61/9.45 second stalls. Successful crafting, native companion safety/movement,
+visible RGB, and the experimental stage selector need in-game verification. The
+world control requires an eligible post-game save; it is not a mission-free sandbox.
+Policy test compilation succeeds, but Windows ASR currently blocks execution.
+See the September 12 continuation in `PROJECT_AND_SDK.md` for exact evidence and
+pending checks. This is not a validated release.

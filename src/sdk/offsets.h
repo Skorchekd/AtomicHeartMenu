@@ -139,6 +139,7 @@ namespace Offsets
     constexpr int O_ObjArray_NumElements   = 0x14;
     constexpr int O_ObjArray_NumChunks     = 0x1C;
     constexpr int NumElementsPerChunk      = 64 * 1024;
+    constexpr int O_ObjectItem_Flags       = 0x08; // verified build 24534183, PlayOpenWorld
     constexpr int O_ObjectItem_Object      = 0x00; // UObject* inside FUObjectItem
     constexpr int SIZE_FUObjectItem        = 0x18;
 

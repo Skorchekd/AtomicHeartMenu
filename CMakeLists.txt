@@ -29,6 +29,9 @@ add_library(AtomicHeartMenu SHARED
     src/hooks/ai_movement_hooks.cpp
     src/menu/menu.cpp
     src/features/features.cpp
+    src/features/bodyguards.cpp
+    src/features/workbench.cpp
+    src/features/test_harness.cpp
     # --- Dear ImGui ---
     ${IMGUI}/imgui.cpp
     ${IMGUI}/imgui_draw.cpp
@@ -79,3 +82,11 @@ set_target_properties(injector PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_SOURCE_DIR}/bin"
 )
+
+option(AHM_BUILD_TESTS "Build isolated bodyguard policy tests" OFF)
+if(AHM_BUILD_TESTS)
+    enable_testing()
+    add_executable(bodyguard_policy_tests tests/bodyguard_policy_tests.cpp src/features/bodyguards.cpp)
+    target_compile_definitions(bodyguard_policy_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME bodyguard_policy COMMAND bodyguard_policy_tests)
+endif()

@@ -11,17 +11,21 @@
 // Additional terms (GPLv3 Section 7): you must preserve attribution to the author
 // (Skorchekd) and to Dumper-7 (Encryqed), MinHook (Tsuda Kageyu), and Dear ImGui
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
+#include "../features/test_harness.h"
 #include "menu.h"
 #include "../core/exception_guard.h"
 #include "../core/globals.h"
 #include "../core/log.h"
 #include "../features/features.h"
+#include "../features/workbench.h"
+#include "../features/bodyguards.h"
 #include "../hooks/native_hooks.h"
 #include "../hooks/ai_movement_hooks.h"
 #include "../sdk/ue4.h"
 #include "imgui.h"
 #include <Windows.h>
 #include <cfloat>
+#include <algorithm>
 #include <vector>
 #include <string>
 
@@ -168,252 +172,129 @@ namespace
     // ===================================================================
     void DrawAiTab(Features::State& f)
     {
-        // --- status strip ---------------------------------------------------
-        ImGui::TextColored(kAccent, "Enemies: %d", Features::AiCachedCount());
-        ImGui::SameLine(0, 16); ImGui::Text("Squad: %d", Features::AiSquadCount());
-        ImGui::SameLine(0, 16); ImGui::Text("Selected: %d", Features::AiSelectedCount());
-        int stream = Features::AiSpawnQueueCount();
-        if (stream > 0) { ImGui::SameLine(0, 16); ImGui::TextColored(kAccent, "Spawning: %d", stream); }
-        ImGui::SetNextItemWidth(-110.0f);
-        ImGui::SliderFloat("Radius (m)", &f.aiRadius, 10.0f, 300.0f, "%.0f");
+        ImGui::TextWrapped("Spawn a companion to follow and defend you. Orders affect selected companions, or all companions when none are selected.");
+        ImGui::Text("Companions: %d / 24   Selected: %d   Spawn queue: %d",
+            Features::AiSquadCount(), Features::AiSelectedCount(), Features::AiSpawnQueueCount());
 
-        ImGui::Spacing();
-
-        // --- ROSTER: nearby AI, select + recruit + dispatch -----------------
-        ImGui::SeparatorText("AI control  (select -> highlighted in-world)");
-        BeginCard("rostercard", 0);
+        int modelCount = Features::AiSpawnModelCount();
+        if (f.aiSpawnModel < 0 || f.aiSpawnModel >= modelCount) f.aiSpawnModel = 0;
+        ImGui::SetNextItemWidth(-175.0f);
+        if (ImGui::BeginCombo("##companionModel", modelCount ? Features::AiSpawnModelName(f.aiSpawnModel) : "No loaded AI models"))
         {
-            float third = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
-            if (ImGui::Button("Select all", ImVec2(third, 0))) Features::AiSelectAllNearby();
-            ImGui::SameLine();
-            if (ImGui::Button("Clear sel.", ImVec2(third, 0))) Features::AiClearSelection();
-            ImGui::SameLine();
-            if (AccentButton("Recruit sel.")) Features::AiRecruitSelected();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Recruited AI join your SQUAD: they walk-follow you and fight your\n"
-                                  "threats. This is the explicit recruit -- no auto-recruit toggle.");
+            for (int i = 0; i < modelCount; ++i)
+                if (ImGui::Selectable(Features::AiSpawnModelName(i), f.aiSpawnModel == i)) f.aiSpawnModel = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(modelCount == 0 || Features::AiSquadCount() >= 24);
+        if (ImGui::Button("Spawn companion", ImVec2(-FLT_MIN, 0))) Features::AiSpawnModel(f.aiSpawnModel);
+        ImGui::EndDisabled();
 
-            if (ImGui::Button("Recruit all nearby", ImVec2(third, 0))) Features::AiRecruitNearby();
-            ImGui::SameLine();
-            if (ImGui::Button("Attack >", ImVec2(third, 0))) Features::AiDispatchAttack();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Send the selected units (or whole squad) at the nearest enemy.");
-            ImGui::SameLine();
-            if (ImGui::Button("Kill sel.", ImVec2(-FLT_MIN, 0))) Features::AiDispatchKill();
+        ImGui::SeparatorText("Orders");
+        if (ImGui::Button("Follow + defend")) Features::AiOrderSelected(0);
+        ImGui::SameLine();
+        if (ImGui::Button("Follow only")) Features::AiOrderSelected(1);
+        ImGui::SameLine();
+        if (ImGui::Button("Hold position")) Features::AiOrderSelected(2);
+        ImGui::SameLine();
+        if (ImGui::Button("Attack nearest enemy")) Features::AiDispatchAttack();
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderFloat("Follow distance", &f.aiFollowStopM, 1.0f, 8.0f, "%.1f m");
+        ImGui::Checkbox("Keep companions alive", &f.aiInvincibleAllies);
 
-            if (ImGui::Button("Save selected to DB", ImVec2(-FLT_MIN, 0))) Features::AiSaveSelected();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Adds the selected units' character types to your saved model library\n"
-                                  "(below) so you can re-spawn them anywhere, anytime.");
-
-            ImGui::Spacing();
-            // scrollable nearby list with per-row select toggles
-            ImGui::BeginChild("ailist", ImVec2(0, 150), ImGuiChildFlags_Borders);
-            std::vector<Features::AiListEntry> list = Features::AiNearbyList(40);
-            if (list.empty())
-                ImGui::TextDisabled("No AI nearby (move closer to enemies).");
-            for (const Features::AiListEntry& e : list)
+        const auto guards = Bodyguards::Snapshot();
+        if (guards.empty()) ImGui::TextDisabled("No regular companions. Spawn one above or recruit a nearby robot below.");
+        if (ImGui::BeginTable("companionStatus", 4, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+        {
+            ImGui::TableSetupColumn("Select", ImGuiTableColumnFlags_WidthFixed, 45);
+            ImGui::TableSetupColumn("Companion");
+            ImGui::TableSetupColumn("State");
+            ImGui::TableSetupColumn("Team", ImGuiTableColumnFlags_WidthFixed, 110);
+            ImGui::TableHeadersRow();
+            const auto nearby = Features::AiNearbyList(128);
+            for (const auto& guard : guards)
             {
-                ImGui::PushID((int)(e.id & 0xFFFFFFFF));
-                bool sel = e.selected;
-                if (ImGui::Checkbox("##sel", &sel))
-                    Features::AiToggleSelect(e.id);
+                ImGui::PushID(reinterpret_cast<void*>(guard.id));
+                ImGui::TableNextRow(); ImGui::TableNextColumn();
+                bool selected = Features::AiIsSelected(guard.id);
+                if (ImGui::Checkbox("##select", &selected)) Features::AiToggleSelect(guard.id);
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s", guard.name.c_str());
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s (%.1f m)", guard.activity.c_str(), guard.distanceM);
+                ImGui::TableNextColumn();
+                ImGui::TextColored(guard.friendly ? ImVec4(.4f,.95f,.55f,1) : ImVec4(1,.65f,.2f,1),
+                    "%s", guard.friendly ? "Friendly" : "Unconfirmed");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Clear selection")) Features::AiClearSelection();
+        ImGui::SameLine();
+        if (ImGui::Button("Release selected")) Features::AiReleaseRegularCompanions(true);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restores their original AI and faction. Former enemies may attack again.");
+        ImGui::SameLine();
+        if (ImGui::Button("Release all")) Features::AiReleaseRegularCompanions(false);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restores regular companions' original AI and faction.");
+
+        if (ImGui::CollapsingHeader("Recruit nearby AI"))
+        {
+            ImGui::SetNextItemWidth(240);
+            ImGui::SliderFloat("Search radius", &f.aiRadius, 10, 300, "%.0f m");
+            if (ImGui::Button("Select nearby")) Features::AiSelectAllNearby();
+            ImGui::SameLine();
+            if (ImGui::Button("Recruit selected")) Features::AiRecruitSelected();
+            ImGui::BeginChild("nearbyRecruit", ImVec2(0,180), ImGuiChildFlags_Borders);
+            for (const auto& row : Features::AiNearbyList(64))
+            {
+                ImGui::PushID(reinterpret_cast<void*>(row.id));
+                bool selected = row.selected;
+                if (ImGui::Checkbox("##select", &selected)) Features::AiToggleSelect(row.id);
                 ImGui::SameLine();
-                // Delete = remove the actor from the game outright (K2_DestroyActor).
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
-                if (ImGui::SmallButton("Del")) Features::AiDeleteActor(e.id);
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Delete this actor from the world (gone, not just killed).");
-                ImGui::SameLine();
-                ImVec4 col = e.inSquad ? ImVec4(0.4f, 0.95f, 0.55f, 1.0f)
-                                       : ImVec4(0.85f, 0.87f, 0.9f, 1.0f);
-                ImGui::TextColored(col, "%-20s %4.0fm%s", e.name.c_str(), e.distanceM,
-                                   e.inSquad ? "  [squad]" : "");
+                ImGui::Text("%s   %.0f m%s", row.name.c_str(), row.distanceM, row.inSquad ? "  [companion]" : "");
                 ImGui::PopID();
             }
             ImGui::EndChild();
-
-            if (ImGui::Button("Stand down squad", ImVec2(third, 0)))      Features::AiReleaseSquad();
-            ImGui::SameLine();
-            if (ImGui::Button("Release selected", ImVec2(-FLT_MIN, 0)))   Features::AiReleaseSelected();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Turns them back into normal, KILLABLE enemies (forced hostile to\n"
-                                  "you through the engine -- no more 'stuck invincible after release').");
         }
-        ImGui::EndChild();
-
-        // --- SPAWN ----------------------------------------------------------
-        ImGui::SeparatorText("Spawn ally / boss");
-        BeginCard("spawncard", 0);
+        if (ImGui::CollapsingHeader("More models and saved characters"))
         {
-            int modelCount = Features::AiSpawnModelCount();
-            if (f.aiSpawnModel < 0 || f.aiSpawnModel >= modelCount) f.aiSpawnModel = 0;
-            const char* preview = modelCount > 0
-                ? Features::AiSpawnModelName(f.aiSpawnModel)
-                : "(no models loaded yet)";
-
-            ImGui::TextDisabled("Model (live, loaded enemy/boss types)");
+            static char search[128]{};
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##model", preview))
+            ImGui::InputTextWithHint("##modelSearch", "Search robot, character, or boss type", search, sizeof(search));
+            auto models = Features::AiSearchModels(search, 40);
+            ImGui::BeginChild("modelSearchResults", ImVec2(0,180), ImGuiChildFlags_Borders);
+            for (const auto& model : models)
             {
-                for (int i = 0; i < modelCount; ++i)
-                {
-                    bool sel = (f.aiSpawnModel == i);
-                    if (ImGui::Selectable(Features::AiSpawnModelName(i), sel))
-                        f.aiSpawnModel = i;
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            if (AccentButton(modelCount > 0 ? "Spawn selected model" : "Spawn (no models yet)"))
-            {
-                bool ok = Features::AiSpawnModel(f.aiSpawnModel);
-                LOG("UI: spawn model %d -> %s", f.aiSpawnModel, ok ? "queued" : "failed");
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Spawns the chosen LIVE class (incl. bosses like the Twins if loaded)\n"
-                                  "as a squad member. STREAMED one-at-a-time so it never freezes --\n"
-                                  "press a few times for a squad.");
-            if (ImGui::Button("Clone nearest enemy", ImVec2(-FLT_MIN, 0)))
-                Features::AiSpawnBodyguard();
-
-            ImGui::Spacing();
-            static int bossPreset = 0;
-            int bossPresetCount = Features::AiBossPresetCount();
-            if (bossPreset < 0 || bossPreset >= bossPresetCount) bossPreset = 0;
-            const char* bossPreview = bossPresetCount > 0 ? Features::AiBossPresetName(bossPreset) : "(no boss presets)";
-            ImGui::TextDisabled("Boss presets (base game + DLC)");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##bosspreset", bossPreview))
-            {
-                for (int i = 0; i < bossPresetCount; ++i)
-                {
-                    bool sel = bossPreset == i;
-                    if (ImGui::Selectable(Features::AiBossPresetName(i), sel)) bossPreset = i;
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            if (AccentButton("Spawn boss preset"))
-            {
-                bool ok = Features::AiSpawnBossPreset(bossPreset);
-                LOG("UI: spawn boss preset %d -> %s", bossPreset, ok ? "queued" : "failed");
-            }
-
-            // --- search + spawn ANY model in the whole game + DLC ----------
-            ImGui::Spacing();
-            ImGui::TextDisabled("Search ANY model (whole game + DLC, incl. bosses)");
-            static char modelSearch[64] = "";
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::InputTextWithHint("##modelsearch", "type to filter: twin, robot, larisa, mutant...",
-                                     modelSearch, sizeof(modelSearch));
-            std::vector<std::string> results = Features::AiSearchModels(modelSearch, 200);
-            ImGui::BeginChild("modellist", ImVec2(0, 160), ImGuiChildFlags_Borders);
-            if (results.empty())
-                ImGui::TextDisabled("Loading full asset list (first open takes a second)... then type to filter.");
-            for (int i = 0; i < (int)results.size(); ++i)
-            {
-                ImGui::PushID(5000 + i);
-                // Fixed-width Spawn button so the model NAME stays visible beside it
-                // (AccentButton fills the whole row -> name was hidden).
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.13f, 0.50f, 0.62f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.66f, 0.80f, 1.0f));
-                bool go = ImGui::Button("Spawn", ImVec2(64, 0));
-                ImGui::PopStyleColor(2);
-                if (go) Features::AiSpawnModelByName(results[i].c_str());
-                ImGui::SameLine();
-                ImGui::TextUnformatted(results[i].c_str());
+                ImGui::PushID(model.c_str());
+                if (ImGui::SmallButton("Spawn")) Features::AiSpawnModelByName(model.c_str());
+                ImGui::SameLine(); ImGui::TextUnformatted(model.c_str());
                 ImGui::PopID();
             }
             ImGui::EndChild();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Every character TYPE currently loaded -- spawns it as a bodyguard.\n"
-                                  "Combat vs non-combat is auto-detected (robots fight; civilians/Larisa\n"
-                                  "just follow), so it never crashes on a peaceful model.");
-        }
-        ImGui::EndChild();
-
-        // --- saved characters (spawn anywhere, no proximity) ----------------
-        ImGui::SeparatorText("Saved characters  (spawn anywhere)");
-        BeginCard("savedcard", 0);
-        {
-            static char saveName[64] = "";
-            ImGui::SetNextItemWidth(-96.0f);
-            ImGui::InputTextWithHint("##bgname", "name (optional)", saveName, sizeof(saveName));
-            ImGui::SameLine();
-            if (ImGui::Button("Save##nearest", ImVec2(-FLT_MIN, 0)))
+            if (ImGui::Button("Save selected models")) Features::AiSaveSelected();
+            auto saved = Features::AiSavedCharacterNames();
+            for (int i = 0; i < static_cast<int>(saved.size()); ++i)
             {
-                if (Features::AiSaveNearestCharacter(saveName)) saveName[0] = '\0';
-            }
-            std::vector<std::string> names = Features::AiSavedCharacterNames();
-            if (names.empty())
-                ImGui::TextDisabled("None yet. Stand near an enemy and Save.");
-            for (int i = 0; i < (int)names.size(); ++i)
-            {
-                ImGui::PushID(1000 + i);
-                if (ImGui::Button("Spawn")) Features::AiSpawnSavedCharacter(i);
-                ImGui::SameLine();
-                if (ImGui::Button("X")) { Features::AiDeleteSavedCharacter(i); ImGui::PopID(); break; }
-                ImGui::SameLine();
-                ImGui::TextUnformatted(names[i].c_str());
+                ImGui::PushID(i);
+                if (ImGui::SmallButton("Spawn saved")) Features::AiSpawnSavedCharacter(i);
+                ImGui::SameLine(); ImGui::TextUnformatted(saved[i].c_str());
                 ImGui::PopID();
             }
-            ImGui::TextDisabled("Loads the type on demand -- no need to be near it.");
+            ImGui::TextWrapped("Some encounter-specific bosses require their original level setup. A queued spawn is not a compatibility guarantee.");
         }
-        ImGui::EndChild();
-
-        // --- settings + crowd control ---------------------------------------
-        ImGui::SeparatorText("Settings");
-        BeginCard("setcard", 0);
+        if (ImGui::CollapsingHeader("World AI controls"))
         {
-            LogCheckbox("Invincible squad (keep them alive)", &f.aiInvincibleAllies, "aiInvincibleAllies");
-            LogCheckbox("Squad fights for you (obliterate threats)", &f.aiSquadAggressive, "aiSquadAggressive");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("ON (default): combat-capable guards force-attack nearby enemies with\n"
-                                  "massively boosted damage. Non-combat NPCs (Larisa, civilians) are\n"
-                                  "auto-detected and just follow -- no crash. Your guards NEVER attack\n"
-                                  "you, even if you shoot them. OFF: peaceful followers (no fighting).");
-            ImGui::SetNextItemWidth(-140.0f);
-            ImGui::SliderFloat("Follow stop dist (m)", &f.aiFollowStopM, 0.5f, 8.0f, "%.1f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("How close squad members stop behind you. They path-follow smoothly\n"
-                                  "and stop cleanly at this distance (no circling). 1.0-1.5 = tight.");
-            LogCheckbox("Allow teleport (only if a member gets stuck)", &f.aiAllowTeleport, "aiAllowTeleport");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Off (default): squad members WALK to you with real locomotion.\n"
-                                  "On: if one can't path (nav hole) and stops making progress, it snaps.");
-            LogCheckbox("Enemies fight each other", &f.aiFightEachOther, "aiFightEachOther");
-            LogCheckbox("Freeze nearby AI", &f.aiFreezeNearby, "aiFreezeNearby");
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("Zone respawn:");
-            float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
-            if (ImGui::Button("Snapshot zone", ImVec2(half, 0))) Features::AiSnapshotZone();
+            ImGui::Checkbox("Freeze nearby enemies", &f.aiFreezeNearby);
+            ImGui::Checkbox("Enemies fight each other", &f.aiFightEachOther);
+            ImGui::Checkbox("Recover stuck companions by teleporting", &f.aiAllowTeleport);
+            if (ImGui::Button("Kill selected")) Features::AiDispatchKill();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Kills selected units. Does not delete actor objects.");
             ImGui::SameLine();
-            if (ImGui::Button("Respawn zone", ImVec2(-FLT_MIN, 0))) Features::AiRespawnZone();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Snapshot records the current enemies; Respawn brings that whole set\n"
-                                  "back (as your allies) -- e.g. after you've cleared the area.");
-            ImGui::Text("Snapshot: %d type(s)", Features::AiZoneSnapshotCount());
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("Whole level:");
-            if (ImGui::Button("KILL ALL", ImVec2(half, 0)))     Features::AiQueueKillAll();
+            if (ImGui::Button("Kill nearby enemies")) Features::AiQueueKillNearby();
+            if (ImGui::Button("Snapshot enemies")) Features::AiSnapshotZone();
             ImGui::SameLine();
-            if (ImGui::Button("LAUNCH ALL", ImVec2(-FLT_MIN, 0))) Features::AiQueueLaunchAll();
-            if (ImGui::Button("KILL ALL (deep sweep)", ImVec2(-FLT_MIN, 0))) Features::AiKillAllDeep();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Sweeps EVERY object for live enemies -- catches the rare attacker\n"
-                                  "the normal scan misses (the 'unkillable, still attacking' one that\n"
-                                  "regular Kill All can't reach). Use this if an enemy won't die.");
+            if (ImGui::Button("Respawn snapshot as companions")) Features::AiRespawnZone();
         }
-        ImGui::EndChild();
     }
 
-    // ===================================================================
-    //  HORDE ROUNDS tab -- arena wave survival vs HOSTILE, killable robots.
-    // ===================================================================
     void DrawHordeTab(Features::State& f)
     {
         const bool active = Features::HordeIsActive();
@@ -941,7 +822,17 @@ void Menu::Render()
     auto& f = Features::Get();
 
     static bool themed = false;
-    if (!themed) { ApplyTheme(); themed = true; }
+    static float uiScale = 1.0f;
+    if (!themed)
+    {
+        ApplyTheme();
+        const float height = ImGui::GetIO().DisplaySize.y;
+        uiScale = height >= 1300 ? 1.25f : 1.0f;
+        ImGui::GetStyle().ScaleAllSizes(uiScale);
+        ImGui::GetStyle().FontSizeBase = 17.0f;
+        ImGui::GetStyle().FontScaleMain = uiScale;
+        themed = true;
+    }
 
     // --- always-on overlay (coords / status), independent of the window -----
     if (f.showCoords && G::sdkReady.load())
@@ -959,19 +850,36 @@ void Menu::Render()
 
     if (!G::menuOpen.load()) return;
 
-    ImGui::SetNextWindowSize(ImVec2(560, 640), ImGuiCond_FirstUseEver);
-    ImGui::Begin("ATOMIC  -  internal menu   [INSERT]", nullptr, ImGuiWindowFlags_NoCollapse);
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(ImVec2((std::min)(960.0f * uiScale, display.x - 40),
+        (std::min)(740.0f * uiScale, display.y - 40)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(660, 460), ImVec2(display.x, display.y));
+    if (!ImGui::Begin("ATOMIC HEART  |  Menu###AtomicHeartMenu", nullptr, ImGuiWindowFlags_NoCollapse))
+    { ImGui::End(); return; }
 
     // SDK status pill
     if (G::sdkReady.load())
-        ImGui::TextColored(ImVec4(0.40f, 0.95f, 0.55f, 1.0f), "* SDK resolved   (%d objects)", UE::NumObjects());
+        ImGui::TextColored(ImVec4(0.40f, 0.95f, 0.55f, 1.0f), "Connected  |  %d loaded objects", UE::NumObjects());
     else
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.40f, 1.0f), "* SDK NOT resolved  -  check offsets.h");
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.40f, 1.0f), "Waiting for the game connection. Details are available in Diagnostics.");
     ImGui::Separator();
 
-    if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_FittingPolicyScroll))
+    static int page = 0;
+    static const char* pages[] = { "Player", "Weapons", "AI / Squad", "Horde Rounds", "Nora", "World",
+        "Visuals", "Rendering", "Tools", "Agent tests", "Diagnostics", "Hook diagnostics" };
+    const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+    ImGui::BeginChild("navigation", ImVec2(174 * uiScale, -footer), true);
+    for (int i = 0; i < IM_ARRAYSIZE(pages); ++i)
     {
-        if (ImGui::BeginTabItem("Player"))
+        if (i == 9) { ImGui::Spacing(); ImGui::SeparatorText("Development"); }
+        if (ImGui::Selectable(pages[i], page == i, 0, ImVec2(0, 25 * uiScale))) page = i;
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("feature_content", ImVec2(0, -footer), true);
+    ImGui::PushID(page);
+    {
+        if (page == 0)
         {
             ImGui::SeparatorText("Survival");
             LogCheckbox("God mode (zero incoming damage)", &f.godMode, "godMode");
@@ -1005,10 +913,9 @@ void Menu::Render()
             ImGui::SliderFloat("Scale", &f.playerScale, 0.2f, 8.0f, "%.2f");
             if (ImGui::IsItemDeactivatedAfterEdit())
                 LOG("UI: playerScale -> %.2f", f.playerScale);
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Weapons"))
+        if (page == 1)
         {
             ImGui::SeparatorText("Give weapon");
             static int selectedWeapon = 0;
@@ -1066,23 +973,88 @@ void Menu::Render()
                 Features::MaxWeaponUpgrades();
             }
             ImGui::TextDisabled("Calls BaseWeapon.FullUpgrade on the equipped weapon.\nSwitch weapon and press again to max each.");
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("AI / Squad"))
+        if (page == 2)
         {
             DrawAiTab(f);
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Horde Rounds"))
+        if (page == 3)
         {
             DrawHordeTab(f);
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("World"))
+        if (page == 4)
         {
+            auto state = Workbench::GetStatus();
+            ImGui::SeparatorText("Portable Nora");
+            ImGui::TextWrapped("The game's full Nora Blueprint, with its own animation, sound and interaction components.");
+            ImGui::TextColored(state.noraReady ? ImVec4(0.3f, 0.9f, 0.6f, 1) : ImVec4(0.9f, 0.7f, 0.3f, 1),
+                "%s", state.noraInUse ? "IN USE" : state.noraReady ? "READY" : state.noraPresent ? "INITIALIZING" : "NOT SPAWNED");
+            ImGui::BeginDisabled(state.busy);
+            ImGui::BeginDisabled(state.noraInUse);
+            if (ImGui::Button(state.noraPresent ? "Move Nora nearby" : "Spawn Nora nearby")) Workbench::SpawnNora();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!state.noraPresent || state.noraInUse);
+            if (ImGui::Button("Remove portable Nora")) Workbench::RemoveNora();
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(!state.noraReady || state.noraInUse);
+            if (ImGui::Button("Use Nora")) Workbench::UseNora();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!state.noraInUse);
+            if (ImGui::Button("Close Nora dialogue")) Workbench::CloseNoraDialogue();
+            ImGui::EndDisabled();
+            if (state.noraInUse && ImGui::TreeNode("Dialogue response controls"))
+            {
+                ImGui::TextWrapped("Choose the numbered response currently shown by the game.");
+                for (int choice = 1; choice <= 6; ++choice)
+                {
+                    ImGui::PushID(choice);
+                    if (choice > 1) ImGui::SameLine();
+                    if (ImGui::Button(std::to_string(choice).c_str())) Workbench::ChooseNoraResponse(choice);
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
+            }
+            ImGui::TextWrapped("Spawn in a clear, level space. You can also interact with her normally using F.");
+            ImGui::SeparatorText("Crafting and skills");
+            static float priceScale = 1.0f;
+            ImGui::SliderFloat("Cost multiplier", &priceScale, 0.0f, 2.0f, "%.2fx");
+            if (ImGui::Button("Apply prices")) Workbench::SetPrices(priceScale);
+            ImGui::SameLine();
+            if (ImGui::Button("Free crafting and skills")) { priceScale = 0; Workbench::SetPrices(0); }
+            if (ImGui::Button("Restore original prices")) { priceScale = 1; Workbench::SetPrices(1); }
+            ImGui::Text("Applied %.2fx to %d price lists", state.priceMultiplier, state.pricesChanged);
+            if (state.scanPercent < 100) ImGui::ProgressBar(state.scanPercent / 100.0f, ImVec2(-1, 0), "Scanning loaded assets");
+            ImGui::TextWrapped("Includes crafting, weapon upgrades and skill costs. Reopen crafting after applying. Purchases and skill unlocks follow the game's normal save behavior.");
+            bool recipes = state.unlockRecipes;
+            if (ImGui::Checkbox("Unlock recipe requirements", &recipes)) Workbench::SetRecipeUnlocks(recipes);
+            ImGui::Text("Recipes learned: %d   Failed: %d", state.recipesLearned, state.recipeFailures);
+            ImGui::TextWrapped("Learns recipes as their assets load. Learned recipes remain in your save after this option is disabled.");
+            if (ImGui::Button("Unlock all skills")) Workbench::UnlockSkills();
+            ImGui::EndDisabled();
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", state.message.c_str());
+        }
+
+        if (page == 5)
+        {
+            ImGui::SeparatorText("Stages and free roam");
+            const auto worldStatus = Workbench::GetStatus();
+            ImGui::BeginDisabled(worldStatus.busy);
+            if (ImGui::Button("Stage selector (experimental)")) Workbench::ToggleDebugMenu();
+            ImGui::SameLine();
+            if (ImGui::Button("Close stage selector")) Workbench::CloseDebugMenu();
+            if (ImGui::Button("Continue open-world save")) Workbench::ContinueOpenWorld();
+            ImGui::TextWrapped("Use these controls from the title main menu. Stage selection is not yet verified in this shipping build. Open-world continuation requires an eligible post-game save and does not remove campaign objectives.");
+            bool hidden = worldStatus.objectiveHidden;
+            if (ImGui::Checkbox("Hide tracked objective", &hidden)) Workbench::SetObjectiveHidden(hidden);
+            ImGui::TextDisabled("Objective display only; mission scripts continue in campaign saves.");
+            ImGui::EndDisabled();
+            ImGui::TextWrapped("%s", worldStatus.message.c_str());
             LogCheckbox("Show coordinates", &f.showCoords, "showCoords");
             float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
             if (ImGui::Button("Save position", ImVec2(half, 0))) Features::SavePosition();
@@ -1102,10 +1074,9 @@ void Menu::Render()
                                   "many times faster than everything else.");
             ImGui::SetNextItemWidth(-110.0f);
             ImGui::SliderFloat("World speed", &f.bulletTimeScale, 0.05f, 1.0f, "%.2f");
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Visuals"))
+        if (page == 6)
         {
             ImGui::SeparatorText("Camera");
             LogCheckbox("Custom FOV", &f.customFov, "customFov");
@@ -1153,15 +1124,14 @@ void Menu::Render()
             ImGui::SameLine();
             LogCheckbox("Rainbow##wpn", &f.weaponRgbRainbow, "weaponRgbRainbow");
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Drives RGB on dynamic instances of the equipped weapon materials.\n"
-                                  "Texture-locked slots use a simple forced parent, and original\n"
-                                  "materials are restored when disabled or when the weapon changes.");
+                ImGui::SetTooltip("Recolors actual shader colour parameters, including inherited materials and layers.\n"
+                                  "Original materials are restored when disabled or when the weapon changes.");
+            if (f.weaponRgb) ImGui::Text("Shader colour parameters: %d", Features::WeaponColorParameterCount());
             if (!f.weaponRgbRainbow)
                 ImGui::ColorEdit3("Gun color", f.weaponRgbColor, ImGuiColorEditFlags_NoInputs);
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Render"))
+        if (page == 7)
         {
             ImGui::SeparatorText("World / sky color");
             LogCheckbox("Tint world lights (RGB sky)", &f.worldTint, "worldTint");
@@ -1228,11 +1198,12 @@ void Menu::Render()
             Cmd("Stat Unit",  "stat unit");             ImGui::SameLine();
             Cmd("Hi-res shot","HighResShot 2");
             ImGui::TextDisabled("Most 'show'/'viewmode' commands toggle -- press again to revert.");
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Misc"))
+        if (page == 8)
         {
+            ImGui::SeparatorText("Readability");
+            ImGui::SliderFloat("Text scale", &ImGui::GetStyle().FontScaleMain, 0.9f, 1.75f, "%.2fx");
             ImGui::SeparatorText("Puzzles");
             LogCheckbox("Instant puzzle resolve", &f.instantPuzzleResolve, "instantPuzzleResolve");
             if (ImGui::IsItemHovered())
@@ -1270,10 +1241,14 @@ void Menu::Render()
                 Features::CompleteActiveQuests();
             }
             ImGui::TextDisabled("Drives the game's own quest debug -- skips objective gates / blockers.");
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Debug"))
+        if (page == 9)
+        {
+            TestHarness::Draw();
+        }
+
+        if (page == 10)
         {
             ImGui::TextWrapped("Confirm the SDK is wired, then find classes/functions to cheat on.");
             ImGui::Spacing();
@@ -1375,19 +1350,20 @@ void Menu::Render()
                 LOG("UI: dump nearby volumes");
                 Features::DumpNearbyVolumes();
             }
-            ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Hook Diagnostics"))
+        if (page == 11)
         {
             RenderHookTestingTab();
-            ImGui::EndTabItem();
         }
 
-        ImGui::EndTabBar();
     }
 
+    ImGui::PopID();
+    ImGui::EndChild();
     ImGui::Separator();
-    ImGui::TextDisabled("Single-player only.  Eject with END.");
+    ImGui::TextDisabled("INSERT  Show / hide     END  Restore and eject");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Close menu")) G::menuOpen = false;
     ImGui::End();
 }

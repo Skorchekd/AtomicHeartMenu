@@ -249,9 +249,9 @@ namespace Scanner
         return false;
     }
 
-    bool IsFunctionEntry(const void* address)
+    bool IsFunctionEntry(const void* address, bool requireGameImage)
     {
-        if (!IsExecutableAddress(address, 1))
+        if (requireGameImage ? !IsExecutableAddress(address, 1) : !Mem::IsExecutable(address, 1))
             return false;
         DWORD64 imageBase = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(

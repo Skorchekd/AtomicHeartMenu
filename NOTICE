@@ -58,3 +58,8 @@ under its own license, which is compatible with the GPL.
 Atomic Heart is a trademark of Mundfish. This project is an unofficial,
 non-commercial fan tool and is not affiliated with, endorsed by, or supported by
 Mundfish.
+
+4. JSON for Modern C++ 3.11.3 - https://github.com/nlohmann/json
+   Copyright (c) 2013-2023 Niels Lohmann
+   License: MIT (see deps/nlohmann/LICENSE.txt)
+   Role: validated JSON caches and structured diagnostics.

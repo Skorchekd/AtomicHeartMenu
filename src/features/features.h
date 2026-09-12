@@ -14,6 +14,7 @@
 #pragma once
 #include "../sdk/ue4.h"
 #include <cstddef>
+#include <functional>
 #include <vector>
 #include <string>
 
@@ -209,6 +210,10 @@ namespace Features
     // (which would run a spawn off the game thread -> the AnimInstance token-stream
     // fatal). Authoritative + immediate, so the very first spawn lands correctly.
     void NoteGameThread();
+    std::string TestSnapshotJson(); // game-thread observation; no mutation
+    bool TestTurn(float degrees);
+    bool TestFlyPulse(int axis, float seconds); // bounded input through normal fly path
+    bool PrepareUnload(); // waits for game-thread restoration; refuses unsafe eject
 
     // Render-thread: project the cached enemy list for the given screen size.
     // Returns a reference to an internal buffer (single-threaded render use).
@@ -272,11 +277,15 @@ namespace Features
     void AiSelectAllNearby();
     void AiClearSelection();
     int  AiSelectedCount();
+    bool AiIsSelected(unsigned long long id);
+    int WeaponColorParameterCount();
     void AiRecruitSelected();     // selected -> squad
     void AiRecruitNearby();       // all nearby -> squad
     void AiSaveSelected();        // save selected units' classes to the model DB (json)
     void AiReleaseSelected();     // selected -> normal killable enemies
     void AiReleaseSquad();        // whole squad -> normal killable enemies
+    void AiOrderSelected(int order); // 0 follow/defend, 1 follow only, 2 hold
+    void AiReleaseRegularCompanions(bool selectedOnly); // leaves Hook Bodyguards untouched
     void AiDispatchAttack();      // selected (or squad) attack your aim/nearest enemy
     void AiDispatchKill();        // selected (or squad) die
     // Zone respawn: snapshot the current enemies, respawn that set later.
@@ -371,6 +380,7 @@ namespace Features
     void     HookTwinAnimCombatPose(bool aggressive);
 
     void MaxWeaponUpgrades();     // BaseWeapon::FullUpgrade on the current weapon
+    bool QueueGameAction(std::function<void()> action); // bounded, verified game-thread dispatch
     void RunConsoleCommand(const char* command); // queue a console command to the game thread
     // Spawn model dropdown = the LIVE enemy classes currently loaded (deduped),
     // so every entry is guaranteed safe to spawn. Refreshed ~1/sec internally.

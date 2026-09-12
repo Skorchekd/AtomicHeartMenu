@@ -12,6 +12,9 @@
 // (Skorchekd) and to Dumper-7 (Encryqed), MinHook (Tsuda Kageyu), and Dear ImGui
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
 #include "features.h"
+#include "bodyguards.h"
+#include "workbench.h"
+#include "test_harness.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
 #include "../sdk/scanner.h"
@@ -31,6 +34,7 @@
 #include <vector>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -247,6 +251,9 @@ namespace
     std::mutex                g_gtQueueMutex;
     std::vector<std::function<void()>> g_gtQueue;
     std::atomic<bool>         g_gtHasWork{ false };
+    std::atomic<bool>         g_preparingUnload{ false };
+    std::atomic<int> g_testFlyAxis{0};
+    std::atomic<ULONGLONG> g_testFlyUntil{0};
     thread_local int          t_peDepth = 0; // ProcessEvent nesting depth on this thread
     // Squad size mirror -- declared up here (not with the rest of the squad state lower
     // down) because hkProcessEvent gates the per-frame squad walk on it.
@@ -458,6 +465,8 @@ namespace
             }
         }
 
+        if (Workbench::FilterProcessEvent(obj, fn, params)) return;
+
         // Track real death events globally so stale cached corpses never remain threats.
         if (fn && obj)
         {
@@ -539,7 +548,7 @@ namespace
         // AIUtils.AreFriendlyCharacters UFunction is uniquely resolved by SDK
         // metadata; ReVa confirms its native exec thunk at RVA 0x225BDA0. We
         // intercept only this dispatch and only for player <-> managed guard.
-        if (g_hookBodyguardMode.load(std::memory_order_relaxed) && fn && params)
+        if (g_ownershipLock.load(std::memory_order_relaxed) && fn && params)
         {
             bool force = false;
             try { force = HookFriendshipShouldForce(fn, params); } catch (...) { force = false; }
@@ -554,6 +563,13 @@ namespace
         try { DiagnosticTraceProcessEvent(obj, fn, params); } catch (...) {}
 
         unsigned long tid = GetCurrentThreadId();
+        // UE also dispatches reflected functions on async workers. Only the
+        // thread owning our game window may run gameplay mutations.
+        DWORD windowThread = G::hGameWindow
+            ? GetWindowThreadProcessId(static_cast<HWND>(G::hGameWindow), nullptr) : 0;
+        bool onGameThread = windowThread != 0 && tid == windowThread;
+        if (onGameThread)
+            g_gameThreadId.store(windowThread);
 
         // Per-frame squad FOLLOW, on the GAME thread. We DON'T move the body ourselves
         // (no drag/teleport/velocity write -- those all looked like "dogshit gliding").
@@ -566,7 +582,7 @@ namespace
         // (the BT re-reads the keys continuously, so this rate is plenty and stays light).
         {
             unsigned long gtid = g_gameThreadId.load();
-            if (outermost && gtid != 0 && tid == gtid && g_spawnedAllyCount.load() > 0)
+            if (!g_preparingUnload.load() && outermost && onGameThread && gtid != 0 && tid == gtid && g_spawnedAllyCount.load() > 0)
             {
                 static ULONGLONG lastDriveMs = 0;
                 ULONGLONG nowMs = GetTickCount64();
@@ -591,34 +607,12 @@ namespace
             }
         }
 
-        if (outermost && g_gtHasWork.load() && tid != g_renderThreadId.load() &&
+        if (outermost && onGameThread && g_gtHasWork.load() &&
             !PeDispatchingOnAi(obj))
         {
-            // Latch onto the first safe non-render thread we see (the game thread:
-            // UFunction dispatch is game-thread-only in UE4) and never switch.
-            unsigned long expected = 0;
-            g_gameThreadId.compare_exchange_strong(expected, tid);
             static std::atomic<bool> reported{ false };
             if (!reported.exchange(true))
-            {
-                // The latch above assumes the first thread to reach a safe
-                // ProcessEvent callsite is the game thread, but UE also dispatches
-                // UFunctions from task-graph and async-loading workers. The thread
-                // owning the game window is the one that really is.
-                DWORD windowThread = G::hGameWindow
-                    ? GetWindowThreadProcessId(static_cast<HWND>(G::hGameWindow), nullptr) : 0;
-                unsigned long latched = g_gameThreadId.load();
-                // Absent window handle reports UNKNOWN, not MISMATCH: a false
-                // "wrong" here is worse than no line at all.
-                LOG("Game-thread pump: draining on tid=%lu, latched=%lu, window (game) thread=%lu -> %s",
-                    tid, latched, windowThread,
-                    !windowThread
-                        ? "UNKNOWN -- no game window handle yet, cannot compare"
-                        : (latched == windowThread
-                            ? "MATCH"
-                            : "MISMATCH -- tasks are draining on a worker, not the game thread"));
-            }
-            if (tid == g_gameThreadId.load())
+                LOG("Game-thread pump: verified window thread tid=%lu", windowThread);
             {
                 // Drain at most a few tasks per safe callsite so a pile-up never does
                 // all the heavy work (e.g. several spawns) in ONE frame -> the game
@@ -639,7 +633,24 @@ namespace
                 for (auto& task : tasks) { try { task(); } catch (...) {} }
             }
         }
+        const ULONGLONG dispatchStart = onGameThread ? GetTickCount64() : 0;
         oProcessEvent(obj, fn, params);
+        if (dispatchStart)
+        {
+            const ULONGLONG elapsed = GetTickCount64() - dispatchStart;
+            if (elapsed >= 100)
+            {
+                try
+                {
+                    UObject* object = reinterpret_cast<UObject*>(obj);
+                    UObject* function = reinterpret_cast<UObject*>(fn);
+                    LOG("[HITCH] ProcessEvent %llums depth=%d object=%s function=%s", elapsed, t_peDepth,
+                        IsLiveObject(object) ? object->GetFullName().c_str() : "destroyed",
+                        IsLiveObject(function) ? function->GetFullName().c_str() : "unavailable");
+                }
+                catch (...) {}
+            }
+        }
     }
 
     bool InstallProcessEventHook()
@@ -666,14 +677,14 @@ namespace
         }
         void* target = vt[Offsets::VFUNC_PROCESSEVENT];
         // MinHook would otherwise read the prologue out of whatever data lives there.
-        if (!Mem::IsExecutable(target, 1))
+        if (!Mem::IsExecutable(target, 1) || !Scanner::IsFunctionEntry(target))
         {
-            LOG("ProcessEvent hook: target %p not executable", target);
+            LOG("ProcessEvent hook: target %p is not a verified function entry", target);
             return false;
         }
 
         MH_STATUS c = MH_CreateHook(target, reinterpret_cast<void*>(&hkProcessEvent), reinterpret_cast<void**>(&oProcessEvent));
-        if (c != MH_OK && c != MH_ERROR_ALREADY_CREATED)
+        if (c != MH_OK || !oProcessEvent)
         {
             LOG("ProcessEvent hook: MH_CreateHook failed %d", c);
             return false;
@@ -682,6 +693,8 @@ namespace
         if (e != MH_OK && e != MH_ERROR_ENABLED)
         {
             LOG("ProcessEvent hook: MH_EnableHook failed %d", e);
+            MH_RemoveHook(target);
+            oProcessEvent = nullptr;
             return false;
         }
         g_peTarget = target;
@@ -692,6 +705,7 @@ namespace
     void QueueGameThread(std::function<void()> fn)
     {
         std::lock_guard<std::mutex> lk(g_gtQueueMutex);
+        if (g_preparingUnload.load() || g_gtQueue.size() >= 128) return;
         g_gtQueue.push_back(std::move(fn));
         g_gtHasWork = true;
     }
@@ -1331,7 +1345,7 @@ namespace
         return false;
     }
 
-    bool SetActorLocation(UObject* actor, const FVector& loc, bool logFailure)
+    bool SetActorLocation(UObject* actor, const FVector& loc, bool logFailure, bool sweep = false)
     {
         UFunction* setLoc = CachedFn(AH::Fn_SetActorLocation);
         if (!actor || !setLoc)
@@ -1343,7 +1357,7 @@ namespace
 
         P_SetActorLocation p{};
         p.NewLocation = loc;
-        p.bSweep = false;
+        p.bSweep = sweep;
         p.bTeleport = true;
         actor->ProcessEvent(setLoc, &p);
 
@@ -1494,9 +1508,8 @@ namespace
         if (!subsystem || !fn)
             return false;
 
-        P_BoolParam p{ true }; // bUpdateStreamingVolumes
-        subsystem->ProcessEvent(fn, &p);
-        return true;
+        P_BoolParam p{ false }; // preserve scripted streaming-volume state
+        return subsystem->ProcessEvent(fn, &p);
     }
 
     UObject* ResolveDebugSubsystem()
@@ -2084,12 +2097,15 @@ namespace
             for (UObject* s : g_spawnedAllies) if (s == ai) return;
             if ((int)g_spawnedAllies.size() >= kMaxSpawnedAllies)
             {
-                evicted = g_spawnedAllies.front();
-                g_spawnedAllies.erase(g_spawnedAllies.begin());
+                LOG("Squad is full; existing companions retain ownership.");
+                return;
             }
             g_spawnedAllies.push_back(ai);
             g_spawnedAllyCount = (int)g_spawnedAllies.size();
         }
+        // Regular recruits need the same player-target protection as debug guards.
+        // Resolve outside the roster lock: ProcessEvent may consult this roster.
+        Features::SetOwnershipLock(true);
         if (evicted)
             QueueGameThread([evicted]()
             {
@@ -2102,6 +2118,7 @@ namespace
     // the world so the follow drive stops poking a dead pointer.
     void SquadRemove(UObject* ai)
     {
+        Bodyguards::Forget(ai);
         {
             std::lock_guard<std::mutex> lk(g_squadMutex);
             for (size_t i = 0; i < g_spawnedAllies.size(); ++i)
@@ -2132,42 +2149,38 @@ namespace
         void* fSwitch = g_fnOwnSwitchTeamAttitude.load(std::memory_order_relaxed);
         void* fEnemyC = g_fnOwnSetTargetEnemy.load(std::memory_order_relaxed);
         void* fEnemyB = g_fnOwnSetBbTargetEnemy.load(std::memory_order_relaxed);
-        if (fn != fSwitch && fn != fEnemyC && fn != fEnemyB)
-            return false;                       // cheap reject (the hot path)
-        if (!Mem::IsReadable(params, 0x10))
+        void* fAggressive = g_fnHookSetCharacterAggressive.load(std::memory_order_relaxed);
+        if (fn != fSwitch && fn != fEnemyC && fn != fEnemyB && fn != fAggressive)
             return false;
-
-        UObject* o = reinterpret_cast<UObject*>(obj);
-        bool owned = IsHookBodyguard(o);
-        if (!owned)
+        auto managed = [](UObject* actor)
         {
-            UObject* pawn = OwnershipControllerPawn(obj); // obj may be the controller
-            owned = pawn && IsHookBodyguard(pawn);
-        }
-        if (!owned)
-            return false;                       // never touch AI we do not own
-
-        UObject* player = UE::GetLocalPawn();
-        auto isUs = [&](void* x) -> bool {
-            return x && (x == player || IsHookBodyguard(reinterpret_cast<UObject*>(x)));
+            return actor && IsLiveObject(actor) && (IsSquadMember(actor) || IsHookBodyguard(actor));
         };
-
-        if (fn == fSwitch)
+        UObject* player = GetLocalPawn();
+        auto protectedTarget = [&](void* target)
         {
-            // Block the engine flipping our unit to a NON-friendly attitude toward us.
-            // Our own SwitchTeamToMatchCharacterAttitude(player, Friendly=0) passes.
+            return target && (target == player || managed(reinterpret_cast<UObject*>(target)));
+        };
+        if (fn == fAggressive)
+        {
+            if (!Mem::IsReadable(params, sizeof(P_SetCharacterAggressive))) return false;
+            auto* p = reinterpret_cast<P_SetCharacterAggressive*>(params);
+            return p->bShouldBeActive && managed(reinterpret_cast<UObject*>(p->InAICharacter)) &&
+                protectedTarget(p->InTargetEnemy);
+        }
+        UObject* receiver = reinterpret_cast<UObject*>(obj);
+        UObject* owner = fn == fEnemyB ? OwnershipControllerPawn(obj) : receiver;
+        if (!managed(owner)) return false;
+        if (fn == fSwitch && Mem::IsReadable(params, sizeof(P_SwitchTeamToMatchCharacterAttitude)))
+        {
             auto* p = reinterpret_cast<P_SwitchTeamToMatchCharacterAttitude*>(params);
-            return isUs(p->OtherCharacter) && p->TargetTeamAttitude != 0;
+            return protectedTarget(p->OtherCharacter) && p->TargetTeamAttitude != 0;
         }
-        if (fn == fEnemyC)
-        {
-            // Never let our unit take US as its enemy (real-enemy targets pass through).
-            auto* p = reinterpret_cast<P_SetTargetEnemy*>(params);
-            return isUs(p->TargetEnemy);
-        }
-        // fn == fEnemyB
-        auto* p = reinterpret_cast<P_SetBlackboardTargetEnemy*>(params);
-        return isUs(p->NewTarget);
+        if (fn == fEnemyC && Mem::IsReadable(params, sizeof(P_SetTargetEnemy)))
+            return protectedTarget(reinterpret_cast<P_SetTargetEnemy*>(params)->TargetEnemy);
+        if (fn == fEnemyB && Mem::IsReadable(params, sizeof(P_SetBlackboardTargetEnemy)))
+            return protectedTarget(reinterpret_cast<P_SetBlackboardTargetEnemy*>(params)->NewTarget);
+        return false;
     }
 
     bool HookMovementShouldSwallow(void* obj, void* fn)
@@ -2302,7 +2315,7 @@ namespace
 
     bool HookFriendshipShouldForce(void* fn, void* params)
     {
-        if (!g_hookBodyguardMode.load(std::memory_order_relaxed) ||
+        if (!g_ownershipLock.load(std::memory_order_relaxed) ||
             fn != g_fnHookAreFriendly.load(std::memory_order_relaxed) ||
             !Mem::IsReadable(params, sizeof(P_AreFriendlyCharacters)))
             return false;
@@ -2315,9 +2328,9 @@ namespace
             return false;
 
         UObject* guard = nullptr;
-        if (a == player && b && IsHookBodyguard(b)) guard = b;
-        if (b == player && a && IsHookBodyguard(a)) guard = a;
-        if (!guard || !NativeHooks::IsAHAICharacter(guard))
+        if (a == player && b && (IsSquadMember(b) || IsHookBodyguard(b))) guard = b;
+        if (b == player && a && (IsSquadMember(a) || IsHookBodyguard(a))) guard = a;
+        if (!IsLiveObject(guard) || !NativeHooks::IsAHAICharacter(guard))
             return false;
 
         p->ReturnValue = true;
@@ -2346,7 +2359,7 @@ namespace
     // does guarded reads, so it can't crash even on freed memory.
     bool AiUsable(UObject* ai)
     {
-        if (!Mem::IsReadable(ai, 0x30))
+        if (!IsLiveObject(ai))
             return false;
         UClass* cls = g_aiClass;
         if (!Mem::IsReadable(cls, 0x30))
@@ -2363,7 +2376,7 @@ namespace
 
     bool PawnUsable(UObject* pawn)
     {
-        if (!Mem::IsReadable(pawn, 0x30))
+        if (!IsLiveObject(pawn))
             return false;
         UClass* cls = ResolvePawnClass();
         if (!Mem::IsReadable(cls, 0x30))
@@ -2420,7 +2433,7 @@ namespace
 
     bool AiControllerUsable(UObject* ctrl)
     {
-        if (!Mem::IsReadable(ctrl, 0x30))
+        if (!IsLiveObject(ctrl))
             return false;
         UClass* cls = ResolveAiControllerClass();
         if (!Mem::IsReadable(cls, 0x30))
@@ -2430,13 +2443,13 @@ namespace
 
     bool ControllerOwnsPawn(UObject* ctrl, UObject* pawn)
     {
-        if (!AiControllerUsable(ctrl) || !Mem::IsReadable(pawn, 0x30))
+        if (!AiControllerUsable(ctrl) || !IsLiveObject(pawn))
             return false;
         uint8_t* base = reinterpret_cast<uint8_t*>(ctrl);
         if (!Mem::IsReadable(base + Offsets::O_BaseController_Pawn, sizeof(void*)))
             return false;
         UObject* owned = *reinterpret_cast<UObject**>(base + Offsets::O_BaseController_Pawn);
-        return owned == pawn && Mem::IsReadable(owned, 0x30);
+        return owned == pawn && IsLiveObject(owned);
     }
 
     bool ControllerPathFollowingReady(UObject* ctrl, UObject* pawn)
@@ -2447,7 +2460,7 @@ namespace
         if (!Mem::IsReadable(base + AH::AICtrl_PathFollowing, sizeof(void*)))
             return false;
         UObject* path = *reinterpret_cast<UObject**>(base + AH::AICtrl_PathFollowing);
-        return Mem::IsReadable(path, 0x30);
+        return IsLiveObject(path);
     }
 
     bool ReadCameraPOV(FVector& loc, FRotator& rot, float& fov)
@@ -2496,7 +2509,7 @@ namespace
         uint8_t* base = reinterpret_cast<uint8_t*>(ch);
         if (!Mem::IsReadable(base + AH::Char_AttributeSet, 8)) return false;
         uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
-        if (!Mem::IsReadable(set, AH::Set_Health + AH::Attr_CurrentValue + 4)) return false;
+        if (!IsLiveObject(reinterpret_cast<UObject*>(set)) || !Mem::IsReadable(set, AH::Set_MaxHealth + AH::Attr_CurrentValue + 4)) return false;
         cur = *reinterpret_cast<float*>(set + AH::Set_Health    + AH::Attr_CurrentValue);
         mx  = *reinterpret_cast<float*>(set + AH::Set_MaxHealth + AH::Attr_CurrentValue);
         return true;
@@ -2806,18 +2819,8 @@ namespace
     // Picked high so it can't collide with a real faction or your (small) team id.
     constexpr uint8_t kFightTeamB = 231;
 
-    // Dedicated ALLY/GUARD team. A squad bodyguard is parked here while it is
-    // ENGAGING a threat. WHY a distinct combat team instead of the player's own
-    // team: dump evidence shows the player is team 0, and team 0 is the game's
-    // DOCILE/civilian faction (animals, pedestrians, Larisa, turrets all sit on it
-    // and target NOTHING). SwitchTeamToMatchCharacterAttitude(player, Friendly) put
-    // guards onto team 0 -- which silently stripped their combat AI (a team-0
-    // character's perception ignores the team-1 robots). kGuardTeam is a normal
-    // combat id (not 0, not the robots' team), so the robots' perception reads it as
-    // hostile and the guard's OWN native combat AI hunts them -- the exact mechanism
-    // that makes "fight each other" work, now applied to bodyguards. Distinct from
-    // kFightTeamB so guards and free brawlers are never accidentally the same side.
-    constexpr uint8_t kGuardTeam = 230;
+    // Bodyguards preserve friendly allegiance, including during combat.
+
 
     bool ValidateTargetAllyAssignment(UObject* target)
     {
@@ -2928,7 +2931,7 @@ namespace
         if (!Mem::IsReadable(base + AH::AICtrl_Blackboard, sizeof(void*)))
             return false;
         UObject* bb = *reinterpret_cast<UObject**>(base + AH::AICtrl_Blackboard);
-        return Mem::IsReadable(bb, 0x30);
+        return IsLiveObject(bb);
     }
 
     bool SetControllerFollowLocation(UObject* ctrl, const FVector& loc)
@@ -3100,7 +3103,7 @@ namespace
     bool MoveControllerToActor(UObject* ctrl, UObject* controlledPawn, UObject* goal,
                                float acceptanceRadius, bool usePathfinding = false)
     {
-        if (!ControllerPathFollowingReady(ctrl, controlledPawn) || !Mem::IsReadable(goal, 0x30))
+        if (!ControllerPathFollowingReady(ctrl, controlledPawn) || !IsLiveObject(goal))
             return false;
         UFunction* fn = CachedFn(AH::Fn_AIController_MoveToActor);
         if (!Mem::IsReadable(fn, 0x30))
@@ -4306,12 +4309,14 @@ namespace
     // every brawler hostile to (killable by) the player. Pass exactly one mode.
     bool InjectAttack(UObject* ai, UObject* enemy, UObject* teamRef, uint8_t attitudeVsRef, int forceTeamId = -1)
     {
-        if (!AiUsable(ai) || !Mem::IsReadable(enemy, 0x30) || ai == enemy)
+        if (!AiUsable(ai) || !IsLiveCombatTarget(enemy) || ai == enemy ||
+            (IsSquadMember(ai) && (enemy == GetLocalPawn() || IsSquadMember(enemy))))
             return false;
 
         // (1)(2) raw aggro target + aggressive gates -- crash-safe data writes.
         WriteAiTargetField(ai, enemy);
-        WriteAiAggressiveFlags(ai, true);
+        if (IsSquadMember(ai)) ClearAiAggressiveLatch(ai);
+        else WriteAiAggressiveFlags(ai, true);
         // (3) the game's own setter routes the target into the blackboard.
         SetAiTargetEnemy(ai, enemy, true);
         // (3b) drive the controller blackboard so the BT enters its ATTACK branch.
@@ -4526,7 +4531,7 @@ namespace
         // the normal AI/Squad tab's "squad aggressive" setting.
         bool engage = ReadActorLocationFast(guard, guardLoc) &&
                       IsLiveCombatTarget(threat) && threat != guard && threat != player &&
-                      !IsHookBodyguard(threat) && ReadActorLocationFast(threat, threatLoc);
+                      !IsHookBodyguard(threat) && !IsSquadMember(threat) && ReadActorLocationFast(threat, threatLoc);
 
         if (engage)
         {
@@ -4551,7 +4556,8 @@ namespace
         }
 
         SetCharacterInstigatedDamage(guard, 10000.0f);
-        InjectAttack(guard, threat, nullptr, 0, (int)kGuardTeam);
+        InjectAttack(guard, threat, player, 0);
+        WriteAiAggressiveFlags(guard, false);
         SuppressGuardTargetingPlayer(guard, player);
         g_engagedUntilMs[guard] = GetTickCount64() + 350; // bridges the 5 Hz selector only
 
@@ -4677,16 +4683,8 @@ namespace
         }
     }
 
-    // Bodyguard injection. THE FIX: a guard fights with the EXACT pipeline that
-    // "enemies fight each other" uses -- it is parked on the dedicated combat ally
-    // team kGuardTeam (NOT the player's docile team 0, which silently strips combat;
-    // see kGuardTeam) and force-aggro'd onto the threat, so its OWN native combat AI
-    // hunts the robots just like a free brawler. It NEVER hits you because (a) while
-    // ENGAGING it is busy on the forced robot target and we blank any player-target
-    // every pump, and (b) while IDLE (no threat) it is dropped back onto the docile
-    // player faction (team 0, Friendly) where it can't acquire you at all. Two states:
-    //   * threat in range  -> kGuardTeam + force attack (fight-each-other logic)
-    //   * no threat        -> Friendly team 0, combat state cleared, follow only
+    // Retain player-friendly allegiance throughout follow and combat. Threat
+    // selection never includes the player or another managed squad member.
     bool InjectBodyguard(UObject* guard, UObject* player, const FVector& playerLoc, UObject* threat)
     {
         if (!FollowPawnUsable(guard) || !Mem::IsReadable(player, 0x30) || guard == player)
@@ -4694,16 +4692,8 @@ namespace
         if (g_hookBodyguardMode.load(std::memory_order_relaxed) && IsHookBodyguard(guard))
             return InjectHookBodyguard(guard, player, playerLoc, threat);
 
-        // Drive combat for ANY squad AHAICharacter, NOT just ones the BT-name heuristic
-        // (AiIsCombatCapable) flags "combat". WHY: the heuristic mis-flagged the Twins
-        // (and bosses) as non-combat, so the gate skipped ALL injection -> they stayed on
-        // the NEUTRAL player team 0 and never engaged (log: engaged=0 team=0 with a threat
-        // 19m away). Combat here is the team-split (kGuardTeam) + forced target -- the
-        // SAME perception-driven mechanism "enemies fight each other" uses, which does NOT
-        // depend on that heuristic (fight-each-other already injects every nearby AI this
-        // way). The only call that can fault on a TRUE civilian -- ForceCharacterAggressive
-        // / StopCharacterAggressive -- stays self-gated on AiIsCombatCapable internally, so
-        // this stays crash-safe while letting real combat units (mis-flagged or not) fight.
+        // The class check permits native combat AI; each attack-state call
+        // separately checks its required controller and character capabilities.
         const bool combatCapable = AiUsable(guard);
         InjectState& s = g_inject[guard];
         ULONGLONG nowMs = GetTickCount64();
@@ -4714,7 +4704,7 @@ namespace
             // TargetAlly: that native path requires AHAICharacter, while the player
             // is only AHBaseCharacter. Friendship is supplied by the Hook Debug
             // pair override and team logic instead.
-            WriteAiAggressiveFlags(guard, true);
+            ClearAiAggressiveLatch(guard);
             SuppressGuardTargetingPlayer(guard, player);
         }
 
@@ -4731,7 +4721,7 @@ namespace
         FVector guardLoc{}, threatLoc{};
         bool guardLocOk = ReadActorLocationFast(guard, guardLoc);
         if (combatCapable && Features::Get().aiSquadAggressive
-            && threat && Mem::IsReadable(threat, 0x30) && threat != guard && threat != player && guardLocOk
+            && IsLiveCombatTarget(threat) && !IsSquadMember(threat) && threat != guard && threat != player && guardLocOk
             && ReadActorLocationFast(threat, threatLoc))
         {
             float threatToYou   = DistanceMetres(playerLoc, threatLoc);
@@ -4750,21 +4740,14 @@ namespace
         bool combatHold = false;
         {
             auto it = g_lastThreatMs.find(guard);
-            combatHold = combatCapable && it != g_lastThreatMs.end() && (nowMs - it->second < kCombatHoldMs);
+            combatHold = combatCapable && Features::Get().aiSquadAggressive && IsLiveCombatTarget(s.target) && it != g_lastThreatMs.end() && (nowMs - it->second < kCombatHoldMs);
         }
 
         if (combatCapable && engage)
         {
-            // *** THE COPY YOU ASKED FOR: drive the guard with the EXACT "enemies fight
-            // each other" injection and then GET OUT OF ITS WAY. forceTeamId = kGuardTeam
-            // parks it on a real COMBAT team the robots read as hostile; we force the
-            // first target + native attack-state kick, then its OWN combat AI moves it to
-            // the enemy and attacks -- exactly like a released brawler (which is the ONLY
-            // mode that ever worked, incl. for the Twins). Crucially we do NOT pin it
-            // friendly or reset its team anywhere in the combat path; that per-pump reset
-            // was why it never engaged. Player safety: it's busy on the forced robot
-            // target, on a non-player team, and we re-blank any player-target every pump.
-            InjectAttack(guard, threat, nullptr, 0, (int)kGuardTeam);
+            // Select an enemy while retaining the player-friendly team.
+            InjectAttack(guard, threat, player, 0);
+            ClearAiAggressiveLatch(guard);
             SuppressGuardTargetingPlayer(guard, player);
             // Leave this guard alone in the per-frame follow drive long enough to actually
             // fight -- the follow tug-of-war (FollowLocation back to you every 50ms) was
@@ -4774,10 +4757,8 @@ namespace
         }
         else if (combatCapable && combatHold)
         {
-            // Recently fought, no fresh target THIS pump: HOLD. Stay on the combat team
-            // (do NOT flip friendly), keep the engaged stamp so the follow drive keeps
-            // its hands off, and let the guard's own perception keep hunting nearby
-            // robots. Don't wipe its target -- let it finish what it's chasing.
+            // Preserve the current enemy briefly so follow requests do not cancel
+            // the attack between threat scans. Friendly allegiance stays unchanged.
             g_engagedUntilMs[guard] = nowMs + 600;
         }
         else if (combatCapable)
@@ -4856,6 +4837,7 @@ namespace
 
     bool ApplyAiRelease(UObject* ai)
     {
+        Bodyguards::Forget(ai);
         if (!AiUsable(ai))
             return false;
 
@@ -4913,24 +4895,25 @@ namespace
 
     bool ApplyAiBodyguard(UObject* ai, UObject* player, const FVector& playerLocHint)
     {
+        if (!IsHookBodyguard(ai))
+        {
+            const bool alreadyOwned = IsSquadMember(ai);
+            SquadAdd(ai);
+            if (IsSquadMember(ai) && Bodyguards::Adopt(ai, player)) return true;
+            if (!alreadyOwned) SquadRemove(ai);
+            return false;
+        }
         if (!FollowPawnUsable(ai) || !Mem::IsReadable(player, 0x30) || ai == player)
             return false;
 
-        // Baseline convert: friendly to the player (team 0, so it stops hitting you)
-        // without ever storing the player in TargetAlly, and record its real team
-        // so release can restore it. This
-        // is only the DOCILE resting state -- team 0 does NOT make it hunt the robots
-        // (team 0 is the game's passive/civilian faction). The per-frame squad pump
-        // (InjectBodyguard) is what arms it: when a threat is near it parks the guard
-        // on kGuardTeam (a combat team the robots read as hostile) and force-engages,
-        // exactly like "enemies fight each other". The button just seeds the convert.
+        // Remember the original faction for release, then keep this guard
+        // friendly to the player without assigning the player as TargetAlly.
         bool ok = false;
         if (AiUsable(ai))
         {
             const bool hookOwned = g_hookBodyguardMode.load(std::memory_order_relaxed) &&
                                    IsHookBodyguard(ai);
-            if (hookOwned) ClearAiAggressiveLatch(ai);
-            else WriteAiAggressiveFlags(ai, true);
+            ClearAiAggressiveLatch(ai);
             ok = SetAiPassive(ai, false);
             ok = SwitchAiTeamFriendlyTo(ai, player) || ok;
             WriteAiTargetField(ai, nullptr);   // drop any aggro on the player
@@ -5697,9 +5680,9 @@ namespace
                 std::remove_if(g_spawnedAllies.begin(), g_spawnedAllies.end(),
                     [](UObject* a)
                     {
-                        if (!Mem::IsReadable(a, 0x30)) { miss.erase(a); LOG("Squad prune: member %p gone (unreadable) -> dropped", (void*)a); return true; } // truly gone
+                        if (!IsLiveObject(a)) { Bodyguards::Forget(a); miss.erase(a); LOG("Squad prune: member %p gone (unreadable) -> dropped", (void*)a); return true; } // truly gone
                         if (FollowPawnUsable(a)) { miss.erase(a); return false; }       // healthy -> keep
-                        if (++miss[a] >= 30) { LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
+                        if (++miss[a] >= 30) { Bodyguards::Forget(a); LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
                         return false; // ~30 consecutive misses (~several s) -> give up; else KEEP
                     }),
                 g_spawnedAllies.end());
@@ -5752,12 +5735,28 @@ namespace
             // Twins are driven by their OWN dedicated brain (DriveTwinCombat) + per-frame
             // follow -- never the normal squad combat/follow path. Keep her completely
             // separate (no ground-nav hammering, no InjectBodyguard, no assist-kill here).
-            if (IsMixedNavCharacter(ally) && !hookOwned)
+            if (IsMixedNavCharacter(ally) && !hookOwned && !Bodyguards::Contains(ally))
                 continue;
             FVector loc{};
             if (!ReadActorLocationFast(ally, loc))
                 continue;
             ++dbgDriven;
+            if (!hookOwned && Bodyguards::Contains(ally))
+            {
+                UObject* attacker = nullptr;
+                float best = 3.4e38f;
+                for (const InjNode& candidate : threats)
+                {
+                    if (!candidate.ok || BodyguardEngine::Protected(candidate.actor)) continue;
+                    UObject* target = ReadAiTargetField(candidate.actor);
+                    if (target != player && !BodyguardEngine::Protected(target)) continue;
+                    float distance = DistanceMetres(candidate.loc, playerLoc);
+                    if (distance < best) { best = distance; attacker = candidate.actor; }
+                }
+                Bodyguards::Update(ally, player, playerLoc, attacker);
+                if (invincible && AiUsable(ally)) SetCharacterHealthFull(ally);
+                continue;
+            }
             // Legacy squad members keep their old grounding heartbeat. Hook Twins
             // must never enter it: their ReVa-derived mixed-nav state owns this field.
             if (!hookOwned)
@@ -5879,7 +5878,7 @@ namespace
         }
 
         // Throttled combat heartbeat so the fight state is observable in the log:
-        // engaged>0 + team=230 = a guard is actively fighting on the guard team. If
+        // engaged>0 reports a guard actively fighting while preserving allegiance. If
         // engaged stays 0 while threats are near, aiSquadAggressive is probably OFF
         // (the "Squad fights for you" checkbox) or no live threat is within kGuardEngageM.
         static ULONGLONG lastCombatLog = 0;
@@ -5918,7 +5917,7 @@ namespace
 
         std::vector<UObject*> twins;
         for (UObject* a : squad)
-            if (Mem::IsReadable(a, 0x30) && IsMixedNavCharacter(a) &&
+            if (!Bodyguards::Contains(a) && Mem::IsReadable(a, 0x30) && IsMixedNavCharacter(a) &&
                 !(g_hookBodyguardMode.load(std::memory_order_relaxed) && IsHookBodyguard(a)))
                 twins.push_back(a);
         if (twins.empty())
@@ -5973,7 +5972,7 @@ namespace
             // (No ground-nav pinning -- her own AI decides nav type. Mercuna does the moving.)
 
             // HARD never-attack-you: she is always your ally; blank any aggro on you.
-            WriteAiAggressiveFlags(twin, true);
+            WriteAiAggressiveFlags(twin, false);
             SuppressGuardTargetingPlayer(twin, player);
 
             // Threat selection: prefer an enemy attacking YOU, else the nearest to HER, and
@@ -5985,7 +5984,7 @@ namespace
             float nearestAnyM = -1.0f;   // nearest combat AI to her at ALL (diag: why no engage)
             for (UObject* c : threats)
             {
-                if (c == twin || c == player)
+                if (c == twin || c == player || IsSquadMember(c) || !IsLiveCombatTarget(c))
                     continue;
                 FVector cl{};
                 if (!ReadActorLocationFast(c, cl))
@@ -6013,7 +6012,8 @@ namespace
             dbgMercCount  = s.mercCount;
             if (engage)
                 s.lastThreatMs = now;
-            bool combatHold = (now - s.lastThreatMs) < kTwinCombatHoldMs;
+            bool combatHold = squadAggr && IsLiveCombatTarget(s.target) && !IsSquadMember(s.target) &&
+                (now - s.lastThreatMs) < kTwinCombatHoldMs;
 
             if (engage)
             {
@@ -6029,27 +6029,17 @@ namespace
                     SetControllerTargetEnemy(ctrl, threat, true);
                     SetControllerAggressive(ctrl, true);
                 }
-                // Combat team: SetGenericTeamId re-triggers perception, so throttle it.
+                // Keep the player alliance; changing teams refreshes perception, so throttle it.
                 if (targetChanged || now - s.lastTeamMs > 1500)
                 {
-                    SetAiTeamIdTracked(twin, kGuardTeam);
+                    SwitchAiTeamFriendlyTo(twin, player);
                     s.lastTeamMs = now;
                 }
-                // *** MOVE her to the threat with Mercuna. ***
-                // Her boss BT's own combat locomotion does NOT move her under our injection (she
-                // just stood "engaged" = frozen). Frequent MoveToActor re-targeting is what moves
-                // her; a single order doesn't sustain her. MoveToActor STACKS path requests over
-                // time (lag grows -> stall), so every few seconds we FLUSH with a STANDALONE Stop
-                // on its own pump -- NOT in the same pump as a Move (Stop+Move together cancels
-                // the move and she freezes, confirmed). Between flushes we re-target on a timer.
-                if (now - s.lastFlushMs > 3000)
+                // Refresh the tracked actor at a bounded cadence. An unconditional
+                // Stop on a timer interrupted otherwise healthy movement/attacks.
+                if (now - s.lastGoalMs > 750)
                 {
-                    MercunaStop(twin);          // flush accumulated path requests (own pump)
-                    s.lastFlushMs = now;
-                }
-                else if (now - s.lastGoalMs > 400)
-                {
-                    dbgMerc = MercunaMoveToPlayer(twin, threat, 250.0f /*~2.5m, melee range*/, 600.0f) ? 1 : 0;
+                    dbgMerc = MercunaMoveToPlayer(twin, threat, 250.0f, 600.0f) ? 1 : 0;
                     s.lastGoalMs = now; ++s.mercCount;
                 }
                 // ATTACK kick: on target change, then re-assert only while she's IN melee range
@@ -6129,6 +6119,8 @@ namespace
     // =======================================================================
     void SpawnAndRegisterAlly(UClass* pawnClass, bool hookOwned = false)
     {
+        if (!hookOwned && g_spawnedAllyCount.load() >= kMaxSpawnedAllies)
+        { LOG("Companion limit reached (%d); spawn refused.", kMaxSpawnedAllies); return; }
         if (!Mem::IsReadable(pawnClass, 0x30))
         {
             LOG("SpawnAndRegisterAlly: pawn class null/not loaded -- cannot spawn");
@@ -6183,8 +6175,19 @@ namespace
         }
         LOG("SpawnAndRegisterAlly: SpawnAIFromClass OK actor=%p; registering + fixup", (void*)spawned);
 
-        // Register FIRST (so the squad tracks it and Stand-down can remove it even if
-        // the fixup throws), then run the fixup. Fixup is best-effort and self-guarded.
+        if (!hookOwned)
+        {
+            SquadAdd(spawned);
+            if (!Bodyguards::Adopt(spawned, player))
+            {
+                LOG("Spawned companion could not initialize; removing it instead of leaving a hostile robot.");
+                SquadRemove(spawned);
+                if (UFunction* destroy = CachedFn(AH::Fn_K2DestroyActor)) ProcessNoParams(spawned, destroy);
+                return;
+            }
+            ForceActorVisible(spawned);
+            SnapAiToGround(spawned);
+        }
         RequestAiDiscovery();
         LOG("SpawnAndRegisterAlly: spawned ally actor=%p", (void*)spawned);
     }
@@ -7828,6 +7831,15 @@ namespace
             { P_SetCustomDepthStencil p{ stencil }; mesh->ProcessEvent(fn, &p); }
     }
 
+    struct WeaponColorParameter
+    {
+        UE::FName Name{};
+        uint8_t Association = 2; // GlobalParameter; preserve layers/blends from real metadata
+        uint8_t Pad[3]{};
+        int32_t Index = -1;
+    };
+    static_assert(sizeof(WeaponColorParameter) == 0x10, "FMaterialParameterInfo");
+    std::atomic<int> g_weaponColorTargets{0};
     struct WeaponRgbSlotState
     {
         UObject* mesh = nullptr;
@@ -7835,7 +7847,7 @@ namespace
         UObject* original = nullptr;
         UObject* mid = nullptr;
         bool     forcedParent = false;
-        std::vector<UE::FName> realColorParams;
+        std::vector<WeaponColorParameter> realColorParams;
     };
 
     UObject* g_weaponRgbWeapon = nullptr;
@@ -8155,28 +8167,61 @@ namespace
         mid->ProcessEvent(fn, &p);
     }
 
-    void CollectMaterialVectorParamNames(UObject* mat, std::vector<UE::FName>& out)
+    void CollectMaterialVectorParamNames(UObject* mat, std::vector<WeaponColorParameter>& out)
     {
-        if (!Mem::IsReadable(mat, AH::Mat_VectorParameterValues + 0x10))
-            return;
-        static UClass* miCls = nullptr;
-        if (!Mem::IsReadable(miCls, 0x30))
-            miCls = FindObjectFast(AH::Cls_MaterialInstance);
-        if (miCls && !mat->IsA(miCls))
-            return;
-
-        uint8_t* b = reinterpret_cast<uint8_t*>(mat);
-        uint8_t* data = *reinterpret_cast<uint8_t**>(b + AH::Mat_VectorParameterValues);
-        int32_t count = *reinterpret_cast<int32_t*>(b + AH::Mat_VectorParameterValues + 8);
-        if (count <= 0 || count > 64)
-            return;
-        if (!Mem::IsReadable(data, (size_t)count * AH::VectorParamValue_Stride))
-            return;
-
-        for (int k = 0; k < count; ++k)
+        UClass* instanceClass = FindObjectFast(AH::Cls_MaterialInstance);
+        UClass* materialClass = FindObjectFast("Class /Script/Engine.Material");
+        if (!IsLiveObject(instanceClass) || !IsLiveObject(materialClass)) return;
+        auto collect = [&](uint8_t* data, int count, size_t stride)
         {
-            UE::FName nm = *reinterpret_cast<UE::FName*>(data + (size_t)k * AH::VectorParamValue_Stride + AH::VectorParamValue_NameOff);
-            PushUniqueFName(out, nm);
+            if (count < 0 || count > 256 || (count && !Mem::IsReadable(data, size_t(count)*stride))) return;
+            for (int k = 0; k < count; ++k)
+            {
+                WeaponColorParameter parameter{};
+                std::memcpy(&parameter, data + size_t(k)*stride, sizeof(parameter));
+                if (parameter.Association > 2 || parameter.Index < -1 || parameter.Index > 128) continue;
+                std::string name = parameter.Name.ToString();
+                for (char& c : name) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                // Shader vectors also include hit positions, UV scales and cut planes.
+                // Only colour-bearing parameters belong in an RGB operation.
+                if (name.find("color") == std::string::npos && name.find("colour") == std::string::npos &&
+                    name.find("tint") == std::string::npos && name.find("albedo") == std::string::npos &&
+                    name.find("diffuse") == std::string::npos && name.find("emissive") == std::string::npos) continue;
+                bool duplicate = false;
+                for (const auto& old : out)
+                    if (old.Name.ComparisonIndex == parameter.Name.ComparisonIndex && old.Name.Number == parameter.Name.Number &&
+                        old.Association == parameter.Association && old.Index == parameter.Index) { duplicate = true; break; }
+                if (!duplicate && out.size() < 24) out.push_back(parameter);
+            }
+        };
+        std::vector<UObject*> visited;
+        for (int depth = 0; depth < 16 && IsLiveObject(mat); ++depth)
+        {
+            if (std::find(visited.begin(), visited.end(), mat) != visited.end()) break;
+            visited.push_back(mat);
+            auto* bytes = reinterpret_cast<uint8_t*>(mat);
+            if (mat->IsA(instanceClass))
+            {
+                if (!Mem::IsReadable(bytes + AH::Mat_VectorParameterValues, 16)) break;
+                TArray<uint8_t> values{};
+                std::memcpy(&values, bytes + AH::Mat_VectorParameterValues, sizeof(values));
+                if (values.Max >= values.Count) collect(values.Data, values.Count, AH::VectorParamValue_Stride);
+                mat = Reflect::ReadNamedObjectProperty(mat, "Parent");
+            }
+            else if (mat->IsA(materialClass))
+            {
+                // Fresh SDK: CachedExpressionData.Parameters.RuntimeEntries[1].ParameterInfos.
+                // Entry 1 is the vector catalog, confirmed against live VectorValues counts.
+                int cached = Reflect::FindPropertyOffset(mat, "CachedExpressionData");
+                TArray<uint8_t> infos{};
+                if (cached >= 0 && Mem::IsReadable(bytes + cached + 0x40, sizeof(infos)))
+                {
+                    std::memcpy(&infos, bytes + cached + 0x40, sizeof(infos));
+                    if (infos.Max >= infos.Count) collect(infos.Data, infos.Count, sizeof(WeaponColorParameter));
+                }
+                break;
+            }
+            else break;
         }
     }
 
@@ -8185,13 +8230,14 @@ namespace
         int restored = 0;
         for (const WeaponRgbSlotState& slot : g_weaponRgbSlots)
         {
-            if (Mem::IsReadable(slot.mesh, 0x30) &&
-                Mem::IsReadable(slot.original, 0x30) &&
+            if (IsLiveObject(slot.mesh) && IsLiveObject(slot.original) &&
+                GetMeshMaterialSlot(slot.mesh, slot.index) == slot.mid &&
                 SetMeshMaterialSlot(slot.mesh, slot.index, slot.original))
                 ++restored;
         }
         if (!g_weaponRgbSlots.empty())
             LOG("WeaponRGB: restored %d/%zu original material slot(s)", restored, g_weaponRgbSlots.size());
+        g_weaponColorTargets = 0;
         g_weaponRgbSlots.clear();
         g_weaponRgbMeshes.clear();
         g_weaponRgbWeapon = nullptr;
@@ -8222,7 +8268,7 @@ namespace
         std::vector<UE::FName> guessedColorParams, ignoredScalarParams;
         ResolveWeaponRgbParamNames(guessedColorParams, ignoredScalarParams);
         constexpr size_t kMaxWeaponRgbSlots = 16;
-        constexpr size_t kMaxWeaponRgbParamsPerSlot = 6;
+        constexpr size_t kMaxWeaponRgbParamsPerSlot = 24;
 
         std::vector<WeaponRgbSlotState> slots;
         slots.reserve(meshes.size() * 2);
@@ -8245,7 +8291,7 @@ namespace
                 if (!Mem::IsReadable(original, 0x30))
                     continue;
 
-                std::vector<UE::FName> realColorParams;
+                std::vector<WeaponColorParameter> realColorParams;
                 try { CollectMaterialVectorParamNames(original, realColorParams); } catch (...) {}
 
                 bool forceSlot = realColorParams.empty() && IsUsableMaterialPtr(forcedParent);
@@ -8261,11 +8307,9 @@ namespace
                 {
                     try { CollectMaterialVectorParamNames(mid, realColorParams); } catch (...) {}
                 }
-                // Set parameters on this slot's MID directly. Real instance names
-                // take priority; a small guessed fallback covers parent parameters
-                // that are not present in the instance override array.
-                for (const UE::FName& name : guessedColorParams)
-                    PushUniqueFName(realColorParams, name);
+                // No guessed parameter names: non-existent shader inputs silently do nothing.
+                if (realColorParams.empty())
+                { SetMeshMaterialSlot(mesh, i, original); continue; }
                 if (realColorParams.size() > kMaxWeaponRgbParamsPerSlot)
                     realColorParams.resize(kMaxWeaponRgbParamsPerSlot);
 
@@ -8287,6 +8331,9 @@ namespace
         g_weaponRgbParent = forcedParent;
         g_weaponRgbMeshes = meshes;
         g_weaponRgbSlots.swap(slots);
+        int parameterCount = 0;
+        for (const auto& slot : g_weaponRgbSlots) parameterCount += static_cast<int>(slot.realColorParams.size());
+        g_weaponColorTargets = parameterCount;
 
         int forced = 0;
         for (const WeaponRgbSlotState& slot : g_weaponRgbSlots)
@@ -8325,8 +8372,14 @@ namespace
         {
             if (!Mem::IsReadable(slot.mid, 0x30))
                 continue;
-            for (const UE::FName& n : slot.realColorParams)
-                SetMIDVectorParam(slot.mid, n, linear);
+            UFunction* setByInfo = CachedFn("Function /Script/Engine.MaterialInstanceDynamic.SetVectorParameterValueByInfo");
+            if (!IsLiveObject(setByInfo) || !IsLiveObject(slot.mid)) continue;
+            for (const WeaponColorParameter& parameter : slot.realColorParams)
+            {
+                struct { WeaponColorParameter ParameterInfo; FLinearColor Value; } args{parameter, linear};
+                static_assert(sizeof(args) == 0x20, "SetVectorParameterValueByInfo frame");
+                slot.mid->ProcessEvent(setByInfo, &args);
+            }
             if (slot.forcedParent)
             {
                 for (const UE::FName& n : forcedColorNames)
@@ -8520,8 +8573,17 @@ namespace
         if (!Mem::IsReadable(weapon, 0x30))
             return; // holstered / scripted state -> nothing to recolour this tick
 
-        if (weapon != g_weaponRgbWeapon || g_weaponRgbSlots.empty())
+        bool materialsChanged = weapon != g_weaponRgbWeapon || g_weaponRgbSlots.empty();
+        if (!materialsChanged)
+            for (const auto& slot : g_weaponRgbSlots)
+                if (!IsLiveObject(slot.mesh) || !IsLiveObject(slot.mid) || GetMeshMaterialSlot(slot.mesh, slot.index) != slot.mid)
+                { materialsChanged = true; break; }
+        if (materialsChanged)
         {
+            static ULONGLONG nextSetup = 0;
+            if (now < nextSetup) return;
+            nextSetup = now + 1000;
+            RestoreWeaponRgbMaterials();
             std::vector<UObject*> meshes;
             try { CollectWeaponRgbMeshComponents(weapon, meshes); } catch (...) {}
             if (!EnsureWeaponRgbMaterialOverride(weapon, meshes, nullptr))
@@ -8624,32 +8686,14 @@ namespace
 
     void RefreshFlyStreaming(UObject* pawn, bool force)
     {
-        if (!Features::Get().flyStreamingAssist)
+        if (!Features::Get().flyStreamingAssist || !force || !IsLiveObject(pawn) || pawn != GetLocalPawn())
             return;
-
-        static ULONGLONG lastUpdateMs = 0;
-        static ULONGLONG lastLogMs = 0;
-        ULONGLONG nowMs = GetTickCount64();
-        if (!force && nowMs - lastUpdateMs < 1000)
-            return;
-
-        lastUpdateMs = nowMs;
-        ULONGLONG startMs = GetTickCount64();
-        bool invalidated = InvalidateStreaming(pawn);
+        // The engine follows the player's updated location itself. Repeatedly
+        // invalidating streaming and enabling scripted volumes can re-enter
+        // campaign transitions while flying. Refresh only on the explicit edge,
+        // without asking the game to update its scripted volumes.
         bool enabled = EnableLevelStreamingUpdate();
-        ULONGLONG elapsedMs = GetTickCount64() - startMs;
-
-        if (elapsedMs > 50)
-            LOG("Fly streaming assist slow: %llums", elapsedMs);
-
-        if (force || nowMs - lastLogMs > 5000)
-        {
-            LOG("Fly streaming assist: invalidate=%s updateVolumes=%s pawn=%p",
-                invalidated ? "yes" : "no",
-                enabled ? "yes" : "no",
-                (void*)pawn);
-            lastLogMs = nowMs;
-        }
+        LOG("Fly streaming: level updates=%s; scripted volumes were not reinitialized.", enabled ? "enabled" : "unavailable");
     }
 
     FVector Add(const FVector& a, const FVector& b)
@@ -8832,25 +8876,8 @@ namespace
 
     void UpdateGameInputBlock()
     {
-        // VANILLA-STATE RULE: with nothing enabled, the menu must not touch the game.
-        // We never call SetIgnore*Input(true) ourselves, so we must NOT poke the
-        // input-ignore counters either. The old code decremented them every second
-        // unconditionally -- that mutated vanilla state and could fight the game's
-        // own input locks during an ability cast / cutscene (the "shock / V ability
-        // stopped working" report). Now we only clear ONCE on the falling edge of
-        // fly/noclip, purely defensively, and otherwise leave input completely alone.
-        auto& st = Features::Get();
-        static bool wasFreeFly = false;
-        bool freeFly = st.flyHack || st.noclip;
-        if (wasFreeFly && !freeFly)
-        {
-            if (UObject* pc = GetPlayerController())
-            {
-                ApplyLookInputBlock(pc, false, false);
-                ApplyMoveInputBlock(pc, false, false);
-            }
-        }
-        wasFreeFly = freeFly;
+        // This menu never increments the engine's ignore-input counters. Leave
+        // them owned by the game's abilities, dialogue and cutscenes.
     }
 
     bool ApplyMinecraftFly(UObject* pawn, const FVector& currentLoc, float dt)
@@ -8876,6 +8903,16 @@ namespace
         if (KeyDown(VK_SPACE)) input.Z += 1.0f;
         if (KeyDown(VK_SHIFT)) input.Z -= 1.0f;
 
+        if (GetTickCount64() < g_testFlyUntil.load())
+        {
+            switch (g_testFlyAxis.load())
+            {
+            case 1: input = Add(input, forward); break;
+            case 2: input.Z += 1; break;
+            case 3: input.Z -= 1; break;
+            case 4: input = Add(input, Scale(forward, -1.0f)); break;
+            }
+        }
         input = Normalize(input);
         if (Length(input) <= 0.001f)
             return false;
@@ -8883,7 +8920,7 @@ namespace
         float mult = st.speedMult > 0.1f ? st.speedMult : 1.0f;
         float flySpeed = 600.0f * mult;
         FVector next = Add(currentLoc, Scale(input, flySpeed * dt));
-        if (SetActorLocation(pawn, next, false))
+        if (SetActorLocation(pawn, next, false, !st.noclip))
         {
             // Deliberately not writing g_lastLoc: the render tick rewrites it from
             // the pawn every frame while fly is on and the coordinate HUD reads it
@@ -8911,13 +8948,13 @@ namespace
     // would otherwise wedge fly for the rest of the session and say nothing.
     constexpr ULONGLONG kFlyStepStuckMs = 1000;
 
-    void EnterFlyingMovementMode(UObject* pawn, uint8_t* mv); // defined below
+    bool EnterFlyingMovementMode(UObject* pawn, uint8_t* mv); // defined below
 
     // True while any fly movement key is held. Sampled on the render thread;
     // GetAsyncKeyState is process-wide, so it is valid from either thread.
     bool FlyInputHeld()
     {
-        return KeyDown('W') || KeyDown('S') || KeyDown('A') || KeyDown('D') ||
+        return GetTickCount64() < g_testFlyUntil.load() || KeyDown('W') || KeyDown('S') || KeyDown('A') || KeyDown('D') ||
                KeyDown(VK_SPACE) || KeyDown(VK_SHIFT);
     }
 
@@ -8927,8 +8964,11 @@ namespace
         // dispatches GetControlRotation and SetMovementMode every frame while
         // standing still, which fired the crash in ~5s with no input where idle
         // fly had survived 90s.
-        if (!FlyInputHeld())
+        if (!FlyInputHeld() || G::menuOpen.load())
+        {
+            g_flyPendingDt.store(0.0f, std::memory_order_relaxed);
             return;
+        }
 
         // The pump IS the ProcessEvent hook; without it there is no game thread to
         // borrow. Skip the step rather than move the pawn from here.
@@ -8940,7 +8980,7 @@ namespace
         // the drain rate instead of wall-clock time -- roughly halving it, since
         // the render thread schedules faster than the pump drains.
         for (float banked = g_flyPendingDt.load(std::memory_order_relaxed);
-             !g_flyPendingDt.compare_exchange_weak(banked, banked + dt,
+             !g_flyPendingDt.compare_exchange_weak(banked, ClampDeltaSeconds(banked + dt),
                                                    std::memory_order_relaxed); )
         {
         }
@@ -8954,8 +8994,12 @@ namespace
             ULONGLONG waitedMs = nowMs - g_flyStepQueuedMs.load(std::memory_order_relaxed);
             if (waitedMs < kFlyStepStuckMs)
                 return;
-            LOG("Fly: the queued step has not drained in %llums -- the game-thread pump "
-                "looks stalled. Re-queuing.", waitedMs);
+            // The original task still owns the pending flag. Re-queuing here
+            // accumulates stale tasks during pause/loading and races that owner.
+            g_flyPendingDt.store(0.0f, std::memory_order_relaxed);
+            if (waitedMs < kFlyStepStuckMs + 100)
+                LOG("Fly: waiting for the game-thread pump; stale movement discarded.");
+            return;
         }
         g_flyStepQueuedMs.store(nowMs, std::memory_order_relaxed);
 
@@ -8968,18 +9012,19 @@ namespace
             {
                 // Re-validate on arrival: this runs a frame or so after it was
                 // queued, and the pawn can die in between.
-                if (IsLiveObject(pawn))
+                if (IsLiveObject(pawn) && pawn == GetLocalPawn() &&
+                    (Features::Get().flyHack || Features::Get().noclip) &&
+                    !G::menuOpen.load() && FlyInputHeld())
                 {
                     uint8_t* mv = nullptr;
                     if (Mem::IsReadable(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement, 8))
                         mv = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement);
-                    if (mv)
-                        EnterFlyingMovementMode(pawn, mv);
+                    bool flying = mv && EnterFlyingMovementMode(pawn, mv);
 
                     // Read the location here rather than trusting the render
                     // thread's copy, which is a frame stale by now.
                     FVector loc{};
-                    if (ReadActorLocationFast(pawn, loc))
+                    if (flying && ReadActorLocationFast(pawn, loc))
                         ApplyMinecraftFly(pawn, loc, step);
                 }
             }
@@ -8997,7 +9042,7 @@ namespace
             return;
         QueueGameThread([pawn]()
         {
-            try { if (IsLiveObject(pawn)) RefreshFlyStreaming(pawn, true); }
+            try { if (IsLiveObject(pawn) && pawn == GetLocalPawn()) RefreshFlyStreaming(pawn, true); }
             catch (...) {}
         });
     }
@@ -9383,15 +9428,7 @@ namespace
             return;
 
         if (g_movementBackup.mv && g_movementBackup.mv != mv)
-        {
-            if (g_movementBackup.walkValid)
-                WriteFloatField(g_movementBackup.mv, AH::Move_MaxWalkSpeed, g_movementBackup.walkSpeed);
-            if (g_movementBackup.flyValid)
-                WriteFloatField(g_movementBackup.mv, AH::Move_MaxFlySpeed, g_movementBackup.flySpeed);
-            if (g_movementBackup.modeValid)
-                WriteUInt8Field(g_movementBackup.mv, AH::Move_MovementMode, g_movementBackup.mode);
-            g_movementBackup = {};
-        }
+            g_movementBackup = {}; // previous pawn may already have been destroyed
 
         g_movementBackup.mv = mv;
         if (needWalk && !g_movementBackup.walkValid)
@@ -9404,7 +9441,7 @@ namespace
 
     void RestoreMovementWalk()
     {
-        if (g_movementBackup.walkValid && WriteFloatField(g_movementBackup.mv, AH::Move_MaxWalkSpeed, g_movementBackup.walkSpeed))
+        if (IsLiveObject(reinterpret_cast<UObject*>(g_movementBackup.mv)) && g_movementBackup.walkValid && WriteFloatField(g_movementBackup.mv, AH::Move_MaxWalkSpeed, g_movementBackup.walkSpeed))
             LOG("Speed restored: MaxWalkSpeed=%.1f", g_movementBackup.walkSpeed);
         g_movementBackup.walkValid = false;
     }
@@ -9416,12 +9453,13 @@ namespace
     bool SetMovementModeViaEngine(uint8_t* mv, uint8_t mode)
     {
         UObject* movementObject = reinterpret_cast<UObject*>(mv);
+        if (!IsLiveObject(movementObject))
+            return false;
         UFunction* fn = CachedObjectClassFn(movementObject, "SetMovementMode");
         if (!fn)
             return false;
         P_SetMovementMode p{ mode, 0 };
-        movementObject->ProcessEvent(fn, &p);
-        return true;
+        return movementObject->ProcessEvent(fn, &p);
     }
 
     // The exit half of EnterFlyingMovementMode, reached from the render tick's
@@ -9429,37 +9467,32 @@ namespace
     // re-runs FindFloor by itself on the next tick.
     void ScheduleLeaveFlyingMovementMode(uint8_t* mv, uint8_t mode)
     {
-        if (!mv)
-            return;
-        if (!InstallProcessEventHook())
+        if (!mv || !InstallProcessEventHook())
         {
-            if (WriteUInt8Field(mv, AH::Move_MovementMode, mode))
-                LOG("Fly restored: MovementMode=%u by raw write (no game-thread pump); "
-                    "the floor and movement base are NOT re-found on this path.", (unsigned)mode);
+            LOG("Fly restore deferred: movement component or game-thread pump unavailable.");
             return;
         }
         QueueGameThread([mv, mode]()
         {
             try
             {
-                if (!IsLiveObject(reinterpret_cast<UObject*>(mv)) ||
-                    !Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+                UObject* pawn = GetLocalPawn();
+                if (!IsLiveObject(pawn) || !IsLiveObject(reinterpret_cast<UObject*>(mv)) ||
+                    !Mem::IsReadable(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement, sizeof(void*)) ||
+                    *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement) != mv ||
+                    Features::Get().flyHack || Features::Get().noclip)
                     return;
-                bool viaEngine = SetMovementModeViaEngine(mv, mode);
-                uint8_t& live = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
-                bool forced = live != mode;
-                if (forced)
-                    live = mode;
-                LOG("Fly restored: MovementMode=%u via %s", (unsigned)mode,
-                    viaEngine && !forced ? "SetMovementMode" : "raw write");
+                bool restored = SetMovementModeViaEngine(mv, mode) &&
+                    Mem::IsReadable(mv + AH::Move_MovementMode, 1) && mv[AH::Move_MovementMode] == mode;
+                LOG("Fly restore: MovementMode=%u engine confirmed=%s", (unsigned)mode, restored ? "yes" : "no");
             }
-            catch (...) {}
+            catch (...) { LOG("Fly restore: engine call failed; no raw mode write attempted."); }
         });
     }
 
     void RestoreMovementFly()
     {
-        if (g_movementBackup.flyValid && WriteFloatField(g_movementBackup.mv, AH::Move_MaxFlySpeed, g_movementBackup.flySpeed))
+        if (IsLiveObject(reinterpret_cast<UObject*>(g_movementBackup.mv)) && g_movementBackup.flyValid && WriteFloatField(g_movementBackup.mv, AH::Move_MaxFlySpeed, g_movementBackup.flySpeed))
             LOG("Fly restored: MaxFlySpeed=%.1f", g_movementBackup.flySpeed);
         if (g_movementBackup.modeValid)
             ScheduleLeaveFlyingMovementMode(g_movementBackup.mv, g_movementBackup.mode);
@@ -9504,32 +9537,31 @@ namespace
     // still references the component it was standing on; fly away, let that
     // component's level stream out, and the game walks the dangling pointer on the
     // next jump -- its own call, through its own stale pointer, uncatchable by us.
-    void EnterFlyingMovementMode(UObject* pawn, uint8_t* mv)
+    bool EnterFlyingMovementMode(UObject* pawn, uint8_t* mv)
     {
-        if (!Mem::IsReadable(mv + AH::Move_MovementMode, 1))
-            return;
-        uint8_t& mode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
-        if (mode == AH::MOVE_Flying)
-            return; // steady state: no per-frame ProcessEvent
+        if (!IsLiveObject(pawn) || !IsLiveObject(reinterpret_cast<UObject*>(mv)) ||
+            !Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+            return false;
+        if (mv[AH::Move_MovementMode] == AH::MOVE_Flying)
+            return true;
 
         UObject* baseBefore = ReadMovementBase(pawn);
-
-        bool viaEngine = SetMovementModeViaEngine(mv, AH::MOVE_Flying);
-        // Fallback so fly still works if SetMovementMode cannot be resolved. It
-        // carries the dangling-base hazard above, so the log says so.
-        if (mode != AH::MOVE_Flying)
+        if (!SetMovementModeViaEngine(mv, AH::MOVE_Flying) ||
+            !Mem::IsReadable(mv + AH::Move_MovementMode, 1) ||
+            mv[AH::Move_MovementMode] != AH::MOVE_Flying)
         {
-            mode = AH::MOVE_Flying;
-            if (!viaEngine)
-                LOG("Fly: SetMovementMode unavailable; forced MovementMode=Flying by raw write. "
-                    "The stale movement base is NOT cleared on this path -- jumping may crash the game.");
+            static ULONGLONG lastLogMs = 0;
+            ULONGLONG now = GetTickCount64();
+            if (now - lastLogMs > 3000)
+            {
+                LOG("Fly: engine refused MOVE_Flying; movement skipped to preserve floor/base state.");
+                lastLogMs = now;
+            }
+            return false;
         }
-
-        UObject* baseAfter = ReadMovementBase(pawn);
-        LOG("Fly: entered MOVE_Flying via %s; movement base %p -> %p%s",
-            viaEngine ? "SetMovementMode" : "raw write",
-            (void*)baseBefore, (void*)baseAfter,
-            baseBefore && !baseAfter ? " (stale base cleared)" : "");
+        LOG("Fly: entered MOVE_Flying through engine; movement base %p -> %p",
+            (void*)baseBefore, (void*)ReadMovementBase(pawn));
+        return true;
     }
 
     bool ApplyInventoryIgnoreOverWeight(UObject* inventory, bool ignore)
@@ -12665,6 +12697,49 @@ void Features::RunConsoleCommand(const char* command)
     catch (...) { LOG("RunConsoleCommand: exception (ignored)"); }
 }
 
+bool Features::QueueGameAction(std::function<void()> action)
+{
+    if (!G::sdkReady.load() || !G::running.load() || !action || !InstallProcessEventHook())
+        return false;
+    std::lock_guard<std::mutex> lock(g_gtQueueMutex);
+    if (g_preparingUnload.load() || g_gtQueue.size() >= 128)
+        return false;
+    g_gtQueue.push_back(std::move(action));
+    g_gtHasWork = true;
+    return true;
+}
+
+bool Features::PrepareUnload()
+{
+    if (Get().flyHack || Get().noclip)
+    { LOG("Disable fly/noclip before ejecting so movement can be restored."); return false; }
+    if (!G::sdkReady.load()) return true;
+    if (!InstallProcessEventHook()) return false;
+    if (g_preparingUnload.exchange(true)) return false;
+    // Keep the completion alive if the game stops pumping before this timeout.
+    auto result = std::make_shared<std::atomic<int>>(0);
+    {
+        std::lock_guard<std::mutex> lock(g_gtQueueMutex);
+        g_gtQueue.push_back([result]()
+        {
+            int pending = 0;
+            if (!result->compare_exchange_strong(pending, 1)) return;
+            bool ok = false;
+            try { ok = Workbench::CleanupGameThread(); } catch (...) {}
+            result->store(ok ? 2 : 3);
+        });
+        g_gtHasWork = true;
+    }
+    const ULONGLONG deadline = GetTickCount64() + 2500;
+    while (GetTickCount64() < deadline && result->load() < 2) Sleep(10);
+    if (result->load() == 2) return true;
+    int pending = 0;
+    result->compare_exchange_strong(pending, 4); // cancel an unstarted cleanup
+    g_preparingUnload = false;
+    LOG("Eject deferred: close Nora and resume gameplay, then press END again.");
+    return false;
+}
+
 void Features::NoteGameThread()
 {
     // The WndProc thread IS the game thread in UE4 (window messages are pumped from
@@ -12981,8 +13056,14 @@ int  Features::HordePendingCount(){ return g_hordePending.load(); }
 // ---- AI ownership lock (native ProcessEvent-level "they're ours, permanently") ----
 void Features::SetOwnershipLock(bool on)
 {
+    // Disabling the experimental controller must not disable ordinary squad safety.
+    on = on || g_spawnedAllyCount.load() > 0;
     if (on)
     {
+        if (!g_fnHookAreFriendly.load())
+            g_fnHookAreFriendly.store(CachedFn(AH::Fn_AIUtils_AreFriendlyCharacters));
+        if (!g_fnHookSetCharacterAggressive.load())
+            g_fnHookSetCharacterAggressive.store(CachedFn(AH::Fn_AIUtils_SetCharacterAggressive));
         // Resolve (and cache) the three un-ally UFunctions we compare against, and make
         // sure the ProcessEvent detour is live so the swallow can actually fire.
         if (!g_fnOwnSwitchTeamAttitude.load())
@@ -13522,6 +13603,8 @@ void Features::HordeDeleteLocation(int i)
 // =======================================================================
 int Features::AiSquadCount() { return g_spawnedAllyCount.load(); }
 int Features::AiSelectedCount() { return (int)g_selectedAi.size(); }
+bool Features::AiIsSelected(unsigned long long id) { return IsSelectedAi(reinterpret_cast<UObject*>(id)); }
+int Features::WeaponColorParameterCount() { return g_weaponColorTargets.load(); }
 
 // Build the nearby-AI list for the menu (render thread). Each row carries a stable
 // id = (uintptr_t)actor used for select/dispatch, plus its squad/selected state.
@@ -13607,8 +13690,9 @@ static void RecruitListGameThread(std::vector<UObject*> targets)
             for (UObject* ai : targets)
             {
                 if (!AiUsable(ai) || ai == player) continue;
-                ApplyAiBodyguard(ai, player, playerLoc); // friendly + follow baseline
-                SquadAdd(ai);                            // join the squad (driven every pump)
+                SquadAdd(ai); // protect before the first engine dispatch
+                if (!IsSquadMember(ai)) continue;
+                ApplyAiBodyguard(ai, player, playerLoc);
                 ++n;
             }
             LOG("Recruit: %d unit(s) joined the squad", n);
@@ -13701,6 +13785,12 @@ void Features::AiDispatchAttack()
                 if (!AiUsable(u)) continue;
                 FVector loc{}; if (!ReadActorLocationFast(u, loc)) continue;
                 UObject* target = NearestNode(enemies, loc, player, -1, u);
+                if (Bodyguards::Contains(u))
+                {
+                    if (Bodyguards::AttackTarget(u, target)) ++n;
+                    continue;
+                }
+
                 if (target && InjectAttack(u, target, player, 0 /*friendly to you*/)) ++n;
             }
             LOG("AiDispatchAttack: %d unit(s) sent at the nearest enemy", n);
@@ -13837,8 +13927,8 @@ namespace
         { "AtomicHeart.EquipableItem",        "Mesh",                 AH::Weapon_Mesh,                     "AH::Weapon_Mesh" },
         { "AtomicHeart.EquipableItem",        "ItemDataAsset",        AH::Weapon_ItemDataAsset,            "AH::Weapon_ItemDataAsset" },
         { "EasyBallistics.EBBarrel",          "Ammo",                 AH::EBBarrel_Ammo,                   "AH::EBBarrel_Ammo" },
-        { "AtomicHeart.AIMixedNavigationCharacter", "Mercuna3DMovement", AH::Mixed_Mercuna3DMovement,      "AH::Mixed_Mercuna3DMovement" },
-        { "AtomicHeart.AIMixedNavigationCharacter", "MercunaNavigation", AH::Mixed_MercunaNavigation,      "AH::Mixed_MercunaNavigation" },
+        { "AtomicHeart.AIMixedNavigationCharacter", "Mercuna3DMovementComponent", AH::Mixed_Mercuna3DMovement,      "AH::Mixed_Mercuna3DMovement" },
+        { "AtomicHeart.AIMixedNavigationCharacter", "MercunaNavigationComponent", AH::Mixed_MercunaNavigation,      "AH::Mixed_MercunaNavigation" },
     };
 
     volatile LONG g_offsetVerifyRunning = 0;
@@ -14451,6 +14541,9 @@ void Features::SolveCurrentPuzzle()
 
 void Features::WorkerTick()
 {
+    if (g_preparingUnload.load()) return;
+    TestHarness::WorkerTick();
+    if (G::sdkReady.load()) Workbench::WorkerTick();
     // Worker-thread heartbeat (called from the dllmain idle loop). All heavy
     // GObjects scanning happens here so the render thread never stalls.
     // ProcessEvent itself is deferred to the render Tick.
@@ -14651,7 +14744,7 @@ static UObject* GetMercunaNavComp(UObject* ai)
     static UClass* navCls = nullptr;
     if (!Mem::IsReadable(navCls, 0x30)) navCls = FindObjectFast(AH::Cls_MercunaNavComponent);
     UFunction* fn = CachedFn(AH::Fn_ActorGetComponentsByClass);
-    if (!navCls || !fn || !Mem::IsReadable(ai, 0x30)) return nullptr;
+    if (!IsLiveObject(navCls) || !IsLiveObject(fn) || !IsLiveObject(ai)) return nullptr;
     UObject* found = nullptr;
     try
     {
@@ -15461,6 +15554,7 @@ static void DriveTwinsFollowGameThread()
         if (!Mem::IsReadable(twin, 0x30) || twin == player) continue;
         if (g_hookBodyguardMode.load(std::memory_order_relaxed) && IsHookBodyguard(twin)) continue;
         if (!IsMixedNavCharacter(twin) || !FollowPawnUsable(twin)) continue;
+        if (Bodyguards::Contains(twin) && !Bodyguards::AllowsFollow(twin)) continue;
         TwinState& s = g_twin[twin];
         dbgAny = true;
 
@@ -15475,17 +15569,11 @@ static void DriveTwinsFollowGameThread()
         // Fighting -> leave her to her own combat AI (movement + montages + flight).
         if (s.engagedUntilMs > now) { s.followState = 0; dbgSkip = "engaged"; continue; }
 
-        // Airborne / mid-flight -> do NOT drive a ground follow into her; wait until she lands.
-        // (Re-pinning nav or overwriting move keys mid-air is what bugged her flight.)
-        uint8_t* base = reinterpret_cast<uint8_t*>(twin);
-        uint8_t* mv = Mem::IsReadable(base + AH::Char_CharacterMovement, sizeof(void*))
-            ? *reinterpret_cast<uint8_t**>(base + AH::Char_CharacterMovement) : nullptr;
-        if (Mem::IsReadable(mv + AH::Move_MovementMode, 1))
-            dbgMode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
-        // If she's flying on her OWN (not our forced traversal), leave her be. While WE force
-        // flight to cross stairs (traverse3D), keep driving her with Mercuna.
-        if (dbgMode == AH::MOVE_Flying && !s.traverse3D)
-        { s.followState = 0; dbgSkip = "flying"; continue; }
+        // Mercuna supports the Twin's current navigation mode. Skipping every
+        // airborne frame stranded idle hovering Twins forever.
+        uint8_t* mv = GetCharacterMovementPtr(twin);
+        if (!IsLiveObject(reinterpret_cast<UObject*>(mv))) continue;
+        if (Mem::IsReadable(mv + AH::Move_MovementMode, 1)) dbgMode = mv[AH::Move_MovementMode];
         if (Mem::IsReadable(mv + 0xE4, sizeof(FVector)))
         { FVector v = *reinterpret_cast<FVector*>(mv + 0xE4); dbgVel = sqrtf(v.X*v.X + v.Y*v.Y + v.Z*v.Z); }
 
@@ -15534,12 +15622,12 @@ static void DriveTwinsFollowGameThread()
             // linearly -> she stalls), so every few seconds FLUSH with a STANDALONE Stop on its
             // own pump -- NEVER in the same pump as a Move (Stop+Move together cancels the move
             // and she freezes, confirmed by the vel=0 logs). Between flushes, re-target on a timer.
-            if (now - s.lastFlushMs > 4000)
+            if (stuck && now - s.lastFlushMs > 4000)
             {
                 MercunaStop(twin);          // flush accumulated path requests (own pump, no Move)
                 s.lastFlushMs = now;
             }
-            else if (now - s.lastGoalMs > 300)
+            else if (now - s.lastGoalMs > 750)
             {
                 dbgMerc = MercunaMoveToPlayer(twin, player, stopU, 600.0f) ? 1 : 0;
                 s.lastGoalMs = now; ++s.mercCount;
@@ -15621,6 +15709,12 @@ void DriveSquadVelocityGameThread()
     {
         if (!Mem::IsReadable(ai, 0x30) || ai == player) continue;
         if (!AiUsable(ai)) continue; // AHAICharacter
+        if (Bodyguards::Contains(ai))
+        {
+            UObject* target = ReadAiTargetField(ai);
+            if (target && BodyguardEngine::Protected(target)) BodyguardEngine::ClearCombat(ai);
+            if (!Bodyguards::AllowsFollow(ai)) continue;
+        }
         const bool hookOwned = g_hookBodyguardMode.load(std::memory_order_relaxed) &&
                                IsHookBodyguard(ai);
         if (hookOwned) continue; // never share SDK/blackboard/input/velocity movement with Hook Bodyguards
@@ -15666,11 +15760,9 @@ void DriveSquadVelocityGameThread()
         float planarDist = sqrtf(to.X * to.X + to.Y * to.Y);
         InjectState& followState = g_inject[ai];
         const float memberStopU = (hookOwned ? kHookFollowStopM : stopM) * kUnitsPerMetre;
-        const float memberStartU = (hookOwned ? kHookFollowStartM : stopM) * kUnitsPerMetre;
+        const float memberStartU = (stopM + 1.0f) * kUnitsPerMetre;
         bool wasMoving = followState.followMoving;
-        bool needsToMove = hookOwned
-            ? (wasMoving ? planarDist > memberStopU : planarDist > memberStartU)
-            : planarDist > memberStopU;
+        bool needsToMove = wasMoving ? planarDist > memberStopU : planarDist > memberStartU;
         followState.followMoving = needsToMove;
         if (hookOwned && needsToMove) ++hookMoving;
 
@@ -15767,7 +15859,7 @@ void DriveSquadVelocityGameThread()
             {
                 goal = aiLoc; // already within the ring -> destination == her position -> stop
             }
-            bool refreshGoal = !hookOwned || wasMoving != needsToMove ||
+            bool refreshGoal = wasMoving != needsToMove ||
                                nowm - followState.lastFollowGoalMs >= 250;
             if (refreshGoal)
             {
@@ -15778,7 +15870,7 @@ void DriveSquadVelocityGameThread()
                 SetControllerForceFollow(ctrl, needsToMove);
                 SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
                 SetControllerFollowSpeed(ctrl);
-                if (hookOwned && needsToMove)
+                if (needsToMove)
                     ClearControllerFocus(ctrl); // face velocity, not backwards toward the player
                 else
                     FocusControllerOnActor(ctrl, player);
@@ -15787,16 +15879,18 @@ void DriveSquadVelocityGameThread()
             // Start one direct, non-pathfinding controller request. Do not restart an
             // active request; if measured displacement stalls, StopMovement + recovery
             // below deliberately replaces it.
-            if (hookOwned && needsToMove && nowm - followState.lastMoveMs >= 750)
+            if (!GetMercunaNavComp(ai) && needsToMove && nowm - followState.lastMoveMs >= 750)
             {
                 uint8_t moveStatus = ControllerMoveStatus(ctrl);
                 bool requestNeeded = !wasMoving || moveStatus != 3;
                 if (requestNeeded)
                 {
                     followState.lastMoveMs = nowm;
-                    MoveControllerToActor(ctrl, ai, player, memberStopU);
+                    MoveControllerToActor(ctrl, ai, player, memberStopU, true);
                 }
             }
+            if (!needsToMove && wasMoving && !GetMercunaNavComp(ai))
+                StopHookControllerMovement(ctrl);
             ++followed;
         }
 
@@ -15817,7 +15911,7 @@ void DriveSquadVelocityGameThread()
                 followState.followLastProgressMs = nowm;
                 UObject* ctrl = GetAiController(ai);
                 RecoverHookFollowerMovement(ai, ctrl);
-                if (ctrl) MoveControllerToActor(ctrl, ai, player, memberStopU);
+                if (ctrl) MoveControllerToActor(ctrl, ai, player, memberStopU, true);
                 if (!followState.velocityFallback)
                 {
                     followState.velocityFallback = true;
@@ -15841,7 +15935,7 @@ void DriveSquadVelocityGameThread()
         }
 
         // (LAYER 3) Mercuna nav bonus for pawns that have a nav component.
-        if (planarDist > memberStopU)
+        if (needsToMove && GetMercunaNavComp(ai))
         {
             ULONGLONG& last = g_navReissueMs[ai];
             if (nowm - last > 900) { last = nowm; if (MercunaMoveToPlayer(ai, player, memberStopU, 600.0f)) ++mercuna; }
@@ -15851,16 +15945,16 @@ void DriveSquadVelocityGameThread()
     // Prune dead members from the per-member maps so they can't grow unbounded.
     if (g_navReissueMs.size() > 64)
         for (auto it = g_navReissueMs.begin(); it != g_navReissueMs.end(); )
-        { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_navReissueMs.erase(it); }
+        { if (IsLiveObject(it->first) && IsSquadMember(it->first)) ++it; else it = g_navReissueMs.erase(it); }
     if (g_stashedSchedule.size() > 64)
         for (auto it = g_stashedSchedule.begin(); it != g_stashedSchedule.end(); )
-        { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_stashedSchedule.erase(it); }
+        { if (IsLiveObject(it->first) && IsSquadMember(it->first)) ++it; else it = g_stashedSchedule.erase(it); }
     if (g_engagedUntilMs.size() > 64)
         for (auto it = g_engagedUntilMs.begin(); it != g_engagedUntilMs.end(); )
-        { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_engagedUntilMs.erase(it); }
+        { if (IsLiveObject(it->first) && IsSquadMember(it->first)) ++it; else it = g_engagedUntilMs.erase(it); }
     if (g_lastThreatMs.size() > 64)
         for (auto it = g_lastThreatMs.begin(); it != g_lastThreatMs.end(); )
-        { if (Mem::IsReadable(it->first, 0x30)) ++it; else it = g_lastThreatMs.erase(it); }
+        { if (IsLiveObject(it->first) && IsSquadMember(it->first)) ++it; else it = g_lastThreatMs.erase(it); }
 
     static ULONGLONG lastLog = 0;
     if (nowm - lastLog > 3000)
@@ -15877,6 +15971,7 @@ void DriveSquadVelocityGameThread()
 
 static void TickImpl()
 {
+    if (g_preparingUnload.load()) return;
     using namespace UE;
     auto& st = Features::Get();
 
@@ -15886,6 +15981,8 @@ static void TickImpl()
     lastTickMs = nowMs;
     dt = ClampDeltaSeconds(dt);
 
+    TestHarness::RenderTick();
+    Workbench::Tick();
     UpdateGameInputBlock();
     UpdateInstantPuzzleResolveToggle();
     UpdateDebugDiagnostics();
@@ -15973,10 +16070,8 @@ static void TickImpl()
 
     if (Mem::IsReadable(set, AH::Set_InstigatedDmgMult + 0x10))
     {
-        if (!st.godMode)
-            NormalizeDisabledDamageAttr(set, AH::Set_IncomingDamageMult, "God mode incoming damage", false);
-        if (!st.oneHitKill)
-            NormalizeDisabledDamageAttr(set, AH::Set_InstigatedDmgMult, "One-hit outgoing damage", true);
+        // Zero incoming damage can belong to a story scene or safe area.
+        // Only restore attributes this session actually modified on a toggle edge.
 
         if (st.godMode)
         {
@@ -16044,14 +16139,20 @@ static void TickImpl()
     {
         if (pawn != noclipColPawn)
         {
-            SetActorCollisionEnabled(pawn, false);
-            noclipColPawn = pawn;
+            if (Features::QueueGameAction([pawn]()
+            {
+                if (IsLiveObject(pawn) && pawn == GetLocalPawn() && Features::Get().noclip)
+                    SetActorCollisionEnabled(pawn, false);
+            })) noclipColPawn = pawn;
         }
     }
     else if (noclipColPawn)
     {
-        SetActorCollisionEnabled(pawn, true);
-        noclipColPawn = nullptr;
+        if (Features::QueueGameAction([pawn]()
+        {
+            if (IsLiveObject(pawn) && pawn == GetLocalPawn() && !Features::Get().noclip)
+                SetActorCollisionEnabled(pawn, true);
+        })) noclipColPawn = nullptr;
     }
 
     if (wasSpeedHack && !st.speedHack)
@@ -16239,3 +16340,169 @@ void Features::Tick()
 
 
 
+
+bool Features::TestFlyPulse(int axis, float seconds)
+{
+    if (axis < 1 || axis > 4 || !std::isfinite(seconds) || seconds <= 0 || seconds > 2 ||
+        !(Get().flyHack || Get().noclip) || G::menuOpen.load()) return false;
+    g_testFlyAxis = axis;
+    g_testFlyUntil = GetTickCount64() + static_cast<ULONGLONG>(seconds * 1000);
+    return true;
+}
+
+std::string Features::TestSnapshotJson()
+{
+    std::ostringstream out;
+    out << std::boolalpha;
+    UObject* pawn = GetLocalPawn(); FVector location{};
+    bool live = IsLiveObject(pawn);
+    bool position = live && ReadActorLocationFast(pawn, location) && std::isfinite(location.X) && std::isfinite(location.Y) && std::isfinite(location.Z);
+    out << "{\"player_live\":" << live << ",\"game_thread_id\":" << GetCurrentThreadId()
+        << ",\"menu_open\":" << G::menuOpen.load() << ",\"fly_enabled\":" << Get().flyHack
+        << ",\"position\":";
+    if (position) out << '[' << location.X << ',' << location.Y << ',' << location.Z << ']'; else out << "null";
+    float health = 0, maximum = 0;
+    out << ",\"health\":";
+    if (live && ::ReadCharacterHealth(pawn, health, maximum) && std::isfinite(health)) out << health; else out << "null";
+    uint8_t* movement = live ? GetCharacterMovementPtr(pawn) : nullptr;
+    int mode = IsLiveObject(reinterpret_cast<UObject*>(movement)) && Mem::IsReadable(movement + AH::Move_MovementMode, 1) ? movement[AH::Move_MovementMode] : -1;
+    out << ",\"movement_mode\":" << mode << ",\"squad\":[";
+    std::vector<UObject*> squad;
+    { std::lock_guard<std::mutex> lock(g_squadMutex); squad = g_spawnedAllies; }
+    int sampled = 0;
+    for (UObject* ally : squad)
+    {
+        if (!IsLiveObject(ally) || sampled >= 32) continue;
+        if (sampled++) out << ',';
+        FVector at{}; bool haveLocation = ReadActorLocationFast(ally, at) && std::isfinite(at.X) && std::isfinite(at.Y) && std::isfinite(at.Z);
+        UObject* target = ReadAiTargetField(ally);
+        out << "{\"index\":" << ally->Index() << ",\"targets_player\":" << (target == pawn && live)
+            << ",\"target_live\":" << IsLiveObject(target) << ",\"position\":";
+        if (haveLocation) out << '[' << at.X << ',' << at.Y << ',' << at.Z << ']'; else out << "null";
+        out << '}';
+    }
+    out << "],\"squad_total\":" << squad.size() << ",\"ownership_blocks\":" << g_ownershipSwallows.load() << ",\"regular_companions\":" << Bodyguards::SnapshotJson() << '}';
+    return out.str();
+}
+
+bool Features::TestTurn(float degrees)
+{
+    if (!std::isfinite(degrees) || std::abs(degrees) > 180) return false;
+    return QueueGameAction([degrees]()
+    {
+        UObject* controller = GetPlayerController(); FRotator rotation{};
+        if (!IsLiveObject(controller) || !GetControlRotation(rotation)) return;
+        rotation.Yaw += degrees;
+        if (UFunction* fn = CachedObjectClassFn(controller, "SetControlRotation"))
+            controller->ProcessEvent(fn, &rotation);
+    });
+}
+
+bool BodyguardEngine::Usable(UE::UObject* actor) { return FollowPawnUsable(actor); }
+bool BodyguardEngine::CombatCapable(UE::UObject* actor)
+{
+    return AiUsable(actor) && AiIsCombatCapable(actor) && ControllerBlackboardReady(GetAiController(actor));
+}
+bool BodyguardEngine::Protected(UE::UObject* actor)
+{
+    return IsLiveObject(actor) && (actor == GetLocalPawn() || IsSquadMember(actor) ||
+        IsHookBodyguard(actor) || Bodyguards::Contains(actor));
+}
+bool BodyguardEngine::LiveEnemy(UE::UObject* actor) { return IsLiveCombatTarget(actor); }
+UE::UObject* BodyguardEngine::Target(UE::UObject* actor) { return ReadAiTargetField(actor); }
+bool BodyguardEngine::Location(UE::UObject* actor, UE::FVector& out) { return ReadActorLocationFast(actor, out); }
+
+bool BodyguardEngine::Friendly(UE::UObject* actor, UE::UObject* player)
+{
+    if (!AiUsable(actor) || !IsLiveObject(player)) return false;
+    UFunction* get = CachedFn(AH::Fn_AHBaseCharacter_GetGenericTeamId);
+    if (!IsLiveObject(get)) return false;
+    P_GetGenericTeamId playerTeam{};
+    if (!player->ProcessEvent(get, &playerTeam) || playerTeam.ReturnValue == 255) return false;
+    uint8_t current = 255;
+    if (!ReadAiTeamId(actor, current)) return false;
+    EnsureOriginalTeamRecorded(actor);
+    if (current != playerTeam.ReturnValue)
+    {
+        if (!SwitchAiTeamFriendlyTo(actor, player)) return false;
+        if (!ReadAiTeamId(actor, current)) return false;
+        if (current != playerTeam.ReturnValue && !SetAiTeamIdTracked(actor, playerTeam.ReturnValue)) return false;
+    }
+    ClearAiAggressiveLatch(actor);
+    return ReadAiTeamId(actor, current) && current == playerTeam.ReturnValue;
+}
+void BodyguardEngine::ClearCombat(UE::UObject* actor)
+{
+    if (!AiUsable(actor)) return;
+    WriteAiTargetField(actor, nullptr);
+    SetAiTargetEnemy(actor, nullptr, true);
+    if (UObject* controller = GetAiController(actor))
+    {
+        SetControllerTargetEnemy(controller, nullptr, true);
+        SetControllerAggressive(controller, false);
+    }
+    StopCharacterAggressive(actor);
+    ClearAiAggressiveLatch(actor);
+    g_engagedUntilMs.erase(actor);
+    g_lastThreatMs.erase(actor);
+    g_inject[actor].target = nullptr;
+}
+bool BodyguardEngine::Attack(UE::UObject* actor, UE::UObject* enemy, UE::UObject* player)
+{
+    if (!Bodyguards::Contains(actor) || Protected(enemy) || !LiveEnemy(enemy)) return false;
+    bool applied = InjectAttack(actor, enemy, player, 0);
+    if (applied) g_engagedUntilMs[actor] = GetTickCount64() + 400;
+    return applied;
+}
+void BodyguardEngine::StopMovement(UE::UObject* actor)
+{
+    if (!Usable(actor)) return;
+    if (UObject* controller = GetAiController(actor))
+    {
+        SetControllerForceFollow(controller, false);
+        FVector location{};
+        if (ReadActorLocationFast(actor, location)) SetControllerFollowLocation(controller, location);
+        UFunction* stop = CachedObjectClassFn(controller, "StopMovement");
+        if (IsLiveObject(stop)) ProcessNoParams(controller, stop);
+    }
+    g_inject[actor].followMoving = false;
+}
+void BodyguardEngine::PrepareFollow(UE::UObject* actor, UE::UObject* player, const UE::FVector& location)
+{
+    DriveFollow(actor, player, location, false);
+}
+void Features::AiOrderSelected(int order)
+{
+    if (order < 0 || order > 2) return;
+    auto targets = DispatchTargets();
+    QueueGameThread([targets, order]()
+    {
+        for (UObject* actor : targets)
+            if (!IsHookBodyguard(actor)) Bodyguards::SetOrder(actor, static_cast<Bodyguards::Order>(order));
+    });
+}
+
+void Features::AiReleaseRegularCompanions(bool selectedOnly)
+{
+    std::vector<UObject*> targets;
+    for (const auto& guard : Bodyguards::Snapshot())
+    {
+        UObject* actor = reinterpret_cast<UObject*>(guard.id);
+        if (!selectedOnly || IsSelectedAi(actor)) targets.push_back(actor);
+    }
+    for (UObject* actor : targets)
+        g_selectedAi.erase(std::remove(g_selectedAi.begin(), g_selectedAi.end(), actor), g_selectedAi.end());
+    QueueGameThread([targets]()
+    {
+        for (UObject* actor : targets)
+            if (Bodyguards::Contains(actor) && !IsHookBodyguard(actor))
+            {
+                BodyguardEngine::StopMovement(actor);
+                SquadRemove(actor); // remove ownership before restoring the original faction
+                ApplyAiRelease(actor);
+                g_inject.erase(actor);
+                g_engagedUntilMs.erase(actor);
+                g_lastThreatMs.erase(actor);
+            }
+    });
+}

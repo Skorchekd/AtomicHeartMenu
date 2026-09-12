@@ -18,6 +18,8 @@
 #include "../menu/menu.h"
 #include "../features/features.h"
 #include "../sdk/ue4.h"
+#include "../sdk/scanner.h"
+#include "../core/memory.h"
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -46,6 +48,45 @@ namespace
     void*                 g_presentTarget = nullptr;
     void*                 g_resizeTarget = nullptr;
     void*                 g_executeTarget = nullptr;
+
+    // RTSS restores its DXGI entry patch after injection. Chain its existing
+    // Present implementation instead of competing for the same five bytes.
+    // The ABI comes from the observed vtable jump chain, never a guessed RVA.
+    void* ResolvePresentChain(void* entry)
+    {
+        uint8_t* cursor = static_cast<uint8_t*>(entry);
+        for (int depth = 0; depth < 4; ++depth)
+        {
+            if (!Mem::IsExecutable(cursor, 6)) return entry;
+            HMODULE owner = nullptr; wchar_t path[MAX_PATH]{};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(cursor), &owner) && GetModuleFileNameW(owner, path, MAX_PATH))
+            {
+                const wchar_t* name = wcsrchr(path, L'\\'); name = name ? name + 1 : path;
+                if (_wcsicmp(name, L"RTSSHooks64.dll") == 0)
+                {
+                    if (!Scanner::IsFunctionEntry(cursor, false))
+                    { LOG("RTSS Present target is not a verified function entry; chaining refused."); return entry; }
+                    LOG("Present compatibility: chaining existing RTSS implementation %p (DXGI entry %p).", cursor, entry);
+                    return cursor;
+                }
+            }
+            if (cursor[0] == 0xE9)
+            {
+                int32_t displacement = 0; memcpy(&displacement, cursor + 1, 4);
+                cursor += 5 + displacement;
+            }
+            else if (cursor[0] == 0xFF && cursor[1] == 0x25)
+            {
+                int32_t displacement = 0; memcpy(&displacement, cursor + 2, 4);
+                auto slot = cursor + 6 + displacement;
+                if (!Mem::IsReadable(slot, sizeof(void*))) return entry;
+                memcpy(&cursor, slot, sizeof(cursor));
+            }
+            else return entry;
+        }
+        return entry;
+    }
 
     // ---- D3D12 state -------------------------------------------------------
     struct FrameContext
@@ -805,17 +846,17 @@ bool DX12Hook::Install()
         auto createHook = [](void* target, void* detour, void** original, const char* name) -> bool
         {
             MH_STATUS st = MH_CreateHook(target, detour, original);
-            if (st == MH_OK || st == MH_ERROR_ALREADY_CREATED) return true;
+            if (st == MH_OK && *original) return true;
             LOG("MH_CreateHook(%s) failed status=%d target=%p", name, st, target);
             return false;
         };
 
         // IDXGISwapChain vtable: Present=8, ResizeBuffers=13
         // ID3D12CommandQueue vtable: ExecuteCommandLists=10
-        g_presentTarget = swapVT[8];
+        g_presentTarget = ResolvePresentChain(swapVT[8]);
         g_resizeTarget = swapVT[13];
         g_executeTarget = queueVT[10];
-        if (!createHook(swapVT[8],   &hkPresent,             reinterpret_cast<void**>(&oPresent), "Present") ||
+        if (!createHook(g_presentTarget, &hkPresent,             reinterpret_cast<void**>(&oPresent), "Present") ||
             !createHook(swapVT[13],  &hkResizeBuffers,       reinterpret_cast<void**>(&oResizeBuffers), "ResizeBuffers") ||
             !createHook(queueVT[10], &hkExecuteCommandLists, reinterpret_cast<void**>(&oExecuteCommandLists), "ExecuteCommandLists"))
         {

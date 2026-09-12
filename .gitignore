@@ -37,3 +37,9 @@ out/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Local SDK captures, tool builds, and save backups
+/work/
+__pycache__/
+
+AtomicHeartMenu.cache/

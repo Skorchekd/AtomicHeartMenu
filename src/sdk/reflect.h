@@ -62,6 +62,10 @@ namespace Reflect
     // moment the class loads, with no instance in existence.
     int FindPropertyOffsetInStruct(UE::UObject* structOrClass, const char* propName);
 
+    // Validate a scalar/struct parameter's layout before copying a native value.
+    bool PropertyLayoutInStruct(UE::UObject* structOrClass, const char* propName,
+                                int& offset, int& elementSize, int& arrayDim);
+
     // The UClass an object-typed property points at (FObjectPropertyBase::PropertyClass).
     // Passed a UFunction and a parameter name, this is the game stating what that
     // parameter will be cast to. Returns nullptr if the property is absent, is not

@@ -348,6 +348,23 @@ int Reflect::FindPropertyOffsetInStruct(UObject* structOrClass, const char* prop
     return off;
 }
 
+bool Reflect::PropertyLayoutInStruct(UObject* structOrClass, const char* propName,
+                                     int& offset, int& elementSize, int& arrayDim)
+{
+    offset = -1; elementSize = arrayDim = 0;
+    try
+    {
+        if (!IsLiveObject(structOrClass)) return false;
+        uint8_t* field = FindPropertyFieldInStruct(structOrClass, propName, &offset);
+        if (!field || offset < 0 || !Mem::IsReadable(field + R::FProperty_ElementSize, 4) ||
+            !Mem::IsReadable(field + R::FProperty_ArrayDim, 4)) return false;
+        elementSize = Rd<int32_t>(field + R::FProperty_ElementSize);
+        arrayDim = Rd<int32_t>(field + R::FProperty_ArrayDim);
+        return elementSize > 0 && arrayDim > 0;
+    }
+    catch (...) { return false; }
+}
+
 UObject* Reflect::ObjectPropertyClassInStruct(UObject* structOrClass, const char* propName)
 {
     try
