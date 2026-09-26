@@ -336,6 +336,15 @@ namespace Features
     void AiDispatchKill();        // selected units die (nothing selected: nothing happens)
     void AiRepairAnomalies();     // sweep every loaded robot: 0-HP ghosts, leftover teams, freezes, immunity
     int  AiGhostCount();          // robots alive at 0 HP (missing from every list) seen by the last refresh
+
+    // ---- the save guard ----------------------------------------------------
+    // The game's save functions are swallowed while the horde or any owner holds
+    // the guard. Switching an owner on runs on the game thread (it resolves the
+    // save functions); switching it off works from any thread.
+    enum SaveBlockOwner : unsigned { SaveBlockPlayAs = 1u, SaveBlockSandbox = 2u };
+    void SetSaveBlock(unsigned owner, bool on);
+    bool SavesBlocked();
+
     // Zone respawn: snapshot the current enemies, respawn that set later.
     void AiSnapshotZone();
     void AiRespawnZone();

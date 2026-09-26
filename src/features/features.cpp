@@ -288,6 +288,9 @@ namespace
     // pointers (filled by the horde code on the game thread via CachedFn). The hook
     // only ever does a few cheap pointer compares, so it costs nothing when idle.
     std::atomic<bool>   g_blockSaves{ false };
+    // Other owners of the same guard (Features::SaveBlockOwner bits): playing as
+    // another character and a sandbox map both keep the game from saving.
+    std::atomic<unsigned> g_saveBlockOwners{ 0 };
     std::atomic<void*>  g_fnSaveProgress{ nullptr };
     std::atomic<void*>  g_fnSavePersistentData{ nullptr };
     std::atomic<void*>  g_fnCheckpointSaveProgress{ nullptr };
@@ -463,7 +466,7 @@ namespace
         // save UFunctions so it can NEVER checkpoint over the player's real progress.
         // Pure pointer compares; we return WITHOUT calling the original (the saves are
         // fire-and-forget triggers with no return value the engine consumes mid-frame).
-        if (g_blockSaves.load(std::memory_order_relaxed) && fn)
+        if ((g_blockSaves.load(std::memory_order_relaxed) || g_saveBlockOwners.load(std::memory_order_relaxed)) && fn)
         {
             if (fn == g_fnSaveProgress.load(std::memory_order_relaxed) ||
                 fn == g_fnSavePersistentData.load(std::memory_order_relaxed) ||
@@ -471,7 +474,7 @@ namespace
             {
                 static ULONGLONG lastBlockLogMs = 0;
                 ULONGLONG nowB = GetTickCount64();
-                if (nowB - lastBlockLogMs > 1000) { lastBlockLogMs = nowB; LOG("Horde: swallowed a game save (arena active)"); }
+                if (nowB - lastBlockLogMs > 1000) { lastBlockLogMs = nowB; LOG("Save guard: swallowed a game save (horde/play-as/sandbox active)"); }
                 return; // depthGuard restores t_peDepth
             }
         }
@@ -14914,6 +14917,23 @@ namespace
         return nullptr;
     }
 }
+
+// ---- the save guard, for owners other than the horde -------------------------
+void Features::SetSaveBlock(unsigned owner, bool on)
+{
+    if (on)
+    {
+        ResolveSaveBlockFns(); // game thread (CachedFn)
+        InstallProcessEventHook();
+        g_saveBlockOwners.fetch_or(owner);
+    }
+    else
+    {
+        g_saveBlockOwners.fetch_and(~owner);
+    }
+}
+
+bool Features::SavesBlocked() { return g_blockSaves.load() || g_saveBlockOwners.load() != 0; }
 
 void Features::AiToggleSelect(unsigned long long id)
 {
