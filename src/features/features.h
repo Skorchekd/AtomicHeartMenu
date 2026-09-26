@@ -334,6 +334,8 @@ namespace Features
     void AiToggleHoldAll();       // hold position <-> follow + defend, for the whole squad
     void AiHealCompanions();      // top every companion up to full health
     void AiDispatchKill();        // selected units die (nothing selected: nothing happens)
+    void AiRepairAnomalies();     // sweep every loaded robot: 0-HP ghosts, leftover teams, freezes, immunity
+    int  AiGhostCount();          // robots alive at 0 HP (missing from every list) seen by the last refresh
     // Zone respawn: snapshot the current enemies, respawn that set later.
     void AiSnapshotZone();
     void AiRespawnZone();

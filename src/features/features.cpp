@@ -383,6 +383,7 @@ namespace
     void UpdateHookTwinForensics();
     std::string SafeObjectFullName(UObject* o);
     std::string SafeClassName(UObject* o);
+    std::string SafeObjectName(UObject* o);
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params);
 
     bool HookFriendshipShouldForce(void* fn, void* params);
@@ -2574,7 +2575,7 @@ namespace
         uint8_t* base = reinterpret_cast<uint8_t*>(ch);
         if (!Mem::IsReadable(base + AH::Char_AttributeSet, 8)) return false;
         uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
-        if (!IsLiveObject(reinterpret_cast<UObject*>(set)) || !Mem::IsReadable(set, AH::Set_MaxHealth + AH::Attr_CurrentValue + 4)) return false;
+        if (!IsLiveObject(reinterpret_cast<UObject*>(set)) || !Mem::IsReadable(set, AH::Set_Health + AH::Attr_CurrentValue + 4)) return false;
         cur = *reinterpret_cast<float*>(set + AH::Set_Health    + AH::Attr_CurrentValue);
         mx  = *reinterpret_cast<float*>(set + AH::Set_MaxHealth + AH::Attr_CurrentValue);
         return true;
@@ -2796,9 +2797,10 @@ namespace
     //  All writes are 1-byte, guarded by Mem::IsReadable -> crash-safe.
     // =======================================================================
     std::unordered_map<UObject*, uint8_t> g_origTeam; // game-thread/pump only
-    // Fight mode owns only these actors. Squad membership and bodyguard allegiance
-    // are separate state and must survive the fight toggle's falling edge.
-    std::unordered_set<UObject*> g_fightParticipants;
+    // Fight mode owns only these actors (value: when the brawl last drove each one).
+    // Squad membership and bodyguard allegiance are separate state and must survive
+    // the fight toggle's falling edge.
+    std::unordered_map<UObject*, ULONGLONG> g_fightParticipants;
 
     // Read/write the team id through the CHARACTER's own GetGenericTeamId /
     // SetGenericTeamId (the engine IGenericTeamAgentInterface path). This refreshes
@@ -2883,6 +2885,82 @@ namespace
     //     -- no robot is ever parked on your team / made invincible (the old bug).
     // Picked high so it can't collide with a real faction or your (small) team id.
     constexpr uint8_t kFightTeamB = 231;
+
+    // AIUtils.AreFriendlyCharacters, neutral counted as friendly. False when the
+    // question could not be asked.
+    bool CharactersFriendly(UObject* a, UObject* b, bool& friendly)
+    {
+        UObject* lib = CachedObject(AH::Obj_AIUtils);
+        UFunction* fn = CachedFn(AH::Fn_AIUtils_AreFriendlyCharacters);
+        if (!IsLiveObject(lib) || !fn || !IsLiveObject(a) || !IsLiveObject(b))
+            return false;
+        P_AreFriendlyCharacters p{};
+        p.CharacterOne = a;
+        p.CharacterTwo = b;
+        p.CountNeutralAsFriendly = true;
+        if (!lib->ProcessEvent(fn, &p))
+            return false;
+        friendly = p.ReturnValue;
+        return true;
+    }
+
+    // The fight's second team. It has to differ from group A's so their hits land,
+    // and it has to stay hostile to the player: a team the game counts as neutral
+    // or friendly to you makes every robot on it immune to your weapons and your
+    // Shok, and the fixed id 231 used before was never checked. Atomic Heart's
+    // attitude table is not reflected, so candidates are put to the game itself on
+    // one brawler, whose own team is written back straight after. Cached per group
+    // A team; -1 means no candidate qualified and the robots are not split.
+    std::unordered_map<uint8_t, int> g_fightTeamFor; // game thread
+
+    int ResolveFightTeamB(UObject* probe, UObject* groupA, UObject* player)
+    {
+        uint8_t teamA = 255, original = 255;
+        if (probe == groupA || !ReadAiTeamId(groupA, teamA) || !ReadAiTeamId(probe, original))
+            return -1;
+        auto cached = g_fightTeamFor.find(teamA);
+        if (cached != g_fightTeamFor.end())
+            return cached->second;
+        uint8_t playerTeam = 255;
+        if (UFunction* get = CachedFn(AH::Fn_AHBaseCharacter_GetGenericTeamId))
+        {
+            P_GetGenericTeamId pt{};
+            if (IsLiveObject(player) && player->ProcessEvent(get, &pt))
+                playerTeam = pt.ReturnValue;
+        }
+        bool friendly = false;
+        if (!CharactersFriendly(probe, player, friendly))
+        {
+            // The game's own check is unavailable: keep the old id rather than no
+            // brawl at all. Release and the orphan sweep put every team back.
+            g_fightTeamFor[teamA] = kFightTeamB;
+            LOG("Fight each other: AIUtils.AreFriendlyCharacters unavailable; using unverified team %d", (int)kFightTeamB);
+            return kFightTeamB;
+        }
+        static const uint8_t kCandidates[] = { kFightTeamB, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0 };
+        int chosen = -1;
+        for (uint8_t candidate : kCandidates)
+        {
+            if (candidate == teamA || candidate == playerTeam || candidate == 255)
+                continue;
+            if (!WriteAiTeamId(probe, candidate))
+                break;
+            bool vsPlayer = true, vsA = true;
+            if (CharactersFriendly(probe, player, vsPlayer) && !vsPlayer &&
+                CharactersFriendly(probe, groupA, vsA) && !vsA)
+            {
+                chosen = candidate;
+                break;
+            }
+        }
+        WriteAiTeamId(probe, original);
+        g_fightTeamFor[teamA] = chosen;
+        if (chosen >= 0)
+            LOG("Fight each other: robot team %d vs team %d (verified hostile to both sides and to the player)", (int)teamA, chosen);
+        else
+            LOG("Fight each other: no second team is hostile to both team %d and the player; robots are not split", (int)teamA);
+        return chosen;
+    }
 
     // Bodyguards preserve friendly allegiance, including during combat.
 
@@ -3257,19 +3335,6 @@ namespace
         return ProcessNoParams(ctrl, fn);
     }
 
-    bool SetCharacterHealthZero(UObject* ai)
-    {
-        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
-        if (!Mem::IsReadable(base + AH::Char_AttributeSet, sizeof(void*)))
-            return false;
-        uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
-        if (!Mem::IsReadable(set + AH::Set_Health + AH::Attr_CurrentValue, sizeof(float)))
-            return false;
-        *reinterpret_cast<float*>(set + AH::Set_Health + AH::Attr_BaseValue) = 0.0f;
-        *reinterpret_cast<float*>(set + AH::Set_Health + AH::Attr_CurrentValue) = 0.0f;
-        return true;
-    }
-
     // Top an ally's health to its max -- a single guarded write (no ProcessEvent),
     // so it's crash-safe and needs no restore bookkeeping. Re-asserted each pump,
     // this keeps your bodyguards/spawns ALIVE (they used to die in seconds, which
@@ -3280,29 +3345,14 @@ namespace
         if (!Mem::IsReadable(base + AH::Char_AttributeSet, sizeof(void*)))
             return false;
         uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
-        if (!Mem::IsReadable(set + AH::Set_MaxHealth + AH::Attr_CurrentValue, sizeof(float)))
+        // Health sits after MaxHealth: check the whole span this writes.
+        if (!Mem::IsReadable(set, AH::Set_Health + AH::Attr_CurrentValue + sizeof(float)))
             return false;
         float mx = *reinterpret_cast<float*>(set + AH::Set_MaxHealth + AH::Attr_CurrentValue);
         if (!(mx > 0.0f) || !std::isfinite(mx))
             return false;
         *reinterpret_cast<float*>(set + AH::Set_Health + AH::Attr_BaseValue)    = mx;
         *reinterpret_cast<float*>(set + AH::Set_Health + AH::Attr_CurrentValue) = mx;
-        return true;
-    }
-
-    // Scale the damage a character INSTIGATES (deals). Single guarded float write (no
-    // ProcessEvent, crash-safe). Re-asserted each pump on combat-capable squad members
-    // so your bodyguards obliterate enemies -- same attribute the player one-hit uses.
-    bool SetCharacterInstigatedDamage(UObject* ai, float mult)
-    {
-        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
-        if (!Mem::IsReadable(base + AH::Char_AttributeSet, sizeof(void*)))
-            return false;
-        uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
-        if (!Mem::IsReadable(set + AH::Set_InstigatedDmgMult + AH::Attr_CurrentValue, sizeof(float)))
-            return false;
-        *reinterpret_cast<float*>(set + AH::Set_InstigatedDmgMult + AH::Attr_BaseValue)    = mult;
-        *reinterpret_cast<float*>(set + AH::Set_InstigatedDmgMult + AH::Attr_CurrentValue) = mult;
         return true;
     }
 
@@ -3445,6 +3495,29 @@ namespace
             ? it->second.walkSpeed : 0.0f;
     }
 
+    // Fixed outgoing-damage boost for legacy and Hook squad members (the same
+    // attribute player one-hit uses). The robot's own multiplier is captured first,
+    // as ApplyCompanionVitals does, so release and removal put it back; it used to
+    // stay boosted after the robot left the squad. Raw guarded writes, game thread.
+    bool SetCharacterInstigatedDamage(UObject* ai, float mult)
+    {
+        if (!AiUsable(ai))
+            return false;
+        uint8_t* set = CompanionAttributeSet(ai);
+        if (!set)
+            return false;
+        CompanionOriginals& o = CompanionOriginalsFor(ai);
+        if (!o.instigatedValid)
+        {
+            ReadAttrPair(set, AH::Set_InstigatedDmgMult, o.instigatedBase, o.instigatedCurrent);
+            if (!(o.instigatedCurrent > 0.0f) || !std::isfinite(o.instigatedCurrent) || o.instigatedCurrent > 50.0f)
+                o.instigatedBase = o.instigatedCurrent = 1.0f;
+            o.instigatedValid = true;
+        }
+        WriteAttrPair(set, AH::Set_InstigatedDmgMult, mult, mult);
+        return true;
+    }
+
     // Stop an actor by scaling its own time dilation to ~0. This is a single
     // guarded float write -- no ProcessEvent -- so it cannot dispatch into game
     // code and cannot crash even if the actor pointer just went stale.
@@ -3535,8 +3608,57 @@ namespace
     }
 
     // Flip the character-level gates that decide "will I attack at all". Raw.
+    // The passive / always-aggressive flags a robot had before the mod first wrote
+    // them, so it gets its own behaviour back when a brawl or a release ends. The
+    // brawl used to leave robots latched "always aggressive" for good. Game thread.
+    struct AggroFlags { int32_t index = -1; bool passive = false, senses = false, always = false; };
+    std::unordered_map<UObject*, AggroFlags> g_origAggro;
+
+    void RememberAggroFlags(UObject* ai)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (!IsLiveObject(ai) || !Mem::IsReadable(base + AH::AICh_bIsPassive, 1) ||
+            !Mem::IsReadable(base + AH::AICh_bPassiveButWithSenses, 1) ||
+            !Mem::IsReadable(base + AH::AICh_bIsAlwaysAggressive, 1))
+            return;
+        auto it = g_origAggro.find(ai);
+        if (it != g_origAggro.end() && it->second.index == ai->Index())
+            return;
+        if (g_origAggro.size() > 512)
+        {
+            for (auto e = g_origAggro.begin(); e != g_origAggro.end(); )
+                if (!IsLiveObject(e->first) || e->first->Index() != e->second.index) e = g_origAggro.erase(e);
+                else ++e;
+        }
+        AggroFlags f;
+        f.index = ai->Index();
+        f.passive = *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive);
+        f.senses = *reinterpret_cast<bool*>(base + AH::AICh_bPassiveButWithSenses);
+        f.always = *reinterpret_cast<bool*>(base + AH::AICh_bIsAlwaysAggressive);
+        g_origAggro[ai] = f;
+    }
+
+    void RestoreAggroFlags(UObject* ai)
+    {
+        auto it = g_origAggro.find(ai);
+        if (it == g_origAggro.end())
+            return;
+        const AggroFlags f = it->second;
+        g_origAggro.erase(it);
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (!IsLiveObject(ai) || ai->Index() != f.index)
+            return;
+        if (Mem::IsReadable(base + AH::AICh_bIsPassive, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive) = f.passive;
+        if (Mem::IsReadable(base + AH::AICh_bPassiveButWithSenses, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bPassiveButWithSenses) = f.senses;
+        if (Mem::IsReadable(base + AH::AICh_bIsAlwaysAggressive, 1))
+            *reinterpret_cast<bool*>(base + AH::AICh_bIsAlwaysAggressive) = f.always;
+    }
+
     void WriteAiAggressiveFlags(UObject* ai, bool aggressive)
     {
+        RememberAggroFlags(ai);
         uint8_t* base = reinterpret_cast<uint8_t*>(ai);
         if (Mem::IsReadable(base + AH::AICh_bIsPassive, 1))
             *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive) = !aggressive;
@@ -3551,6 +3673,7 @@ namespace
     // immediately re-entered combat against distant robots after we cleared its target.
     void ClearAiAggressiveLatch(UObject* ai)
     {
+        RememberAggroFlags(ai);
         uint8_t* base = reinterpret_cast<uint8_t*>(ai);
         if (Mem::IsReadable(base + AH::AICh_bIsPassive, 1))
             *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive) = false;
@@ -5104,18 +5227,129 @@ namespace
         return followOk || combatCapable;
     }
 
+    // ---- kills that actually kill -------------------------------------------
+    // Atomic Heart runs death as an event pipeline (death event, K2_OnDeath, the
+    // death ability, then destruction). The old kill wrote Health = 0 before
+    // calling Suicide. A raw attribute write fires none of that, and a robot that
+    // is already at 0 health takes no further damage, so whenever Suicide did not
+    // finish the job the robot stayed alive at 0 HP: the AI cache drops 0-health
+    // actors, so it vanished from the AI list and from Kill all, the player could
+    // not hurt it, and it kept fighting. Kills now go through the game's Suicide
+    // only, and every kill is checked a few seconds later (VerifyPendingKills).
+    void ThawAi(UObject* ai); // the freeze ledger, below
+
+    struct PendingKill { UObject* actor; int32_t index; ULONGLONG issuedMs; int attempts; };
+    std::vector<PendingKill> g_pendingKills; // game thread
+    std::atomic<int> g_pendingKillCount{ 0 }; // mirror for the pump scheduler
+
+    bool CharacterDeadFlag(UObject* ai)
+    {
+        uint8_t* b = reinterpret_cast<uint8_t*>(ai);
+        return Mem::IsReadable(b + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(b + AH::Char_bIsDead);
+    }
+
+    // A pawn some controller still possesses. A character the game killed is
+    // unpossessed by its death handling; one stuck at 0 HP keeps its AI running.
+    bool PawnPossessed(UObject* pawn)
+    {
+        uint8_t* b = reinterpret_cast<uint8_t*>(pawn);
+        if (!Mem::IsReadable(b + Offsets::O_Pawn_Controller, sizeof(void*)))
+            return false;
+        return IsLiveObject(*reinterpret_cast<UObject**>(b + Offsets::O_Pawn_Controller));
+    }
+
+    // Alive in every sense the engine uses, but at 0 health: the state a raw
+    // health write (or a death that never ran) leaves behind.
+    bool IsZeroHealthGhost(UObject* ai)
+    {
+        if (!AiUsable(ai) || CharacterDeadFlag(ai))
+            return false;
+        float cur = 0.0f, mx = 0.0f;
+        return ReadCharacterHealth(ai, cur, mx) && mx > 0.001f && std::isfinite(cur) && cur <= 0.0f &&
+            PawnPossessed(ai);
+    }
+
+    void ClearDeathTombstone(UObject* ai)
+    {
+        g_aiDeathEventMs.erase(ai);
+    }
+
+    bool CallSuicide(UObject* ai)
+    {
+        UFunction* suicide = CachedClassFn(AH::Cls_AICharacter, "Suicide");
+        return suicide && AiUsable(ai) && ProcessNoParams(ai, suicide);
+    }
+
     bool ApplyAiKill(UObject* ai)
     {
-        if (!AiUsable(ai))
+        if (!AiUsable(ai) || CharacterDeadFlag(ai))
             return false;
-        bool ok = SetCharacterHealthZero(ai); // safe direct write
-        UFunction* suicide = CachedClassFn(AH::Cls_AICharacter, "Suicide");
-        if (suicide && ProcessNoParams(ai, suicide))
-            ok = true;
-        if (ok)
-            MarkAiDeathTombstone(ai, "ApplyAiKill");
-        return ok;
+        // A companion takes no damage (incoming multiplier 0): give it back first,
+        // and a frozen robot could never play its death out.
+        RestoreCompanionVitals(ai);
+        ThawAi(ai);
+        // A robot already stuck at 0 HP has nothing left for the death pipeline to
+        // take; give it its health back so the kill below can register.
+        if (IsZeroHealthGhost(ai))
+            SetCharacterHealthFull(ai);
+        if (!CallSuicide(ai))
+            return false;
+        MarkAiDeathTombstone(ai, "ApplyAiKill");
+        for (const PendingKill& k : g_pendingKills)
+            if (k.actor == ai && k.index == ai->Index())
+                return true;
+        if (g_pendingKills.size() < 256)
+            g_pendingKills.push_back({ ai, ai->Index(), GetTickCount64(), 0 });
+        g_pendingKillCount = (int)g_pendingKills.size();
+        return true;
     }
+
+    // Game thread (AI pump). A kill that has not taken after a few seconds gets one
+    // more Suicide; a robot the game still will not kill is given its health back
+    // and its tombstone cleared, so it is an ordinary, listed, killable enemy
+    // instead of a 0-HP ghost the menu treats as dead.
+    void VerifyPendingKills()
+    {
+        if (g_pendingKills.empty())
+            return;
+        const ULONGLONG now = GetTickCount64();
+        for (size_t i = 0; i < g_pendingKills.size(); )
+        {
+            PendingKill& k = g_pendingKills[i];
+            if (now - k.issuedMs < 3000) { ++i; continue; }
+            UObject* ai = k.actor;
+            const bool same = IsLiveObject(ai) && ai->Index() == k.index && AiUsable(ai);
+            if (!same || CharacterDeadFlag(ai) || !PawnPossessed(ai))
+            {
+                g_pendingKills.erase(g_pendingKills.begin() + i); // died (or is gone)
+                continue;
+            }
+            const bool ghost = IsZeroHealthGhost(ai);
+            if (k.attempts == 0)
+            {
+                if (ghost)
+                    SetCharacterHealthFull(ai);
+                CallSuicide(ai);
+                k.attempts = 1;
+                k.issuedMs = now;
+                ++i;
+                continue;
+            }
+            if (ghost)
+                SetCharacterHealthFull(ai);
+            ClearDeathTombstone(ai);
+            LOG("[AI-KILL] %s did not die from Suicide; left alive%s so it stays listed and killable",
+                SafeObjectName(ai).c_str(), ghost ? " with its health restored" : "");
+            g_pendingKills.erase(g_pendingKills.begin() + i);
+        }
+        g_pendingKillCount = (int)g_pendingKills.size();
+    }
+
+    // Every robot the freeze touched, so switching it off thaws all of them. It
+    // used to thaw only the ones still inside the radius: a robot you walked away
+    // from stayed frozen for good, and one killed while frozen could never finish
+    // dying. Game thread.
+    std::unordered_map<UObject*, int32_t> g_frozenAi;
 
     bool ApplyAiFreeze(UObject* ai)
     {
@@ -5124,7 +5358,36 @@ namespace
         // Memory-only freeze (see SetActorTimeDilation). The old freeze called
         // SetIsPassive / PauseBehaviorTree etc. via ProcessEvent, which crashed
         // the game when an actor went stale mid-command.
-        return SetActorTimeDilation(ai, 0.0001f);
+        if (!SetActorTimeDilation(ai, 0.0001f))
+            return false;
+        g_frozenAi[ai] = ai->Index();
+        return true;
+    }
+
+    void ThawAi(UObject* ai)
+    {
+        auto it = g_frozenAi.find(ai);
+        if (it == g_frozenAi.end())
+            return;
+        const int32_t index = it->second;
+        g_frozenAi.erase(it);
+        if (IsLiveObject(ai) && ai->Index() == index)
+            SetActorTimeDilation(ai, 1.0f);
+    }
+
+    int ThawAllFrozenAi()
+    {
+        int n = 0;
+        std::vector<UObject*> frozen;
+        frozen.reserve(g_frozenAi.size());
+        for (const auto& entry : g_frozenAi)
+            frozen.push_back(entry.first);
+        for (UObject* ai : frozen)
+        {
+            ThawAi(ai);
+            ++n;
+        }
+        return n;
     }
 
     // NOTE on controller calls: the AHAIController is behaviour-tree driven, so
@@ -5146,6 +5409,9 @@ namespace
         if (!AiUsable(ai))
         {
             g_companionOriginals.erase(ai);
+            g_origAggro.erase(ai);
+            g_frozenAi.erase(ai);
+            g_fightParticipants.erase(ai);
             return false;
         }
 
@@ -5167,6 +5433,7 @@ namespace
             SwitchAiTeamAttitude(ai, player, 2 /*ETeamAttitude::Hostile => guaranteed killable*/);
         g_origTeam.erase(ai); // it's a normal enemy now -- forget our team bookkeeping
 
+        g_frozenAi.erase(ai);
         bool ok = SetActorTimeDilation(ai, 1.0f); // undo freeze (safe write)
         ok = SetAiPassive(ai, false) || ok;       // un-passive so it fights normally again
         SetAiTargetAlly(ai, nullptr);
@@ -5198,8 +5465,11 @@ namespace
         if (IsMixedNavCharacter(ai))
             AllowMixedNavAuto(ai);
         g_twin.erase(ai);
-        // Damage multipliers and walk speed go back to what the robot had.
+        // Damage multipliers and walk speed go back to what the robot had, and so do
+        // its own passive / always-aggressive flags.
         RestoreCompanionVitals(ai);
+        RestoreAggroFlags(ai);
+        g_fightParticipants.erase(ai);
         return ok;
     }
 
@@ -5277,11 +5547,11 @@ namespace
         // guard turn on the player when fight mode is later disabled.
         if (IsSquadMember(ai) || IsSquadMember(enemy))
             return false;
-        // teamA -> leave team untouched (real robot team); else -> sentinel team B.
-        bool ok = teamA ? InjectAttack(ai, enemy, nullptr, 0, -1)
-                        : InjectAttack(ai, enemy, nullptr, 0, kFightTeamB);
+        // teamA -> leave team untouched (real robot team); else -> the verified team B.
+        const int teamB = teamA ? -1 : ResolveFightTeamB(ai, enemy, player);
+        bool ok = InjectAttack(ai, enemy, nullptr, 0, teamB);
         if (ok)
-            g_fightParticipants.insert(ai);
+            g_fightParticipants[ai] = GetTickCount64();
         return ok;
     }
 
@@ -5667,12 +5937,12 @@ namespace
                 {
                     bool hookOwned = IsHookBodyguard(ai);
                     if (hookOwned) ReleaseHookNativeMovement(ai, true);
+                    // Out of the squad first: a member left in it is re-converted by
+                    // the next pump, and the ownership lock blocks the release itself.
+                    SquadRemove(ai);
                     ok = ApplyAiRelease(ai);
                     if (hookOwned)
-                    {
-                        SquadRemove(ai);
                         ForgetHookBodyguardRuntimeState(ai, !ok);
-                    }
                     break;
                 }
                 case AiQueuedKind::Launch:
@@ -5747,13 +6017,9 @@ namespace
         static bool wasFreeze = false;
         if (wasFreeze && !st.aiFreezeNearby)
         {
-            std::vector<UObject*> targets = CollectNearbyAi(st.aiRadius, kMaxAiCommandTargets);
-            int released = 0;
-            for (UObject* ai : targets)
-                if (AiUsable(ai) && SetActorTimeDilation(ai, 1.0f))
-                    ++released;
+            int released = ThawAllFrozenAi();
             if (released > 0)
-                LOG("AI auto-freeze off: unfroze %d nearby target(s)", released);
+                LOG("AI auto-freeze off: unfroze %d target(s)", released);
         }
         wasFreeze = st.aiFreezeNearby;
 
@@ -5773,7 +6039,8 @@ namespace
             {
                 if (done >= kAiAutoOpsPerPass)
                     break;
-                if (!IsProtectedUnit(ai) && ApplyAiFreeze(ai))
+                // A robot being killed must be able to play its death out.
+                if (!IsProtectedUnit(ai) && !IsTombstoned(ai) && ApplyAiFreeze(ai))
                     ++done;
             }
             if (done > 0)
@@ -5876,38 +6143,52 @@ namespace
         return best;
     }
 
+    // One brawler back to the robot it was: its own team, no forced target, the
+    // aggressive state machine off, and its own passive / always-aggressive flags.
+    bool StandDownFightParticipant(UObject* ai)
+    {
+        g_fightParticipants.erase(ai);
+        if (!AiUsable(ai))
+        {
+            g_origTeam.erase(ai);
+            g_origAggro.erase(ai);
+            g_inject.erase(ai);
+            return false;
+        }
+        if (IsSquadMember(ai))
+            return false; // bodyguard ownership wins unconditionally
+
+        // Restore the exact pre-fight team instead of forcing a generic hostile
+        // state, then clear only fight-owned target/aggression state.
+        RestoreOriginalTeam(ai);
+        SetAiPassive(ai, false);
+        SetAiTargetAlly(ai, nullptr);
+        SetAiTargetEnemy(ai, nullptr, true);
+        WriteAiTargetField(ai, nullptr);
+        StopCharacterAggressive(ai);
+        if (UObject* ctrl = GetAiController(ai))
+        {
+            SetControllerTargetEnemy(ctrl, nullptr, true);
+            SetControllerAggressive(ctrl, false);
+        }
+        RestoreAggroFlags(ai); // its own passive / always-aggressive setting
+        g_inject.erase(ai);
+        return true;
+    }
+
     void ReleaseFightParticipants(const char* why)
     {
         int n = 0;
-        std::vector<UObject*> participants(g_fightParticipants.begin(), g_fightParticipants.end());
-        g_fightParticipants.clear();
+        std::vector<UObject*> participants;
+        participants.reserve(g_fightParticipants.size());
+        for (const auto& entry : g_fightParticipants)
+            participants.push_back(entry.first);
         for (UObject* ai : participants)
         {
-            if (!AiUsable(ai))
-            {
-                g_origTeam.erase(ai);
-                g_inject.erase(ai);
-                continue;
-            }
-            if (IsSquadMember(ai))
-                continue; // bodyguard ownership wins unconditionally
-
-            // Restore the exact pre-fight team instead of forcing a generic hostile
-            // state, then clear only fight-owned target/aggression state.
-            RestoreOriginalTeam(ai);
-            SetAiPassive(ai, false);
-            SetAiTargetAlly(ai, nullptr);
-            SetAiTargetEnemy(ai, nullptr, true);
-            WriteAiTargetField(ai, nullptr);
-            StopCharacterAggressive(ai);
-            if (UObject* ctrl = GetAiController(ai))
-            {
-                SetControllerTargetEnemy(ctrl, nullptr, true);
-                SetControllerAggressive(ctrl, false);
-            }
-            g_inject.erase(ai);
-            ++n;
+            try { if (StandDownFightParticipant(ai)) ++n; }
+            catch (...) {}
         }
+        g_fightParticipants.clear();
         LOG("AI %s: restored %d fight participant(s); squad untouched", why, n);
     }
 
@@ -5954,10 +6235,25 @@ namespace
             if (cursor >= count) cursor = 0;
             int take = (int)std::min(count, (size_t)kAiInjectPerTick);
             int applied = 0;
+            // One robot of each group settles the second team (cached per group-A team).
+            int teamB = -1;
+            {
+                UObject* probe = nullptr;
+                UObject* anchor = nullptr;
+                for (const InjNode& n : nodes)
+                {
+                    if (!n.ok || n.actor == player) continue;
+                    if (n.parity == 1 && !probe) probe = n.actor;
+                    if (n.parity == 0 && !anchor) anchor = n.actor;
+                }
+                if (probe && anchor)
+                    teamB = ResolveFightTeamB(probe, anchor, player);
+            }
             for (int k = 0; k < take; ++k)
             {
                 const InjNode& self = nodes[(cursor + (size_t)k) % count];
-                if (!self.ok || self.actor == player) continue;
+                // Companions, Hook guards and a character being played are never brawlers.
+                if (!self.ok || self.actor == player || IsProtectedUnit(self.actor)) continue;
                 // Two stable groups by pointer parity; attack the nearest member of
                 // the OTHER group. parity 0 keeps its REAL robot team, parity 1 is
                 // moved to kFightTeamB. Different ids => hits deal real damage, and
@@ -5967,8 +6263,17 @@ namespace
                 UObject* enemy = NearestNode(nodes, self.loc, player, wantParity, self.actor);
                 if (!enemy) // no opposite-group member nearby: hit the nearest other robot
                     enemy = NearestNode(nodes, self.loc, player, -1, self.actor);
-                int forceTeam = (self.parity == 0) ? -1 : (int)kFightTeamB;
-                try { if (enemy && InjectAttack(self.actor, enemy, nullptr, 0, forceTeam)) ++applied; }
+                int forceTeam = (self.parity == 0) ? -1 : teamB;
+                try
+                {
+                    // Recorded, so turning the brawl off gives every robot it touched
+                    // its own team and flags back (it used to restore none of them).
+                    if (enemy && InjectAttack(self.actor, enemy, nullptr, 0, forceTeam))
+                    {
+                        g_fightParticipants[self.actor] = now;
+                        ++applied;
+                    }
+                }
                 catch (...) {} // one stale actor must not abort the whole pass
             }
             cursor = (cursor + (size_t)take) % count;
@@ -6008,11 +6313,14 @@ namespace
             return ReadCharacterHealth(a, cur, mx) && mx > 0.001f && std::isfinite(cur) && cur <= 0.0f;
         };
         std::vector<UObject*> squad;
+        // Members dropped below are released after the lock: a release dispatches
+        // ProcessEvent, and nothing may hold g_squadMutex across a dispatch.
+        std::vector<UObject*> droppedAlive, droppedDead;
         {
             std::lock_guard<std::mutex> lk(g_squadMutex);
             g_spawnedAllies.erase(
                 std::remove_if(g_spawnedAllies.begin(), g_spawnedAllies.end(),
-                    [&companionDead](UObject* a)
+                    [&companionDead, &droppedAlive, &droppedDead](UObject* a)
                     {
                         // Per-member state is dropped with the member: the next actor
                         // allocated at this address must not inherit it (a stale sprint
@@ -6020,14 +6328,44 @@ namespace
                         // member that is still there gets its own damage values back, so
                         // a revived or dropped robot is not left invulnerable.
                         if (!IsLiveObject(a)) { Bodyguards::Forget(a); miss.erase(a); g_companionOriginals.erase(a); g_inject.erase(a); LOG("Squad prune: member %p gone (unreadable) -> dropped", (void*)a); return true; } // truly gone
-                        if (companionDead(a)) { Bodyguards::Forget(a); miss.erase(a); RestoreCompanionVitals(a); g_inject.erase(a); LOG("Squad prune: companion %p died -> dropped", (void*)a); return true; }
+                        if (companionDead(a)) { Bodyguards::Forget(a); miss.erase(a); RestoreCompanionVitals(a); g_inject.erase(a); droppedDead.push_back(a); LOG("Squad prune: companion %p died -> dropped", (void*)a); return true; }
                         if (FollowPawnUsable(a)) { miss.erase(a); return false; }       // healthy -> keep
-                        if (++miss[a] >= 30) { Bodyguards::Forget(a); RestoreCompanionVitals(a); g_inject.erase(a); LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
+                        if (++miss[a] >= 30) { Bodyguards::Forget(a); RestoreCompanionVitals(a); g_inject.erase(a); droppedAlive.push_back(a); LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
                         return false; // ~30 consecutive misses (~several s) -> give up; else KEEP
                     }),
                 g_spawnedAllies.end());
             g_spawnedAllyCount = (int)g_spawnedAllies.size();
             squad = g_spawnedAllies;
+        }
+        // A member dropped while still standing used to stay on your team, unlisted
+        // and immune to your weapons; it gets its own faction and flags back. A dead
+        // one gets its own team back too, so a robot the game revives (repair drones)
+        // is an ordinary enemy again rather than an untracked friendly.
+        for (UObject* a : droppedAlive)
+        {
+            try
+            {
+                const bool hook = IsHookBodyguard(a);
+                if (hook)
+                {
+                    ReleaseHookNativeMovement(a, true);
+                    HookBodyguardRemove(a); // off the Hook roster too, or its drive takes it back
+                }
+                ApplyAiRelease(a);
+                if (hook)
+                    ForgetHookBodyguardRuntimeState(a, true);
+            }
+            catch (...) {}
+        }
+        for (UObject* a : droppedDead)
+        {
+            try
+            {
+                if (AiUsable(a)) RestoreOriginalTeam(a);
+                else g_origTeam.erase(a);
+                RestoreAggroFlags(a);
+            }
+            catch (...) {}
         }
         if (squad.empty())
             return;
@@ -6470,6 +6808,16 @@ namespace
     //  the spawn/fixup/register logic lives in ONE place. Caller resolves the
     //  UClass (nearest live enemy, or a saved class re-resolved by name).
     // =======================================================================
+    // Robots the mod itself created (companion spawns), by identity. Eject removes
+    // them rather than leaving mod-made robots in the world. Game thread.
+    std::unordered_map<UObject*, int32_t> g_modSpawned;
+
+    bool ModSpawned(UObject* actor)
+    {
+        auto it = g_modSpawned.find(actor);
+        return it != g_modSpawned.end() && IsLiveObject(actor) && actor->Index() == it->second;
+    }
+
     void SpawnAndRegisterAlly(UClass* pawnClass, bool hookOwned = false)
     {
         if (!hookOwned && g_spawnedAllyCount.load() >= kMaxSpawnedAllies)
@@ -6527,6 +6875,18 @@ namespace
             return;
         }
         LOG("SpawnAndRegisterAlly: SpawnAIFromClass OK actor=%p; registering + fixup", (void*)spawned);
+        if (IsLiveObject(spawned))
+        {
+            if (g_modSpawned.size() > 256)
+            {
+                for (auto it = g_modSpawned.begin(); it != g_modSpawned.end(); )
+                {
+                    if (!IsLiveObject(it->first) || it->first->Index() != it->second) it = g_modSpawned.erase(it);
+                    else ++it;
+                }
+            }
+            g_modSpawned[spawned] = spawned->Index();
+        }
 
         if (!hookOwned)
         {
@@ -7129,6 +7489,67 @@ namespace
     // =======================================================================
     std::atomic<bool> g_deepKillRequested{ false };
 
+    std::atomic<bool> g_aiRepairRequested{ false };
+    std::atomic<int>  g_aiGhostCount{ 0 }; // robots alive at 0 HP seen by the last AI refresh
+
+    struct AiRepairCounts { int ghosts = 0, teams = 0, thawed = 0, vulnerable = 0; };
+    AiRepairCounts RepairAiAnomaliesGameThread(const std::vector<UObject*>& candidates); // with the AI ledger
+
+    // Worker thread: every loaded AHAICharacter, including the ones the level lists
+    // and the AI cache miss, handed to RepairAiAnomaliesGameThread.
+    void RunAiRepairWorker()
+    {
+        if (!g_aiRepairRequested.exchange(false))
+            return;
+        if (!Mem::IsReadable(g_aiClass, 0x30))
+            g_aiClass = FindObjectFast(AH::Cls_AICharacter);
+        UClass* cls = g_aiClass;
+        if (!cls)
+        {
+            Features::Notify("Repair unavailable: AI class not resolved yet");
+            return;
+        }
+        int n = NumObjects();
+        std::vector<UObject*> targets;
+        targets.reserve(128);
+        std::unordered_map<UClass*, bool> memo;
+        for (int i = 0; i < n && (int)targets.size() < kMaxDeepAiTargets; ++i)
+        {
+            UObject* o = GetObjectByIndex(i);
+            if (!Mem::IsReadable(o, 0x30))
+                continue;
+            UClass* oc = o->Class();
+            if (!Mem::IsReadable(oc, 0x30))
+                continue;
+            bool isAi;
+            auto it = memo.find(oc);
+            if (it != memo.end()) isAi = it->second;
+            else { try { isAi = o->IsA(cls); } catch (...) { isAi = false; } memo[oc] = isAi; }
+            if (!isAi)
+                continue;
+            std::string on;
+            try { on = o->GetName(); } catch (...) { continue; }
+            if (on.rfind("Default__", 0) == 0 || on.find("GEN_VARIABLE") != std::string::npos)
+                continue; // CDOs/templates, not live actors
+            targets.push_back(o);
+        }
+        InstallProcessEventHook();
+        if (!QueueGameThread([targets]()
+        {
+            AiRepairCounts c;
+            try { c = RepairAiAnomaliesGameThread(targets); } catch (...) {}
+            const int total = c.ghosts + c.teams + c.thawed + c.vulnerable;
+            LOG("AI repair: %d robot(s) checked; %d at 0 HP, %d team(s), %d frozen, %d damage-immune fixed",
+                (int)targets.size(), c.ghosts, c.teams, c.thawed, c.vulnerable);
+            if (total)
+                Features::Notify("Repaired %d robot(s): %d at 0 HP, %d team, %d frozen, %d immune",
+                    total, c.ghosts, c.teams, c.thawed, c.vulnerable);
+            else
+                Features::Notify("No bugged robots found (%d checked)", (int)targets.size());
+        }))
+            Features::Notify("Repair skipped: no game-thread pump yet");
+    }
+
     void RunDeepKillWorker()
     {
         if (!g_deepKillRequested.exchange(false))
@@ -7595,7 +8016,7 @@ namespace
                 }
                 else
                 {
-                    SetCharacterHealthZero(r); // safe direct write
+                    ApplyAiKill(r); // the game's own death, never a raw 0-health write
                 }
             }
             catch (...) {}
@@ -7777,6 +8198,225 @@ namespace
     //  injection on the game thread, serialised with the game's own AI tick, so
     //  there is no race. Raw memory writes are thread-safe and stay inline.
     // =======================================================================
+    // =======================================================================
+    //  AI STATE LEDGER  --  nothing the mod changes on a robot outlives its owner
+    // -----------------------------------------------------------------------
+    //  Teams (g_origTeam), passive/aggressive flags (g_origAggro), freezes
+    //  (g_frozenAi) and brawl membership (g_fightParticipants) are recorded when
+    //  first changed. Every feature restores its own on release; this sweep is the
+    //  safety net for whatever no feature owns any more, so a missed release path
+    //  can no longer leave a robot on your team and immune to your weapons, latched
+    //  aggressive, or frozen for the rest of the session. Game thread (AI pump).
+    // =======================================================================
+    std::atomic<int> g_aiLedgerSize{ 0 }; // keeps the AI pump alive until it drains
+
+    bool FightOwns(UObject* ai, ULONGLONG now)
+    {
+        auto it = g_fightParticipants.find(ai);
+        return it != g_fightParticipants.end() &&
+            (Features::Get().aiFightEachOther || now - it->second < 120000);
+    }
+
+    bool HordeOwns(UObject* ai)
+    {
+        return g_hordeActive.load() &&
+            std::find(g_hordeEnemies.begin(), g_hordeEnemies.end(), ai) != g_hordeEnemies.end();
+    }
+
+    void RestoreOrphanedAiState()
+    {
+        const ULONGLONG now = GetTickCount64();
+        static ULONGLONG lastMs = 0;
+        if (now - lastMs >= 2000)
+        {
+            lastMs = now;
+            const bool freezeOn = Features::Get().aiFreezeNearby;
+            std::unordered_set<UObject*> candidates;
+            for (const auto& e : g_origTeam) candidates.insert(e.first);
+            for (const auto& e : g_origAggro) candidates.insert(e.first);
+            for (const auto& e : g_fightParticipants) candidates.insert(e.first);
+            if (!freezeOn)
+                for (const auto& e : g_frozenAi) candidates.insert(e.first);
+            int restored = 0;
+            for (UObject* ai : candidates)
+            {
+                if (IsProtectedUnit(ai) || FightOwns(ai, now) || HordeOwns(ai))
+                    continue;
+                try
+                {
+                    if (g_fightParticipants.count(ai))
+                        StandDownFightParticipant(ai); // team, targets, aggression, flags
+                    else if (AiUsable(ai))
+                    {
+                        RestoreOriginalTeam(ai);
+                        RestoreAggroFlags(ai);
+                    }
+                    else
+                    {
+                        g_origTeam.erase(ai);
+                        g_origAggro.erase(ai);
+                    }
+                    if (!freezeOn)
+                        ThawAi(ai);
+                    ++restored;
+                }
+                catch (...)
+                {
+                    g_origTeam.erase(ai);
+                    g_origAggro.erase(ai);
+                    g_fightParticipants.erase(ai);
+                    g_frozenAi.erase(ai);
+                }
+            }
+            if (restored)
+                LOG("AI ledger: restored %d robot(s) that no feature owns any more", restored);
+        }
+        g_aiLedgerSize = (int)(g_origTeam.size() + g_origAggro.size() + g_frozenAi.size() + g_fightParticipants.size());
+    }
+
+    // Eject (game thread, from PrepareUnload): every robot goes back to the way the
+    // game had it. Robots the mod spawned are removed, recruited ones return to
+    // their own faction and behaviour, brawls, freezes and a horde run end, and a
+    // kill that left a 0-HP ghost is repaired. One robot failing never stops the rest.
+    void AiCleanupForUnload()
+    {
+        auto& st = Features::Get();
+        st.aiFightEachOther = false;
+        st.aiFreezeNearby = false;
+        if (g_hordeActive.load())
+        {
+            try { HordeEndRun(true, true, "eject"); } catch (...) {}
+        }
+
+        std::vector<UObject*> squad, hookGuards;
+        { std::lock_guard<std::mutex> lk(g_squadMutex); squad.swap(g_spawnedAllies); g_spawnedAllyCount = 0; }
+        { std::lock_guard<std::mutex> lk(g_hookBodyguardMutex); hookGuards.swap(g_hookBodyguards); }
+        for (UObject* guard : hookGuards)
+            if (std::find(squad.begin(), squad.end(), guard) == squad.end())
+                squad.push_back(guard);
+        UFunction* destroy = CachedFn(AH::Fn_K2DestroyActor);
+        int removed = 0, released = 0;
+        for (UObject* a : squad)
+        {
+            try
+            {
+                const bool hook = std::find(hookGuards.begin(), hookGuards.end(), a) != hookGuards.end();
+                if (hook)
+                    ReleaseHookNativeMovement(a, true);
+                if (destroy && ModSpawned(a))
+                {
+                    Bodyguards::Forget(a);
+                    RestoreCompanionVitals(a);
+                    uint8_t noParams = 0;
+                    if (a->ProcessEvent(destroy, &noParams))
+                        ++removed;
+                }
+                else if (ApplyAiRelease(a))
+                {
+                    ++released;
+                }
+                if (hook)
+                    ForgetHookBodyguardRuntimeState(a, true);
+            }
+            catch (...) {}
+        }
+
+        try { ReleaseFightParticipants("eject"); } catch (...) {}
+        ThawAllFrozenAi();
+        // Whatever is still in the ledger has no owner now.
+        std::vector<UObject*> rest;
+        for (const auto& e : g_origTeam) rest.push_back(e.first);
+        for (const auto& e : g_origAggro) rest.push_back(e.first);
+        for (UObject* ai : rest)
+        {
+            try
+            {
+                if (AiUsable(ai)) RestoreOriginalTeam(ai);
+                else g_origTeam.erase(ai);
+                RestoreAggroFlags(ai);
+            }
+            catch (...) { g_origTeam.erase(ai); g_origAggro.erase(ai); }
+        }
+        for (const PendingKill& k : g_pendingKills)
+            if (IsLiveObject(k.actor) && k.actor->Index() == k.index && IsZeroHealthGhost(k.actor))
+                SetCharacterHealthFull(k.actor);
+        g_pendingKills.clear();
+        g_pendingKillCount = 0;
+        LOG("Eject: AI restored (%d spawned companion(s) removed, %d released)", removed, released);
+    }
+
+    // "Repair bugged AI". Game thread; `candidates` come from a worker GObjects sweep
+    // (RunAiRepairWorker), so it also reaches robots missing from every list.
+    AiRepairCounts RepairAiAnomaliesGameThread(const std::vector<UObject*>& candidates)
+    {
+        AiRepairCounts c;
+        UObject* player = GetLocalPawn();
+        const auto& st = Features::Get();
+        std::unordered_set<int> fightTeams{ (int)kFightTeamB };
+        for (const auto& e : g_fightTeamFor)
+            if (e.second >= 0) fightTeams.insert(e.second);
+        for (UObject* ai : candidates)
+        {
+            try
+            {
+                if (!AiUsable(ai) || ai == player)
+                    continue;
+                // Alive at 0 HP: the ghost a raw health write left behind.
+                if (IsZeroHealthGhost(ai))
+                {
+                    SetCharacterHealthFull(ai);
+                    ClearDeathTombstone(ai);
+                    ++c.ghosts;
+                }
+                if (IsProtectedUnit(ai) || (st.aiFightEachOther && g_fightParticipants.count(ai)) || HordeOwns(ai))
+                    continue;
+                // Brawl team: restored from the record, or (left by an earlier session
+                // or build) switched hostile to you so your hits and Shok land again.
+                uint8_t team = 255;
+                if (g_origTeam.count(ai))
+                {
+                    RestoreOriginalTeam(ai);
+                    RestoreAggroFlags(ai);
+                    ++c.teams;
+                }
+                else if (IsLiveObject(player) && ReadAiTeamId(ai, team) && fightTeams.count((int)team))
+                {
+                    SwitchAiTeamAttitude(ai, player, 2 /*ETeamAttitude::Hostile*/);
+                    g_origTeam.erase(ai); // the repair is the new state, not something to undo
+                    ++c.teams;
+                }
+                // Still frozen by the (now off) freeze, which writes exactly 0.0001.
+                uint8_t* b = reinterpret_cast<uint8_t*>(ai);
+                if (!st.aiFreezeNearby && Mem::IsReadable(b + Offsets::O_Actor_CustomTimeDilation, sizeof(float)))
+                {
+                    const float dilation = *reinterpret_cast<float*>(b + Offsets::O_Actor_CustomTimeDilation);
+                    if (dilation > 0.0f && dilation < 0.001f)
+                    {
+                        g_frozenAi.erase(ai);
+                        SetActorTimeDilation(ai, 1.0f);
+                        ++c.thawed;
+                    }
+                }
+                // Immune to all damage (incoming multiplier 0) though nothing of ours
+                // owns it: a companion let go by an older build. Hostile robots only.
+                if (uint8_t* set = CompanionAttributeSet(ai))
+                {
+                    float base = 1.0f, current = 1.0f;
+                    ReadAttrPair(set, AH::Set_IncomingDamageMult, base, current);
+                    bool friendly = true;
+                    if (current <= 0.001f && IsLiveObject(player) && CharactersFriendly(ai, player, friendly) && !friendly)
+                    {
+                        WriteAttrPair(set, AH::Set_IncomingDamageMult, 1.0f, 1.0f);
+                        g_companionOriginals.erase(ai);
+                        ++c.vulnerable;
+                    }
+                }
+            }
+            catch (...) {}
+        }
+        return c;
+    }
+
     void DrainAiGameThreadWork()
     {
         // All touch the AI via ProcessEvent -> must be on the game thread.
@@ -7787,6 +8427,8 @@ namespace
         DriveSpawnedAllies();      // spawned allies = permanent bodyguards
         DriveTwinCombat();         // the Twin runs a SEPARATE, fully-controlled combat brain
         UpdateHorde();             // horde rounds: spawn waves, re-aggro, prune, death-halt
+        VerifyPendingKills();      // a mod kill that did not take must not leave a 0-HP ghost
+        RestoreOrphanedAiState();  // the safety net behind every release path
     }
 
     // Render thread: keep at most one bounded AI pump in flight on the game
@@ -7802,6 +8444,8 @@ namespace
                         g_hordeActive.load() ||            // a horde run drives waves every pump
                         g_aiPendingCount.load() > 0 ||
                         g_spawnQueueCount.load() > 0 ||
+                        g_pendingKillCount.load() > 0 ||
+                        g_aiLedgerSize.load() > 0 ||
                         g_aiDeferredKind.load() != (int)AiQueuedKind::None;
 
         // Keep pumping for a short grace window after everything turns off so the
@@ -7891,6 +8535,7 @@ namespace
         std::unordered_set<UObject*> visited;
         int aiHits = 0;
         int scanExceptions = 0;
+        int ghosts = 0;
 
         for (UObject* o : actors)
         {
@@ -7913,7 +8558,12 @@ namespace
                 ++aiHits;
                 AiCachedActor entry{};
                 if (!RefreshAiEntryFromIndex({ o, -1 }, cls, playerLoc, havePlayerLoc, entry)) // -1: use the actor directly
+                {
+                    // Left out of the cache for its 0 health, yet still alive and
+                    // possessed: counted so the menu can offer the repair.
+                    if (IsZeroHealthGhost(o)) ++ghosts;
                     continue;
+                }
                 rebuilt.push_back(entry);
             }
             catch (...) { ++scanExceptions; }
@@ -7929,6 +8579,7 @@ namespace
             g_aiActors.swap(rebuilt); // full wholesale rebuild: always fresh, dead actors drop out
             g_aiCachedCount = (int)g_aiActors.size();
         }
+        g_aiGhostCount = ghosts;
 
         ULONGLONG elapsedMs = GetTickCount64() - scanStartMs;
         static ULONGLONG lastLogMs = 0;
@@ -13336,6 +13987,11 @@ bool Features::PrepareUnload()
             if (!result->compare_exchange_strong(pending, 1)) return;
             bool ok = false;
             try { ok = Workbench::CleanupGameThread(); } catch (...) {}
+            // Only once eject is certain: a deferred eject keeps the squad as it is.
+            if (ok)
+            {
+                try { AiCleanupForUnload(); } catch (...) { LOG("Eject: AI cleanup faulted (ignored)"); }
+            }
             result->store(ok ? 2 : 3);
         });
         g_gtHasWork = true;
@@ -14095,8 +14751,8 @@ void Features::HookAiRelease()
         for (UObject* guard : guards)
         {
             ReleaseHookNativeMovement(guard, true);
+            SquadRemove(guard); // before the release, which the ownership lock would otherwise block
             bool released = AiUsable(guard) && ApplyAiRelease(guard);
-            SquadRemove(guard);
             ForgetHookBodyguardRuntimeState(guard, !released);
             if (released) ++n;
         }
@@ -14341,8 +14997,10 @@ void Features::AiReleaseSelected()
             {
                 bool hookOwned = IsHookBodyguard(ai);
                 if (hookOwned) ReleaseHookNativeMovement(ai, true);
-                bool released = AiUsable(ai) && ApplyAiRelease(ai);
+                // Membership first: while it is still a squad member the ownership
+                // lock swallows the release's own switch back to its faction.
                 SquadRemove(ai);
+                bool released = AiUsable(ai) && ApplyAiRelease(ai);
                 if (hookOwned) ForgetHookBodyguardRuntimeState(ai, !released);
                 if (released) ++n;
             }
@@ -14595,6 +15253,25 @@ void Features::AiHealCompanions()
         LOG("AiHealCompanions skipped: no game-thread pump yet");
 }
 
+// Sweep every loaded robot (worker thread) and repair what the mod left behind:
+// 0-HP ghosts, brawl teams, freezes, damage immunity. Companions are untouched.
+void Features::AiRepairAnomalies()
+{
+    if (!G::sdkReady.load()) return;
+    g_aiRepairRequested = true; // RunAiRepairWorker
+    Notify("Checking every loaded robot...");
+}
+
+int Features::AiGhostCount()
+{
+    // Counted by the AI refresh; ask for one so the number stays current while the
+    // page showing it is open.
+    static ULONGLONG lastRequestMs = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - lastRequestMs > 1000) { lastRequestMs = now; RequestAiDiscovery(); }
+    return g_aiGhostCount.load();
+}
+
 void Features::AiDispatchKill()
 {
     // The explicit selection only. Falling back to the whole squad, as orders do,
@@ -14604,7 +15281,28 @@ void Features::AiDispatchKill()
     InstallProcessEventHook();
     QueueGameThread([units]()
     {
-        try { int n = 0; for (UObject* u : units) if (AiUsable(u) && ApplyAiKill(u)) ++n; LOG("AiDispatchKill: %d", n); }
+        try
+        {
+            int n = 0;
+            for (UObject* u : units)
+            {
+                if (!AiUsable(u))
+                    continue;
+                // A companion is released first: while it is one it takes no damage,
+                // and a kill that does not take must leave an ordinary enemy behind,
+                // not an untracked robot still on your team.
+                if (IsSquadMember(u) || IsHookBodyguard(u))
+                {
+                    const bool hook = IsHookBodyguard(u);
+                    if (hook) ReleaseHookNativeMovement(u, true);
+                    SquadRemove(u);
+                    ApplyAiRelease(u);
+                    if (hook) ForgetHookBodyguardRuntimeState(u, true);
+                }
+                if (ApplyAiKill(u)) ++n;
+            }
+            LOG("AiDispatchKill: %d", n);
+        }
         catch (...) {}
     });
 }
@@ -15229,7 +15927,7 @@ void Features::FullHeal()
             return;
         }
         uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
-        if (!Mem::IsReadable(set + AH::Set_MaxHealth + AH::Attr_CurrentValue, sizeof(float)))
+        if (!Mem::IsReadable(set, AH::Set_Health + AH::Attr_CurrentValue + sizeof(float)))
         {
             LOG("FullHeal: attribute set unreadable");
             return;
@@ -15376,6 +16074,7 @@ void Features::WorkerTick()
         RefreshAiActors();
         RefreshAllModelsWorker(); // global model search list (only sweeps while panel open)
         RunDeepKillWorker();      // one-shot deep enemy sweep when requested
+        RunAiRepairWorker();      // one-shot "Repair bugged AI" sweep when requested
     }
     catch (...)
     {

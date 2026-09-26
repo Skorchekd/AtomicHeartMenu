@@ -430,7 +430,22 @@ namespace
         if (ImGui::CollapsingHeader("World AI controls"))
         {
             ImGui::Checkbox("Freeze nearby enemies", &f.aiFreezeNearby);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Turning it off thaws every robot it froze, near or far.");
             ImGui::Checkbox("Enemies fight each other", &f.aiFightEachOther);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Splits nearby robots into two sides that attack each other. The second side's\n"
+                                  "team is checked with the game first so both stay hostile to you. Turning it\n"
+                                  "off gives every robot it touched its own team and behaviour back.");
+            const int ghosts = Features::AiGhostCount();
+            if (ghosts > 0)
+                ImGui::TextColored(ImVec4(1, .65f, .2f, 1), "%d robot(s) alive at 0 HP: missing from the lists and unkillable", ghosts);
+            if (ImGui::Button("Repair bugged AI")) { LOG("UI: repair bugged AI"); Features::AiRepairAnomalies(); }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Checks every loaded robot, including ones missing from the lists. Robots stuck\n"
+                                  "alive at 0 HP get their health back (kill them normally afterwards), and teams,\n"
+                                  "freezes and damage immunity left behind by the mod are undone. Companions are\n"
+                                  "not touched.");
             if (ImGui::Button("Kill selected")) Features::AiDispatchKill();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Kills selected units. Does not delete actor objects.");
             ImGui::SameLine();
