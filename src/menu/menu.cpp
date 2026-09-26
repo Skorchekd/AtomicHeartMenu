@@ -25,6 +25,7 @@
 #include "imgui.h"
 #include <Windows.h>
 #include <cfloat>
+#include <cstdio>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -168,6 +169,39 @@ namespace
         }
     }
 
+    // Lays buttons out left to right and wraps to a new line when the next one
+    // would not fit, so a narrow menu window never clips a row of commands.
+    struct ButtonRow
+    {
+        float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        bool  first = true;
+
+        bool Button(const char* label)
+        {
+            if (!first)
+            {
+                const ImGuiStyle& style = ImGui::GetStyle();
+                const float width = ImGui::CalcTextSize(label, nullptr, true).x + style.FramePadding.x * 2.0f;
+                if (ImGui::GetItemRectMax().x + style.ItemSpacing.x + width <= right)
+                    ImGui::SameLine();
+            }
+            first = false;
+            return ImGui::Button(label);
+        }
+    };
+
+    // Companion orders, numbered as Bodyguards::Order and Features::AiOrderSelected.
+    const char* const kOrderNames[] = { "Follow + defend", "Follow only", "Hold position", "Follow + attack" };
+    const char* const kOrderTips[] =
+    {
+        "Stay close and fight anything attacking you or them, plus hostile\n"
+        "enemies that have spotted you nearby. The default.",
+        "Stay close and stay out of fights.",
+        "Stay where they are and stay out of fights until given another order.",
+        "Like Follow + defend, and also go after hostile enemies inside the\n"
+        "defend radius before they attack.",
+    };
+
     // ===================================================================
     //  AI / SQUAD tab -- the headline surface: full control over the AI.
     // ===================================================================
@@ -192,49 +226,161 @@ namespace
         ImGui::EndDisabled();
 
         ImGui::SeparatorText("Orders");
-        if (ImGui::Button("Follow + defend")) Features::AiOrderSelected(0);
-        ImGui::SameLine();
-        if (ImGui::Button("Follow only")) Features::AiOrderSelected(1);
-        ImGui::SameLine();
-        if (ImGui::Button("Hold position")) Features::AiOrderSelected(2);
-        ImGui::SameLine();
-        if (ImGui::Button("Attack nearest enemy")) Features::AiDispatchAttack();
-        ImGui::SetNextItemWidth(220.0f);
-        ImGui::SliderFloat("Follow distance", &f.aiFollowStopM, 1.0f, 8.0f, "%.1f m");
-        ImGui::Checkbox("Keep companions alive", &f.aiInvincibleAllies);
-
-        const auto guards = Bodyguards::Snapshot();
-        if (guards.empty()) ImGui::TextDisabled("No regular companions. Spawn one above or recruit a nearby robot below.");
-        if (ImGui::BeginTable("companionStatus", 4, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::TableSetupColumn("Select", ImGuiTableColumnFlags_WidthFixed, 45);
-            ImGui::TableSetupColumn("Companion");
-            ImGui::TableSetupColumn("State");
-            ImGui::TableSetupColumn("Team", ImGuiTableColumnFlags_WidthFixed, 110);
+            ButtonRow row;
+            const int shown[] = { 0, 3, 1, 2 };
+            for (int order : shown)
+            {
+                if (row.Button(kOrderNames[order]))
+                {
+                    LOG("UI: companion order -> %s", kOrderNames[order]);
+                    Features::AiOrderSelected(order);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kOrderTips[order]);
+            }
+        }
+
+        ImGui::SeparatorText("Commands");
+        {
+            ButtonRow row;
+            if (row.Button("Regroup")) { LOG("UI: companions regroup"); Features::AiRegroup(); }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Everyone breaks off and follows you again. Companions more than\n"
+                                  "20 m away are brought beside you.   Hotkey: Num 4");
+            if (row.Button("Attack my target")) { LOG("UI: companions attack aim target"); Features::AiAttackAimTarget(); }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Companions attack the enemy under your crosshair.   Hotkey: Num 5");
+            if (row.Button("Attack nearest")) { LOG("UI: companions attack nearest"); Features::AiDispatchAttack(); }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Each companion attacks the enemy nearest to it. Your crosshair\n"
+                                  "target takes priority when there is one.");
+            if (row.Button("Hold / follow")) { LOG("UI: companions hold/follow"); Features::AiToggleHoldAll(); }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The whole squad holds position, or follows + defends again if it\n"
+                                  "is already holding.   Hotkey: Num 6");
+            if (row.Button("Heal all")) { LOG("UI: heal companions"); Features::AiHealCompanions(); }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Tops every companion up to full health.");
+        }
+
+        ImGui::SeparatorText("Companions");
+        const auto guards = Bodyguards::Snapshot();
+        if (guards.empty())
+            ImGui::TextDisabled("No companions yet. Spawn one above or recruit a nearby robot below.");
+        else if (ImGui::BeginTable("companionStatus", 6, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+        {
+            ImGui::TableSetupColumn("##select", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+            ImGui::TableSetupColumn("Companion", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Health", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("Order", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("Remove").x + ImGui::GetStyle().FramePadding.x * 2.0f);
             ImGui::TableHeadersRow();
-            const auto nearby = Features::AiNearbyList(128);
             for (const auto& guard : guards)
             {
                 ImGui::PushID(reinterpret_cast<void*>(guard.id));
-                ImGui::TableNextRow(); ImGui::TableNextColumn();
+                ImGui::TableNextRow();
+
+                ImGui::TableNextColumn();
                 bool selected = Features::AiIsSelected(guard.id);
                 if (ImGui::Checkbox("##select", &selected)) Features::AiToggleSelect(guard.id);
-                ImGui::TableNextColumn(); ImGui::TextWrapped("%s", guard.name.c_str());
-                ImGui::TableNextColumn(); ImGui::TextWrapped("%s (%.1f m)", guard.activity.c_str(), guard.distanceM);
+
                 ImGui::TableNextColumn();
-                ImGui::TextColored(guard.friendly ? ImVec4(.4f,.95f,.55f,1) : ImVec4(1,.65f,.2f,1),
-                    "%s", guard.friendly ? "Friendly" : "Unconfirmed");
+                ImGui::TextWrapped("%s", guard.name.c_str());
+                if (!guard.friendly)
+                {
+                    ImGui::TextColored(ImVec4(1, .65f, .2f, 1), "Not confirmed friendly");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("The game does not report this companion as friendly yet, so it\n"
+                                          "stays out of fights until it does.");
+                }
+
+                ImGui::TableNextColumn();
+                if (guard.healthFrac >= 0.0f)
+                {
+                    char percent[16];
+                    snprintf(percent, sizeof(percent), "%.0f%%", guard.healthFrac * 100.0f);
+                    ImGui::ProgressBar((std::min)(1.0f, guard.healthFrac), ImVec2(-FLT_MIN, 0), percent);
+                }
+                else
+                    ImGui::TextDisabled("-");
+
+                ImGui::TableNextColumn();
+                int order = static_cast<int>(guard.order);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::Combo("##order", &order, kOrderNames, IM_ARRAYSIZE(kOrderNames)))
+                {
+                    LOG("UI: order for %s -> %s", guard.name.c_str(), kOrderNames[order]);
+                    Features::AiOrderCompanion(guard.id, order);
+                }
+
+                ImGui::TableNextColumn();
+                if (guard.target.empty())
+                    ImGui::TextWrapped("%s", guard.activity.c_str());
+                else
+                    ImGui::TextWrapped("%s: %s", guard.activity.c_str(), guard.target.c_str());
+                if (guard.distanceM >= 0.0f)
+                    ImGui::TextDisabled("%.1f m away", guard.distanceM);
+
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("Remove"))
+                {
+                    LOG("UI: remove companion %s", guard.name.c_str());
+                    Features::AiDeleteActor(guard.id);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Removes this companion from the world.");
                 ImGui::PopID();
             }
             ImGui::EndTable();
         }
-        if (ImGui::Button("Clear selection")) Features::AiClearSelection();
-        ImGui::SameLine();
-        if (ImGui::Button("Release selected")) Features::AiReleaseRegularCompanions(true);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restores their original AI and faction. Former enemies may attack again.");
-        ImGui::SameLine();
-        if (ImGui::Button("Release all")) Features::AiReleaseRegularCompanions(false);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restores regular companions' original AI and faction.");
+        {
+            ButtonRow row;
+            if (row.Button("Select all"))
+                for (const auto& guard : guards)
+                    if (!Features::AiIsSelected(guard.id)) Features::AiToggleSelect(guard.id);
+            if (row.Button("Clear selection")) Features::AiClearSelection();
+            if (row.Button("Release selected")) Features::AiReleaseRegularCompanions(true);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restores their original AI and faction. Former enemies may attack again.");
+            if (row.Button("Release all")) Features::AiReleaseRegularCompanions(false);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restores regular companions' original AI and faction.");
+        }
+
+        if (ImGui::CollapsingHeader("Companion behaviour", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            const float width = 220.0f;
+            ImGui::SetNextItemWidth(width);
+            ImGui::SliderFloat("Follow distance", &f.aiFollowStopM, 1.0f, 8.0f, "%.1f m");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far from you companions stop, measured from their body's edge.");
+            LogCheckbox("Keep companions alive", &f.aiInvincibleAllies, "aiInvincibleAllies");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Companions take no damage and stay at full health. Turning it off\n"
+                                  "gives them back their normal damage intake.");
+            ImGui::SetNextItemWidth(width);
+            ImGui::SliderFloat("Companion damage", &f.aiCompanionDamage, 1.0f, 10.0f, "x%.1f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Multiplies the damage companions deal with their own weapons and\n"
+                                  "abilities. x1 is the robot's normal damage. Released companions get\n"
+                                  "their original damage back.");
+            ImGui::SetNextItemWidth(width);
+            ImGui::SliderFloat("Defend radius", &f.aiDefendRadiusM, 10.0f, 80.0f, "%.0f m");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Companions fight anything attacking you or them within this distance.");
+            ImGui::SetNextItemWidth(width);
+            ImGui::SliderFloat("Intercept radius", &f.aiInterceptRadiusM, 0.0f, 40.0f, "%.0f m");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Companions also engage hostile enemies that have spotted you within\n"
+                                  "this distance, before they attack. 0 turns interception off.");
+            ImGui::SetNextItemWidth(width);
+            ImGui::SliderFloat("Leash", &f.aiLeashRadiusM, 20.0f, 150.0f, "%.0f m");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("A fight is dropped once the enemy is this far from you, so companions\n"
+                                  "never chase off and leave you alone.");
+            // Mirror the limits the policy applies, so the sliders show the values in use.
+            f.aiInterceptRadiusM = (std::min)(f.aiInterceptRadiusM, f.aiDefendRadiusM);
+            f.aiLeashRadiusM = (std::max)(f.aiLeashRadiusM, f.aiDefendRadiusM);
+            LogCheckbox("Recover stuck companions by teleporting", &f.aiAllowTeleport, "aiAllowTeleport");
+            ImGui::TextDisabled("Numpad: 4 regroup, 5 attack my target, 6 hold / follow. All hotkeys are listed under Tools.");
+        }
 
         if (ImGui::CollapsingHeader("Recruit nearby AI"))
         {
@@ -285,11 +431,11 @@ namespace
         {
             ImGui::Checkbox("Freeze nearby enemies", &f.aiFreezeNearby);
             ImGui::Checkbox("Enemies fight each other", &f.aiFightEachOther);
-            ImGui::Checkbox("Recover stuck companions by teleporting", &f.aiAllowTeleport);
             if (ImGui::Button("Kill selected")) Features::AiDispatchKill();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Kills selected units. Does not delete actor objects.");
             ImGui::SameLine();
             if (ImGui::Button("Kill nearby enemies")) Features::AiQueueKillNearby();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your companions are never affected.");
             if (ImGui::Button("Snapshot enemies")) Features::AiSnapshotZone();
             ImGui::SameLine();
             if (ImGui::Button("Respawn snapshot as companions")) Features::AiRespawnZone();
@@ -831,7 +977,7 @@ void Menu::Render()
         uiScale = height >= 1300 ? 1.25f : 1.0f;
         ImGui::GetStyle().ScaleAllSizes(uiScale);
         ImGui::GetStyle().FontSizeBase = 17.0f;
-        ImGui::GetStyle().FontScaleMain = uiScale;
+        ImGui::GetStyle().FontScaleMain = f.menuTextScale > 0.0f ? f.menuTextScale : uiScale;
         themed = true;
     }
 
@@ -847,6 +993,25 @@ void Menu::Render()
         auto loc = Features::LastLocation();
         ImGui::Text("X %.0f  Y %.0f  Z %.0f", loc.X, loc.Y, loc.Z);
         ImGui::End();
+    }
+
+    // Short notices (hotkeys, companion commands, eject), shown with the menu closed too.
+    std::string notice;
+    float noticeAge = 0.0f;
+    if (Features::CurrentNotice(notice, noticeAge))
+    {
+        const float alpha = noticeAge > 2.0f ? (std::max)(0.0f, (2.5f - noticeAge) / 0.5f) : 1.0f;
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+        ImGui::SetNextWindowBgAlpha(0.75f);
+        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, 48.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::Begin("##notice", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::TextColored(kAccent, "%s", notice.c_str());
+        ImGui::End();
+        ImGui::PopStyleVar();
     }
 
     if (!G::menuOpen.load()) return;
@@ -1204,7 +1369,46 @@ void Menu::Render()
         if (page == 8)
         {
             ImGui::SeparatorText("Readability");
-            ImGui::SliderFloat("Text scale", &ImGui::GetStyle().FontScaleMain, 0.9f, 1.75f, "%.2fx");
+            float textScale = ImGui::GetStyle().FontScaleMain;
+            if (ImGui::SliderFloat("Text scale", &textScale, 0.9f, 1.75f, "%.2fx"))
+            {
+                ImGui::GetStyle().FontScaleMain = textScale;
+                f.menuTextScale = textScale;
+            }
+
+            ImGui::SeparatorText("Hotkeys");
+            LogCheckbox("Numpad hotkeys", &f.hotkeysEnabled, "hotkeysEnabled");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Work in game while the menu is closed, with NumLock on. The keys\n"
+                                  "still reach the game as usual.");
+            ImGui::BeginDisabled(!f.hotkeysEnabled);
+            if (ImGui::BeginTable("hotkeys", 2, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+            {
+                ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("Num 0").x + 24.0f);
+                ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+                const Features::Hotkey* hotkeys = Features::HotkeyList();
+                for (int i = 0; i < Features::HotkeyCount(); ++i)
+                {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextColored(kAccent, "%s", hotkeys[i].key);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(hotkeys[i].action);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("INSERT or F7 shows the menu. END (not numpad 1) restores everything and ejects.");
+
+            ImGui::SeparatorText("Reset");
+            if (ImGui::Button("Turn off all cheats"))
+            {
+                LOG("UI: turn off all cheats");
+                Features::TurnOffAllCheats();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Unticks every cheat (player, weapons, world, visuals, puzzles) as if\n"
+                                  "done by hand. Companions, horde runs and saved spots are kept.");
+            ImGui::TextDisabled("Preferences (sliders, colours, companion settings, hotkeys) are saved\n"
+                                "automatically. Cheats always start switched off.");
             ImGui::SeparatorText("Puzzles");
             LogCheckbox("Instant puzzle resolve", &f.instantPuzzleResolve, "instantPuzzleResolve");
             if (ImGui::IsItemHovered())

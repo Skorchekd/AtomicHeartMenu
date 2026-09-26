@@ -597,7 +597,7 @@ namespace
             Features::Tick();   // apply cheats for this frame
 
             const auto& featureState = Features::Get();
-            bool wantsOverlay = G::menuOpen.load() ||
+            bool wantsOverlay = G::menuOpen.load() || Features::NoticeActive() ||
                 (G::sdkReady.load() &&
                     (featureState.showCoords || featureState.espEnabled || featureState.crosshair));
             if (!wantsOverlay)

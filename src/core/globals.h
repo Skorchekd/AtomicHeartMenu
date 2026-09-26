@@ -23,6 +23,7 @@ namespace G
     inline std::atomic<bool> menuOpen{ false }; // toggled with INSERT
     inline std::atomic<bool> sdkReady{ false }; // engine globals resolved
     inline std::atomic<uint64_t> overlayLastDrawMs{ 0 }; // menu input block only while recently visible
+    inline std::atomic<bool> ejectRequested{ false }; // the window procedure saw the End key
 
     inline void*    hModule   = nullptr;        // our injected DLL base
     inline uint8_t* moduleBase = nullptr;       // game exe base (0x140000000)

@@ -20,6 +20,7 @@
 namespace WndProcHook
 {
     void Install(HWND hwnd);
+    bool IsInstalled();
     void Tick();
     // False when our procedure had to stay installed (see IsTopLevel); the module
     // must then stay loaded.

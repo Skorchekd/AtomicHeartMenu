@@ -141,6 +141,10 @@ namespace Features
         int   hordePerRound    = 6;      // robots in wave 1 (each wave adds more)
         bool  hordeAutoAdvance = true;   // auto-start the next wave once the arena is cleared
 
+        // Quality of life
+        bool  hotkeysEnabled = true;  // numpad shortcuts (see Features::HotkeyList); ignored while the menu is open
+        float menuTextScale  = 0.0f;  // menu text size; 0 = automatic (by screen height)
+
         // Misc/debug helpers
         bool  instantPuzzleResolve = false;
         bool  debugLiveDump = false; // Debug tab: stream togglelogsN snapshots + ProcessEvent trace
@@ -214,6 +218,37 @@ namespace Features
     // (which would run a spawn off the game thread -> the AnimInstance token-stream
     // fatal). Authoritative + immediate, so the very first spawn lands correctly.
     void NoteGameThread();
+
+    // Numpad shortcuts. The window procedure (game thread) reports key-downs here;
+    // the next render tick performs the action, exactly as the matching menu control
+    // would. Keys are observed, never swallowed.
+    struct Hotkey
+    {
+        int         vk;
+        const char* key;
+        const char* action;
+    };
+    void NoteHotkey(int vk);
+    const Hotkey* HotkeyList();
+    int HotkeyCount();
+
+    // Short on-screen notice (hotkey feedback and the like), drawn by the overlay
+    // for a few seconds, also while the menu is closed. Callable from any thread.
+    void Notify(const char* fmt, ...);
+    bool NoticeActive();
+    bool CurrentNotice(std::string& text, float& ageSeconds);
+
+    // Switch every cheat toggle off, exactly as unticking each one would.
+    // Companions, horde runs and saved positions are left alone. Returns how many
+    // toggles were on.
+    int TurnOffAllCheats();
+
+    // Preferences (sliders, colours, companion tuning, hotkeys; never the cheat
+    // toggles themselves) persist in AtomicHeartMenu_settings.json beside the
+    // game executable.
+    void LoadSettings();          // once at injection, before any hook is installed
+    void SaveSettingsIfChanged(); // worker thread, or after the hooks are quiesced
+
     std::string TestSnapshotJson(); // game-thread observation; no mutation
     bool TestTurn(float degrees);
     bool TestFlyPulse(int axis, float seconds); // bounded input through normal fly path
@@ -289,10 +324,11 @@ namespace Features
     void AiReleaseSelected();     // selected -> normal killable enemies
     void AiReleaseSquad();        // whole squad -> normal killable enemies
     void AiOrderSelected(int order); // 0 follow + defend, 1 follow only, 2 hold, 3 follow + attack hostiles
+    void AiOrderCompanion(unsigned long long id, int order); // same orders, one companion (a Bodyguards::Summary id)
     void AiReleaseRegularCompanions(bool selectedOnly); // leaves Hook Bodyguards untouched
     void AiDispatchAttack();      // selected (or squad) attack your aim target, else the nearest threat
 
-    // ---- companion shortcuts ----------------------------------------------
+    // ---- companion shortcuts (menu buttons + numpad hotkeys) -----------------
     void AiRegroup();             // everyone follows again; stragglers far away are brought beside you
     void AiAttackAimTarget();     // companions attack the enemy under your crosshair
     void AiToggleHoldAll();       // hold position <-> follow + defend, for the whole squad

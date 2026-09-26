@@ -40,6 +40,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <cctype>
 
@@ -13303,8 +13304,25 @@ bool Features::QueueGameAction(std::function<void()> action)
 
 bool Features::PrepareUnload()
 {
+    // Walking and collision are only restored by the render tick, which stops as
+    // soon as unloading begins. Switch free flight off, give the tick a moment to
+    // put movement back, and eject on the next END press (this used to refuse with
+    // nothing but a log line, so END looked broken while flying).
+    static ULONGLONG freeFlyOffMs = 0;
     if (Get().flyHack || Get().noclip)
-    { LOG("Disable fly/noclip before ejecting so movement can be restored."); return false; }
+    {
+        Get().flyHack = false;
+        Get().noclip = false;
+        freeFlyOffMs = GetTickCount64();
+        Notify("Fly/noclip turned off to restore movement. Press END again to eject.");
+        return false;
+    }
+    if (freeFlyOffMs && GetTickCount64() - freeFlyOffMs < 1000)
+    {
+        Notify("Restoring movement. Press END again in a moment.");
+        return false;
+    }
+    freeFlyOffMs = 0;
     if (!G::sdkReady.load()) return true;
     if (!InstallProcessEventHook()) return false;
     if (g_preparingUnload.exchange(true)) return false;
@@ -14422,7 +14440,7 @@ namespace
 void Features::AiDispatchAttack()
 {
     std::vector<UObject*> units = CompanionTargets();
-    if (units.empty()) { LOG("AiDispatchAttack: no companions selected or in the squad"); return; }
+    if (units.empty()) { Notify("No companions to command"); return; }
     // What you are aiming at wins; otherwise each companion takes the threat nearest it.
     if (AimedEnemy())
     {
@@ -14453,7 +14471,8 @@ void Features::AiDispatchAttack()
                 UObject* target = NearestNode(enemies, loc, player, -1, u);
                 if (target && OrderAttack(u, target, player)) ++n;
             }
-            LOG("AiDispatchAttack: %d companion(s) sent at the nearest enemy", n);
+            if (n) Notify("%d companion(s) attacking the nearest enemies", n);
+            else Notify("No enemies for companions to attack");
         }
         catch (...) {}
     });
@@ -14463,11 +14482,11 @@ void Features::AiAttackAimTarget()
 {
     if (!G::sdkReady.load()) return;
     std::vector<UObject*> units = CompanionTargets();
-    if (units.empty()) { LOG("AiAttackAimTarget: no companions selected or in the squad"); return; }
+    if (units.empty()) { Notify("No companions to command"); return; }
     UObject* target = AimedEnemy();
     if (!target)
     {
-        LOG("AiAttackAimTarget: no enemy under the crosshair");
+        Notify("No enemy under the crosshair");
         return;
     }
     const int32_t index = target->Index();
@@ -14485,6 +14504,8 @@ void Features::AiAttackAimTarget()
             for (UObject* u : units)
                 if (OrderAttack(u, target, player)) ++n;
             LOG("AiAttackAimTarget: %d companion(s) sent at %s", n, SafeObjectName(target).c_str());
+            if (n) Notify("%d companion(s) attacking your target", n);
+            else Notify("Companions cannot attack that target");
         }
         catch (...) {}
     }))
@@ -14495,7 +14516,7 @@ void Features::AiRegroup()
 {
     std::vector<UObject*> units;
     { std::lock_guard<std::mutex> lk(g_squadMutex); units = g_spawnedAllies; }
-    if (units.empty()) return;
+    if (units.empty()) { Notify("No companions to command"); return; }
     if (!QueueGameAction([units]()
     {
         try
@@ -14523,6 +14544,8 @@ void Features::AiRegroup()
                     ++moved;
             }
             LOG("AiRegroup: %d companion(s) recalled, %d straggler(s) brought beside you", recalled, moved);
+            if (moved) Notify("Regroup: %d companion(s), %d brought beside you", recalled, moved);
+            else Notify("Regroup: %d companion(s) following", recalled);
         }
         catch (...) {}
     }))
@@ -14545,7 +14568,8 @@ void Features::AiToggleHoldAll()
         int n = 0;
         for (UObject* u : units)
             if (Bodyguards::Contains(u) && !IsHookBodyguard(u)) { Bodyguards::SetOrder(u, next); ++n; }
-        LOG("AiToggleHoldAll: %d companion(s) -> %s", n, anyMoving ? "hold position" : "follow + defend");
+        if (n) Notify("%d companion(s): %s", n, anyMoving ? "hold position" : "follow + defend");
+        else Notify("No companions to command");
     }))
         LOG("AiToggleHoldAll skipped: no game-thread pump yet");
 }
@@ -14566,7 +14590,7 @@ void Features::AiHealCompanions()
             bool dead = Mem::IsReadable(b + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(b + AH::Char_bIsDead);
             if (!dead && SetCharacterHealthFull(u)) ++n;
         }
-        LOG("AiHealCompanions: healed %d companion(s)", n);
+        Notify("Healed %d companion(s)", n);
     }))
         LOG("AiHealCompanions skipped: no game-thread pump yet");
 }
@@ -14576,7 +14600,7 @@ void Features::AiDispatchKill()
     // The explicit selection only. Falling back to the whole squad, as orders do,
     // turned "Kill selected" with nothing selected into "kill all my companions".
     std::vector<UObject*> units = g_selectedAi;
-    if (units.empty()) { LOG("AiDispatchKill: nothing selected"); return; }
+    if (units.empty()) { Notify("Select the units to kill first"); return; }
     InstallProcessEventHook();
     QueueGameThread([units]()
     {
@@ -15330,6 +15354,12 @@ void Features::SolveCurrentPuzzle()
 void Features::WorkerTick()
 {
     if (g_preparingUnload.load()) return;
+    static ULONGLONG lastSettingsCheckMs = 0;
+    if (GetTickCount64() - lastSettingsCheckMs >= 2000)
+    {
+        lastSettingsCheckMs = GetTickCount64();
+        SaveSettingsIfChanged(); // small file, and only when a preference changed
+    }
     TestHarness::WorkerTick();
     if (G::sdkReady.load()) Workbench::WorkerTick();
     // Worker-thread heartbeat (called from the dllmain idle loop). All heavy
@@ -16785,6 +16815,324 @@ void DriveSquadVelocityGameThread()
     DriveTwinsFollowGameThread();
 }
 
+// ---- numpad hotkeys ---------------------------------------------------------
+// The window procedure (game thread) only records which binding was pressed; the
+// action runs on the next render tick, the same thread the menu's own controls
+// run on, so a hotkey behaves exactly like clicking the matching control.
+namespace
+{
+    const Features::Hotkey kHotkeys[] =
+    {
+        { VK_NUMPAD1, "Num 1", "God mode on/off" },
+        { VK_NUMPAD2, "Num 2", "Fly on/off" },
+        { VK_NUMPAD3, "Num 3", "Noclip on/off" },
+        { VK_NUMPAD4, "Num 4", "Companions: regroup on me" },
+        { VK_NUMPAD5, "Num 5", "Companions: attack my target" },
+        { VK_NUMPAD6, "Num 6", "Companions: hold / follow" },
+        { VK_NUMPAD7, "Num 7", "Infinite ammo on/off" },
+        { VK_NUMPAD8, "Num 8", "One-hit kill on/off" },
+        { VK_NUMPAD9, "Num 9", "Heal to full + refill ammo" },
+        { VK_NUMPAD0, "Num 0", "Enemy ESP on/off" },
+    };
+    constexpr int kHotkeyCount = (int)(sizeof(kHotkeys) / sizeof(kHotkeys[0]));
+    std::atomic<uint32_t> g_hotkeyPending{ 0 };
+
+    void ProcessHotkeys()
+    {
+        uint32_t pending = g_hotkeyPending.exchange(0);
+        if (!pending)
+            return;
+        auto& st = Features::Get();
+        auto toggle = [](bool& value, const char* what)
+        {
+            value = !value;
+            Features::Notify("%s: %s", what, value ? "ON" : "OFF");
+        };
+        for (int i = 0; i < kHotkeyCount; ++i)
+        {
+            if (!(pending & (1u << i)))
+                continue;
+            switch (kHotkeys[i].vk)
+            {
+            case VK_NUMPAD1: toggle(st.godMode, "God mode"); break;
+            case VK_NUMPAD2: toggle(st.flyHack, "Fly"); break;
+            case VK_NUMPAD3: toggle(st.noclip, "Noclip"); break;
+            case VK_NUMPAD4: Features::AiRegroup(); break;
+            case VK_NUMPAD5: Features::AiAttackAimTarget(); break;
+            case VK_NUMPAD6: Features::AiToggleHoldAll(); break;
+            case VK_NUMPAD7: toggle(st.infiniteAmmo, "Infinite ammo"); break;
+            case VK_NUMPAD8: toggle(st.oneHitKill, "One-hit kill"); break;
+            case VK_NUMPAD9: Features::FullHeal(); Features::RefillAmmoNow(); Features::Notify("Healed, ammo refilled"); break;
+            case VK_NUMPAD0: toggle(st.espEnabled, "Enemy ESP"); break;
+            default: break;
+            }
+        }
+    }
+}
+
+void Features::NoteHotkey(int vk)
+{
+    if (!g_state.hotkeysEnabled || !G::sdkReady.load() || G::menuOpen.load())
+        return;
+    for (int i = 0; i < kHotkeyCount; ++i)
+        if (kHotkeys[i].vk == vk)
+        {
+            g_hotkeyPending.fetch_or(1u << i);
+            return;
+        }
+}
+
+const Features::Hotkey* Features::HotkeyList() { return kHotkeys; }
+int Features::HotkeyCount() { return kHotkeyCount; }
+
+// ---- on-screen notices ----------------------------------------------------------
+namespace
+{
+    constexpr ULONGLONG    kNoticeMs = 2500;
+    std::mutex             g_noticeMutex;
+    std::string            g_noticeText; // guarded by g_noticeMutex
+    std::atomic<ULONGLONG> g_noticeAtMs{ 0 };
+}
+
+void Features::Notify(const char* fmt, ...)
+{
+    char text[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    {
+        std::lock_guard<std::mutex> lk(g_noticeMutex);
+        g_noticeText = text;
+    }
+    g_noticeAtMs = GetTickCount64();
+    LOG("Notice: %s", text);
+}
+
+bool Features::NoticeActive()
+{
+    const ULONGLONG at = g_noticeAtMs.load();
+    return at != 0 && GetTickCount64() - at < kNoticeMs;
+}
+
+bool Features::CurrentNotice(std::string& text, float& ageSeconds)
+{
+    const ULONGLONG at = g_noticeAtMs.load();
+    const ULONGLONG now = GetTickCount64();
+    if (at == 0 || now - at >= kNoticeMs)
+        return false;
+    {
+        std::lock_guard<std::mutex> lk(g_noticeMutex);
+        text = g_noticeText;
+    }
+    ageSeconds = (float)(now - at) / 1000.0f;
+    return true;
+}
+
+int Features::TurnOffAllCheats()
+{
+    State& st = g_state;
+    bool* toggles[] =
+    {
+        &st.godMode, &st.flyHack, &st.noclip, &st.speedHack, &st.superJump, &st.lowGravity,
+        &st.infiniteStamina, &st.infiniteEnergy, &st.infiniteAir, &st.oneHitKill, &st.infiniteAmmo,
+        &st.timeDilation, &st.bulletTime, &st.customScale, &st.customFov, &st.espEnabled,
+        &st.crosshair, &st.chamsEnabled, &st.worldTint, &st.weaponRgb, &st.aiFreezeNearby,
+        &st.aiFightEachOther, &st.instantPuzzleResolve,
+    };
+    int n = 0;
+    for (bool* toggle : toggles)
+        if (*toggle) { *toggle = false; ++n; }
+    if (n) Notify("Turned off %d cheat(s)", n);
+    else Notify("No cheats were on");
+    return n;
+}
+
+// ---- saved preferences ----------------------------------------------------------
+// Only preferences are stored: slider values, colours, the ESP layout, companion
+// tuning and the hotkey switch. Cheat toggles always start off, so nothing is
+// switched on by itself at the next launch.
+namespace
+{
+    std::mutex  g_settingsMutex;
+    std::string g_settingsWritten; // what the file holds (or would hold); guarded by g_settingsMutex
+
+    bool BuildSettingsPath(char out[MAX_PATH])
+    {
+        char exePath[MAX_PATH]{};
+        DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH)
+            return false;
+        strcpy_s(out, MAX_PATH, exePath);
+        char* slash  = strrchr(out, '\\');
+        char* slash2 = strrchr(out, '/');
+        if (slash2 && (!slash || slash2 > slash)) slash = slash2;
+        if (!slash)
+            return false;
+        slash[1] = '\0';
+        return strcat_s(out, MAX_PATH, "AtomicHeartMenu_settings.json") == 0;
+    }
+
+    nlohmann::json SettingsToJson(const Features::State& s)
+    {
+        auto rgb = [](const float c[3]) { return nlohmann::json::array({ c[0], c[1], c[2] }); };
+        return nlohmann::json{
+            { "version", 1 },
+            { "speedMult", s.speedMult }, { "playerScale", s.playerScale },
+            { "flyStreamingAssist", s.flyStreamingAssist }, { "bulletTimeScale", s.bulletTimeScale },
+            { "showCoords", s.showCoords }, { "fovValue", s.fovValue },
+            { "espBox", s.espBox }, { "espFilled", s.espFilled }, { "espFillAlpha", s.espFillAlpha },
+            { "espCornerBox", s.espCornerBox }, { "espSnapline", s.espSnapline },
+            { "espHealthbar", s.espHealthbar }, { "espDistance", s.espDistance },
+            { "espRainbow", s.espRainbow }, { "espColor", rgb(s.espColor) },
+            { "espMaxDistance", s.espMaxDistance }, { "crosshairColor", rgb(s.crosshairColor) },
+            { "chamsRainbow", s.chamsRainbow }, { "chamsColor", rgb(s.chamsColor) },
+            { "chamsEmissive", s.chamsEmissive }, { "chamsThroughWalls", s.chamsThroughWalls },
+            { "weaponRgbRainbow", s.weaponRgbRainbow }, { "weaponRgbColor", rgb(s.weaponRgbColor) },
+            { "worldTintRainbow", s.worldTintRainbow }, { "worldTintColor", rgb(s.worldTintColor) },
+            { "worldTintCycle", s.worldTintCycle },
+            { "aiRadius", s.aiRadius }, { "aiInvincibleAllies", s.aiInvincibleAllies },
+            { "aiAllowTeleport", s.aiAllowTeleport }, { "aiFollowStopM", s.aiFollowStopM },
+            { "aiCompanionDamage", s.aiCompanionDamage }, { "aiDefendRadiusM", s.aiDefendRadiusM },
+            { "aiInterceptRadiusM", s.aiInterceptRadiusM }, { "aiLeashRadiusM", s.aiLeashRadiusM },
+            { "hordePerRound", s.hordePerRound }, { "hordeAutoAdvance", s.hordeAutoAdvance },
+            { "hotkeysEnabled", s.hotkeysEnabled }, { "menuTextScale", s.menuTextScale },
+        };
+    }
+
+    // Every value is range-checked against its menu control, so a hand-edited or
+    // damaged file can never push the game outside what the menu itself allows.
+    void SettingsFromJson(const nlohmann::json& j, Features::State& s)
+    {
+        auto num = [&j](const char* key, float& value, float lo, float hi)
+        {
+            auto it = j.find(key);
+            if (it == j.end() || !it->is_number()) return;
+            float v = it->get<float>();
+            if (std::isfinite(v)) value = (std::min)(hi, (std::max)(lo, v));
+        };
+        auto flag = [&j](const char* key, bool& value)
+        {
+            auto it = j.find(key);
+            if (it != j.end() && it->is_boolean()) value = it->get<bool>();
+        };
+        auto color = [&j](const char* key, float value[3])
+        {
+            auto it = j.find(key);
+            if (it == j.end() || !it->is_array() || it->size() != 3) return;
+            for (int i = 0; i < 3; ++i)
+                if (!(*it)[i].is_number()) return;
+            for (int i = 0; i < 3; ++i)
+            {
+                float v = (*it)[i].get<float>();
+                if (std::isfinite(v)) value[i] = (std::min)(1.0f, (std::max)(0.0f, v));
+            }
+        };
+        num("speedMult", s.speedMult, 1.0f, 10.0f);
+        num("playerScale", s.playerScale, 0.2f, 8.0f);
+        flag("flyStreamingAssist", s.flyStreamingAssist);
+        num("bulletTimeScale", s.bulletTimeScale, 0.05f, 1.0f);
+        flag("showCoords", s.showCoords);
+        num("fovValue", s.fovValue, 60.0f, 170.0f);
+        flag("espBox", s.espBox);
+        flag("espFilled", s.espFilled);
+        num("espFillAlpha", s.espFillAlpha, 0.0f, 1.0f);
+        flag("espCornerBox", s.espCornerBox);
+        flag("espSnapline", s.espSnapline);
+        flag("espHealthbar", s.espHealthbar);
+        flag("espDistance", s.espDistance);
+        flag("espRainbow", s.espRainbow);
+        color("espColor", s.espColor);
+        num("espMaxDistance", s.espMaxDistance, 25.0f, 600.0f);
+        color("crosshairColor", s.crosshairColor);
+        flag("chamsRainbow", s.chamsRainbow);
+        color("chamsColor", s.chamsColor);
+        num("chamsEmissive", s.chamsEmissive, 0.0f, 20.0f);
+        flag("chamsThroughWalls", s.chamsThroughWalls);
+        flag("weaponRgbRainbow", s.weaponRgbRainbow);
+        color("weaponRgbColor", s.weaponRgbColor);
+        flag("worldTintRainbow", s.worldTintRainbow);
+        color("worldTintColor", s.worldTintColor);
+        num("worldTintCycle", s.worldTintCycle, 0.05f, 2.0f);
+        num("aiRadius", s.aiRadius, 10.0f, 300.0f);
+        flag("aiInvincibleAllies", s.aiInvincibleAllies);
+        flag("aiAllowTeleport", s.aiAllowTeleport);
+        num("aiFollowStopM", s.aiFollowStopM, 1.0f, 8.0f);
+        num("aiCompanionDamage", s.aiCompanionDamage, 1.0f, 10.0f);
+        num("aiDefendRadiusM", s.aiDefendRadiusM, 10.0f, 80.0f);
+        num("aiInterceptRadiusM", s.aiInterceptRadiusM, 0.0f, 40.0f);
+        num("aiLeashRadiusM", s.aiLeashRadiusM, 20.0f, 150.0f);
+        s.aiInterceptRadiusM = (std::min)(s.aiInterceptRadiusM, s.aiDefendRadiusM);
+        s.aiLeashRadiusM = (std::max)(s.aiLeashRadiusM, s.aiDefendRadiusM);
+        auto perRound = j.find("hordePerRound");
+        if (perRound != j.end() && perRound->is_number_integer())
+            s.hordePerRound = (std::min)(24, (std::max)(1, perRound->get<int>()));
+        flag("hordeAutoAdvance", s.hordeAutoAdvance);
+        flag("hotkeysEnabled", s.hotkeysEnabled);
+        float textScale = s.menuTextScale;
+        num("menuTextScale", textScale, 0.0f, 1.75f);
+        s.menuTextScale = textScale <= 0.0f ? 0.0f : (std::max)(0.9f, textScale);
+    }
+}
+
+void Features::LoadSettings()
+{
+    std::lock_guard<std::mutex> lk(g_settingsMutex);
+    // With no file yet, only an actual change writes one.
+    g_settingsWritten = SettingsToJson(g_state).dump(2);
+    char path[MAX_PATH]{};
+    if (!BuildSettingsPath(path))
+        return;
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.is_object())
+    {
+        LOG("Settings: %s is not valid JSON; using defaults.", path);
+        return;
+    }
+    try
+    {
+        State loaded = g_state;
+        SettingsFromJson(j, loaded);
+        g_state = loaded;
+        g_settingsWritten = SettingsToJson(g_state).dump(2);
+        LOG("Settings: loaded %s", path);
+    }
+    catch (...) { LOG("Settings: could not read %s; using defaults.", path); }
+}
+
+void Features::SaveSettingsIfChanged()
+{
+    std::string text;
+    try { text = SettingsToJson(g_state).dump(2); }
+    catch (...) { return; }
+    std::lock_guard<std::mutex> lk(g_settingsMutex);
+    if (text == g_settingsWritten)
+        return;
+    // Recorded even when the write fails, so a read-only folder is reported once
+    // instead of on every check.
+    g_settingsWritten = text;
+    char path[MAX_PATH]{};
+    if (!BuildSettingsPath(path))
+        return;
+    // Write a sibling file and swap it in: a crash mid-write cannot leave a
+    // truncated settings file behind.
+    const std::string temp = std::string(path) + ".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!(out << text))
+        {
+            LOG("Settings: cannot write %s", temp.c_str());
+            return;
+        }
+    }
+    if (!MoveFileExA(temp.c_str(), path, MOVEFILE_REPLACE_EXISTING))
+        LOG("Settings: cannot replace %s (error %lu)", path, GetLastError());
+}
+
 static void TickImpl()
 {
     if (g_preparingUnload.load()) return;
@@ -16802,6 +17150,7 @@ static void TickImpl()
     UpdateGameInputBlock();
     UpdateDebugDiagnostics();
     UpdateHookTwinForensics();
+    ProcessHotkeys();
     // Puzzle completions, the instant-puzzle flag, time dilation, player scale and
     // infinite ammo all dispatch gameplay UFunctions: marshal them to the game
     // thread (they used to run right here, inside Present).
@@ -17332,6 +17681,19 @@ void Features::AiOrderSelected(int order)
     {
         for (UObject* actor : targets)
             if (!IsHookBodyguard(actor)) Bodyguards::SetOrder(actor, static_cast<Bodyguards::Order>(order));
+    });
+}
+
+void Features::AiOrderCompanion(unsigned long long id, int order)
+{
+    if (order < 0 || order > 3) return;
+    UObject* actor = reinterpret_cast<UObject*>((uintptr_t)id);
+    // Bodyguards only acts on an actor it still tracks as live, so a row whose
+    // companion died since the frame was drawn is simply ignored.
+    QueueGameThread([actor, order]()
+    {
+        if (Bodyguards::Contains(actor) && !IsHookBodyguard(actor))
+            Bodyguards::SetOrder(actor, static_cast<Bodyguards::Order>(order));
     });
 }
 

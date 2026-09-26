@@ -18,6 +18,7 @@
 #include "core/log.h"
 #include "sdk/ue4.h"
 #include "hooks/dx12_hook.h"
+#include "hooks/wndproc_hook.h"
 #include "hooks/native_hooks.h"
 #include "hooks/ai_movement_hooks.h"
 #include "features/features.h"
@@ -46,6 +47,23 @@ namespace
         catch (...) { LOG("DX12Hook::Remove threw during shutdown."); }
     }
 
+    // The window procedure reports the dedicated End key while the game has focus
+    // (never numpad 1 with NumLock off). Until it is installed, poll instead, but
+    // only while a game window is in front: GetAsyncKeyState is system-wide, so End
+    // pressed in any other application used to eject the menu.
+    bool EjectKeyPressed()
+    {
+        if (G::ejectRequested.exchange(false))
+            return true;
+        const bool pressed = (GetAsyncKeyState(VK_END) & 1) != 0; // read every poll to clear the latch
+        if (!pressed || WndProcHook::IsInstalled())
+            return false;
+        DWORD pid = 0;
+        if (HWND foreground = GetForegroundWindow())
+            GetWindowThreadProcessId(foreground, &pid);
+        return pid == GetCurrentProcessId();
+    }
+
     void RunMainThread(LPVOID param)
     {
         Log::Init(false);
@@ -59,6 +77,10 @@ namespace
         if (Offsets::ExpectedImageSize && G::moduleSize != Offsets::ExpectedImageSize)
             LOG("Game image 0x%zX; offsets.h was captured from 0x%zX (different game build).",
                 G::moduleSize, Offsets::ExpectedImageSize);
+
+        // Saved preferences, applied before any hook can read the feature state.
+        try { Features::LoadSettings(); }
+        catch (...) { LOG("Settings could not be loaded; using defaults."); }
 
         if (!DX12Hook::Install())
             LOG("WARNING: DX12 hook install failed - menu will not draw.");
@@ -117,7 +139,7 @@ namespace
             if (sdkPrewarmed)
                 Features::WorkerTick();
 
-            if (GetAsyncKeyState(VK_END) & 1)
+            if (EjectKeyPressed())
             {
                 LOG("Eject key pressed.");
                 if (!Features::PrepareUnload()) continue;
@@ -161,6 +183,9 @@ namespace
             return exitCode;
         }
         SafeRemoveHooks();
+        // Nothing else touches the feature state any more: store the last changes.
+        try { Features::SaveSettingsIfChanged(); }
+        catch (...) { LOG("Settings could not be saved on eject."); }
         if (!windowProcReleased)
         {
             LOG("Eject: another overlay still chains through our window procedure; the DLL stays loaded (inert).");

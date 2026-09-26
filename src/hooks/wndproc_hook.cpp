@@ -25,12 +25,23 @@ namespace
 {
     WNDPROC g_originalWndProc = nullptr;
     HWND    g_hwnd = nullptr;
+    std::atomic<bool> g_installed{ false }; // read by the eject poll on the main thread
     bool    g_wasMenuOpen = false;
     std::recursive_mutex g_inputMutex;
     ULONGLONG g_lastInsertToggleMs = 0;
     const LPCSTR kArrowCursor = MAKEINTRESOURCEA(32512);
     constexpr ULONGLONG kOverlayInputGraceMs = 750;
     constexpr ULONGLONG kStaleMenuCloseMs = 2000;
+
+    // True while a menu text field has keyboard focus; End then moves the caret
+    // instead of ejecting.
+    bool MenuTypingText()
+    {
+        if (!G::menuOpen.load())
+            return false;
+        std::lock_guard<std::recursive_mutex> inputLock(g_inputMutex);
+        return ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput;
+    }
 
     bool OverlayRecentlyDrawn(ULONGLONG now = GetTickCount64())
     {
@@ -152,6 +163,15 @@ namespace
         // UE4 pumps window messages on the game thread, so THIS is the game thread.
         // Pin it so the ProcessEvent pump never runs a spawn on a loading/audio worker.
         Features::NoteGameThread();
+        // Feature hotkeys (numpad by default). Keyboard is only observed, never
+        // swallowed, so the game still receives every key.
+        if (msg == WM_KEYDOWN && (lParam & 0x40000000) == 0)
+            Features::NoteHotkey(static_cast<int>(wParam));
+        // Eject on the dedicated End key only. With NumLock off, numpad 1 (one of the
+        // hotkeys above) also arrives as VK_END, but without the extended-key bit.
+        if (msg == WM_KEYDOWN && wParam == VK_END && (lParam & 0x01000000) != 0 && (lParam & 0x40000000) == 0 &&
+            !MenuTypingText())
+            G::ejectRequested = true;
         try
         {
             // Toggle on key-down of INSERT or F7.
@@ -245,7 +265,13 @@ void WndProcHook::Install(HWND hwnd)
     if (g_originalWndProc || !hwnd) return;
     g_hwnd = hwnd;
     g_originalWndProc = (WNDPROC)SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)Hooked);
+    g_installed = g_originalWndProc != nullptr;
     LOG("WndProc hooked (hwnd=%p, orig=%p)", hwnd, g_originalWndProc);
+}
+
+bool WndProcHook::IsInstalled()
+{
+    return g_installed.load();
 }
 
 void WndProcHook::Tick()
@@ -273,6 +299,7 @@ bool WndProcHook::Remove()
             return false;
         }
         SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_originalWndProc);
+        g_installed = false;
         g_originalWndProc = nullptr;
         g_wasMenuOpen = false;
         LOG("WndProc restored");
