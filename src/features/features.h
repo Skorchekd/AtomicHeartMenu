@@ -110,9 +110,13 @@ namespace Features
         // Squad / control model. Recruiting is now EXPLICIT (a managed roster), not
         // an auto-recruit toggle -- see the squad API below. Members always follow +
         // protect you.
-        bool  aiInvincibleAllies = true;  // keep squad members topped to full health
+        bool  aiInvincibleAllies = true;  // companions take no damage (incoming multiplier 0) and stay topped up
         bool  aiAllowTeleport    = false; // OFF by default: the squad WALKS to you; only snap-teleport if a member is stuck
-        float aiFollowStopM      = 1.0f;  // squad stops this far from you (customizable; clean, no circling)
+        float aiFollowStopM      = 1.0f;  // squad stops this far from you (plus the companion's own body radius)
+        float aiCompanionDamage  = 3.0f;  // companions' outgoing damage multiplier (1 = the robot's normal damage)
+        float aiDefendRadiusM    = 30.0f; // companions engage anything attacking you or them inside this range
+        float aiInterceptRadiusM = 15.0f; // ...and hostile enemies that have spotted you inside this range
+        float aiLeashRadiusM     = 45.0f; // a fight is dropped once the enemy is this far from you
         // Squad combat injection (SetCharacterAggressive state machine). OFF by default
         // because it CRASHES on non-combat NPCs (e.g. Larisa) that have no combat AI --
         // turn it on only for a squad of real combat enemies (robots). When off, the
@@ -284,10 +288,16 @@ namespace Features
     void AiSaveSelected();        // save selected units' classes to the model DB (json)
     void AiReleaseSelected();     // selected -> normal killable enemies
     void AiReleaseSquad();        // whole squad -> normal killable enemies
-    void AiOrderSelected(int order); // 0 follow/defend, 1 follow only, 2 hold
+    void AiOrderSelected(int order); // 0 follow + defend, 1 follow only, 2 hold, 3 follow + attack hostiles
     void AiReleaseRegularCompanions(bool selectedOnly); // leaves Hook Bodyguards untouched
-    void AiDispatchAttack();      // selected (or squad) attack your aim/nearest enemy
-    void AiDispatchKill();        // selected (or squad) die
+    void AiDispatchAttack();      // selected (or squad) attack your aim target, else the nearest threat
+
+    // ---- companion shortcuts ----------------------------------------------
+    void AiRegroup();             // everyone follows again; stragglers far away are brought beside you
+    void AiAttackAimTarget();     // companions attack the enemy under your crosshair
+    void AiToggleHoldAll();       // hold position <-> follow + defend, for the whole squad
+    void AiHealCompanions();      // top every companion up to full health
+    void AiDispatchKill();        // selected units die (nothing selected: nothing happens)
     // Zone respawn: snapshot the current enemies, respawn that set later.
     void AiSnapshotZone();
     void AiRespawnZone();

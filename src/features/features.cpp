@@ -2094,6 +2094,14 @@ namespace
         for (UObject* guard : g_hookBodyguards) if (guard == ai) return true;
         return false;
     }
+    // Any unit under the player's control. World-wide AI commands (kill all, launch
+    // all, freeze nearby, passive) must never hit these: "Kill nearby enemies" used to
+    // kill the player's own companions along with everything else.
+    bool IsProtectedUnit(UObject* ai)
+    {
+        return ai && (IsSquadMember(ai) || IsHookBodyguard(ai) || Bodyguards::Contains(ai));
+    }
+
     void HookBodyguardAdd(UObject* ai)
     {
         if (!Mem::IsReadable(ai, 0x30)) return;
@@ -3034,14 +3042,15 @@ namespace
         return true;
     }
 
-    bool SetControllerFollowSpeed(UObject* ctrl)
+    bool SetControllerFollowSpeed(UObject* ctrl, float speed = 260.0f)
     {
         UFunction* fn = CachedObjectClassFn(ctrl, "SetFollowLocationSpeed");
         if (!ControllerBlackboardReady(ctrl) || !fn)
             return false;
-        // Lower speed/rotation keeps Twins in their native walk-cycle range instead
-        // of the stiff Recast jog/snap-turn look. Combat paths override max speed.
-        P_SetFollowLocationSpeed p{ 260.0f, 1.25f, { 0.0f, 240.0f, 0.0f } };
+        // The 260 default keeps Twins in their native walk-cycle range instead of the
+        // stiff Recast jog/snap-turn look. The squad follow passes a pace matched to
+        // how far behind the companion is. Combat paths override max speed.
+        P_SetFollowLocationSpeed p{ speed, 1.25f, { 0.0f, 240.0f, 0.0f } };
         ctrl->ProcessEvent(fn, &p);
         return true;
     }
@@ -3294,6 +3303,145 @@ namespace
         *reinterpret_cast<float*>(set + AH::Set_InstigatedDmgMult + AH::Attr_BaseValue)    = mult;
         *reinterpret_cast<float*>(set + AH::Set_InstigatedDmgMult + AH::Attr_CurrentValue) = mult;
         return true;
+    }
+
+    // ---- companion vitals -------------------------------------------------
+    // "Keep companions alive" used to top health every 200 ms pump, which a single
+    // burst (an explosion, a boss slam) outran: the companion died between two
+    // top-ups and was pruned. It now also zeroes the companion's incoming-damage
+    // multiplier -- the same attribute player god mode uses -- and the outgoing
+    // damage boost is a setting instead of a hardcoded constant. Everything touched
+    // is captured first and put back on release or when the option is turned off.
+    // Raw guarded attribute writes, game thread only.
+    struct CompanionOriginals
+    {
+        int32_t index = -1;
+        FName   name{};
+        bool    incomingValid = false, instigatedValid = false, walkValid = false;
+        float   incomingBase = 1.0f, incomingCurrent = 1.0f;
+        float   instigatedBase = 1.0f, instigatedCurrent = 1.0f;
+        float   walkSpeed = 0.0f;
+    };
+    std::unordered_map<UObject*, CompanionOriginals> g_companionOriginals; // game thread
+
+    uint8_t* CompanionAttributeSet(UObject* ai)
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (!Mem::IsReadable(base + AH::Char_AttributeSet, sizeof(void*)))
+            return nullptr;
+        uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
+        return Mem::IsReadable(set, AH::Set_InstigatedDmgMult + AH::Attr_CurrentValue + sizeof(float)) ? set : nullptr;
+    }
+
+    void ReadAttrPair(uint8_t* set, int offset, float& baseValue, float& currentValue)
+    {
+        baseValue = *reinterpret_cast<float*>(set + offset + AH::Attr_BaseValue);
+        currentValue = *reinterpret_cast<float*>(set + offset + AH::Attr_CurrentValue);
+    }
+
+    void WriteAttrPair(uint8_t* set, int offset, float baseValue, float currentValue)
+    {
+        *reinterpret_cast<float*>(set + offset + AH::Attr_BaseValue) = baseValue;
+        *reinterpret_cast<float*>(set + offset + AH::Attr_CurrentValue) = currentValue;
+    }
+
+    uint8_t* GetCharacterMovementPtr(UObject* pawn);
+
+    // The record for `ai`, reset when the address now belongs to a different object.
+    CompanionOriginals& CompanionOriginalsFor(UObject* ai)
+    {
+        CompanionOriginals& o = g_companionOriginals[ai];
+        FName name = *ai->NamePtr();
+        if (o.index != ai->Index() || o.name.ComparisonIndex != name.ComparisonIndex || o.name.Number != name.Number)
+        {
+            o = CompanionOriginals{};
+            o.index = ai->Index();
+            o.name = name;
+            // Captured before the follow drive raises the walk-speed floor.
+            if (uint8_t* mv = GetCharacterMovementPtr(ai))
+            {
+                float speed = *reinterpret_cast<float*>(mv + AH::Move_MaxWalkSpeed);
+                if (std::isfinite(speed) && speed > 0.0f) { o.walkSpeed = speed; o.walkValid = true; }
+            }
+        }
+        return o;
+    }
+
+    void ApplyCompanionVitals(UObject* ai)
+    {
+        if (!AiUsable(ai))
+            return;
+        uint8_t* set = CompanionAttributeSet(ai);
+        if (!set)
+            return;
+        const auto& st = Features::Get();
+        CompanionOriginals& o = CompanionOriginalsFor(ai);
+
+        if (st.aiInvincibleAllies)
+        {
+            if (!o.incomingValid)
+            {
+                ReadAttrPair(set, AH::Set_IncomingDamageMult, o.incomingBase, o.incomingCurrent);
+                // A value left at 0 by an earlier session is not an original.
+                if (!(o.incomingCurrent > 0.0f) || !std::isfinite(o.incomingCurrent)) o.incomingBase = o.incomingCurrent = 1.0f;
+                o.incomingValid = true;
+            }
+            WriteAttrPair(set, AH::Set_IncomingDamageMult, 0.0f, 0.0f);
+            SetCharacterHealthFull(ai);
+        }
+        else if (o.incomingValid)
+        {
+            WriteAttrPair(set, AH::Set_IncomingDamageMult, o.incomingBase, o.incomingCurrent);
+            o.incomingValid = false;
+        }
+
+        float boost = st.aiCompanionDamage;
+        if (!std::isfinite(boost) || boost < 1.0f) boost = 1.0f;
+        if (boost > 100.0f) boost = 100.0f;
+        if (boost > 1.0f)
+        {
+            if (!o.instigatedValid)
+            {
+                ReadAttrPair(set, AH::Set_InstigatedDmgMult, o.instigatedBase, o.instigatedCurrent);
+                if (!(o.instigatedCurrent > 0.0f) || !std::isfinite(o.instigatedCurrent) || o.instigatedCurrent > 50.0f)
+                    o.instigatedBase = o.instigatedCurrent = 1.0f;
+                o.instigatedValid = true;
+            }
+            WriteAttrPair(set, AH::Set_InstigatedDmgMult, o.instigatedBase * boost, o.instigatedCurrent * boost);
+        }
+        else if (o.instigatedValid)
+        {
+            WriteAttrPair(set, AH::Set_InstigatedDmgMult, o.instigatedBase, o.instigatedCurrent);
+            o.instigatedValid = false;
+        }
+    }
+
+    // Put back everything ApplyCompanionVitals and the follow drive changed.
+    void RestoreCompanionVitals(UObject* ai)
+    {
+        auto it = g_companionOriginals.find(ai);
+        if (it == g_companionOriginals.end())
+            return;
+        CompanionOriginals o = it->second;
+        g_companionOriginals.erase(it);
+        if (!IsLiveObject(ai) || ai->Index() != o.index)
+            return;
+        if (uint8_t* set = CompanionAttributeSet(ai))
+        {
+            if (o.incomingValid) WriteAttrPair(set, AH::Set_IncomingDamageMult, o.incomingBase, o.incomingCurrent);
+            if (o.instigatedValid) WriteAttrPair(set, AH::Set_InstigatedDmgMult, o.instigatedBase, o.instigatedCurrent);
+        }
+        if (o.walkValid)
+            if (uint8_t* mv = GetCharacterMovementPtr(ai))
+                *reinterpret_cast<float*>(mv + AH::Move_MaxWalkSpeed) = o.walkSpeed;
+    }
+
+    // The companion's walk speed before we touched it, or 0 when unknown.
+    float CompanionBaseWalkSpeed(UObject* ai)
+    {
+        auto it = g_companionOriginals.find(ai);
+        return it != g_companionOriginals.end() && it->second.walkValid && it->second.index == ai->Index()
+            ? it->second.walkSpeed : 0.0f;
     }
 
     // Stop an actor by scaling its own time dilation to ~0. This is a single
@@ -4082,6 +4230,8 @@ namespace
         ULONGLONG followLastProgressMs = 0;
         bool      velocityFallback = false;
         uint32_t  movementRecoveries = 0;
+        bool      speedBoosted = false;     // walk speed raised for a catch-up sprint
+        float     speedBeforeBoost = 0.0f;  // ...and what to put back once caught up
     };
     std::unordered_map<UObject*, InjectState> g_inject; // game thread (pump) only
 
@@ -4196,6 +4346,42 @@ namespace
             return nullptr;
         uint8_t* movement = *reinterpret_cast<uint8_t**>(base + AH::Char_CharacterMovement);
         return Mem::IsReadable(movement, AH::Move_MaxWalkSpeed + sizeof(float)) ? movement : nullptr;
+    }
+
+    // A character's collision radius in metres, read by name through reflection
+    // (ACharacter.CapsuleComponent -> UCapsuleComponent.CapsuleRadius) so no build-
+    // specific offset is involved. Per class, so it is resolved once per robot type.
+    // Game thread only (the memo is thread_local).
+    float CapsuleRadiusM(UObject* pawn)
+    {
+        constexpr float kDefault = 0.45f;
+        if (!Mem::IsReadable(pawn, 0x30))
+            return kDefault;
+        UClass* cls = pawn->Class();
+        if (!Mem::IsReadable(cls, 0x30))
+            return kDefault;
+        thread_local std::unordered_map<UClass*, float> memo;
+        auto it = memo.find(cls);
+        if (it != memo.end())
+            return it->second;
+        float radius = kDefault;
+        try
+        {
+            UObject* capsule = Reflect::ReadNamedObjectProperty(pawn, "CapsuleComponent");
+            int offset = capsule ? Reflect::FindPropertyOffset(capsule, "CapsuleRadius") : -1;
+            uint8_t* bytes = reinterpret_cast<uint8_t*>(capsule);
+            if (offset > 0 && Mem::IsReadable(bytes + offset, sizeof(float)))
+            {
+                float r = *reinterpret_cast<float*>(bytes + offset) / kUnitsPerMetre;
+                if (std::isfinite(r) && r > 0.05f && r < 10.0f)
+                    radius = r;
+            }
+        }
+        catch (...) {}
+        if (memo.size() > 512)
+            memo.clear();
+        memo[cls] = radius;
+        return radius;
     }
 
     bool WriteHookFollowVelocity(UObject* pawn, const FVector& direction, float speed)
@@ -4453,7 +4639,11 @@ namespace
         if (forceTeamId < 0 && targetChanged && teamRef && Mem::IsReadable(teamRef, 0x30))
             SwitchAiTeamAttitude(ai, teamRef, attitudeVsRef);
         // (5) heavy, throttled: fight-team split + force the attack state machine.
-        if (targetChanged || (now - s.lastHeavyMs > 1500))
+        // A companion's own behaviour tree keeps attacking once it is in the
+        // aggressive state; re-kicking it every 1.5 s restarted its attack and
+        // ability montages mid-swing, so companions only get a slow heartbeat.
+        const ULONGLONG heavyEveryMs = IsSquadMember(ai) ? 5000 : 1500;
+        if (targetChanged || (now - s.lastHeavyMs > heavyEveryMs))
         {
             if (forceTeamId >= 0)
                 SetAiTeamIdTracked(ai, (uint8_t)forceTeamId);
@@ -4953,7 +5143,10 @@ namespace
     {
         Bodyguards::Forget(ai);
         if (!AiUsable(ai))
+        {
+            g_companionOriginals.erase(ai);
             return false;
+        }
 
         // *** Release => put the unit back EXACTLY as it was, so it behaves naturally. ***
         // Recruiting tracks the unit's real team (g_origTeam) before we ever touch it.
@@ -5004,6 +5197,8 @@ namespace
         if (IsMixedNavCharacter(ai))
             AllowMixedNavAuto(ai);
         g_twin.erase(ai);
+        // Damage multipliers and walk speed go back to what the robot had.
+        RestoreCompanionVitals(ai);
         return ok;
     }
 
@@ -5428,12 +5623,17 @@ namespace
                 switch (local.kind)
                 {
                 case AiQueuedKind::Kill:
+                    // World commands never touch companions (explicit per-unit
+                    // "Kill selected" is AiDispatchKill, not this queue).
+                    if (IsProtectedUnit(ai)) break;
                     ok = ApplyAiKill(ai);
                     break;
                 case AiQueuedKind::PassiveOn:
+                    if (IsProtectedUnit(ai)) break;
                     ok = SetAiPassive(ai, true);
                     break;
                 case AiQueuedKind::PassiveOff:
+                    if (IsProtectedUnit(ai)) break;
                     ok = SetAiPassive(ai, false);
                     break;
                 case AiQueuedKind::Follow:
@@ -5475,6 +5675,7 @@ namespace
                     break;
                 }
                 case AiQueuedKind::Launch:
+                    if (IsProtectedUnit(ai)) break;
                     ok = ApplyAiLaunch(ai);
                     break;
                 default:
@@ -5563,11 +5764,15 @@ namespace
 
         if (st.aiFreezeNearby && nowMs - lastFreezeMs >= 1000)
         {
-            std::vector<UObject*> targets = CollectNearbyAi(st.aiRadius, kAiAutoOpsPerPass);
+            // Companions are never frozen with the enemies around them. Over-collect by
+            // the squad cap so companions standing nearest do not use up the budget.
+            std::vector<UObject*> targets = CollectNearbyNonSquadAi(st.aiRadius, kAiAutoOpsPerPass + kMaxSpawnedAllies);
             int done = 0;
             for (UObject* ai : targets)
             {
-                if (Mem::IsReadable(ai, 0x30) && ApplyAiFreeze(ai))
+                if (done >= kAiAutoOpsPerPass)
+                    break;
+                if (!IsProtectedUnit(ai) && ApplyAiFreeze(ai))
                     ++done;
             }
             if (done > 0)
@@ -5787,16 +5992,36 @@ namespace
         // they vanished from the list"). The miss-counter keeps a hitching guard in the
         // squad so it stays converted.
         static std::unordered_map<UObject*, int> miss; // consecutive transient misses (game thread)
+        // A dead companion stays a live object (the corpse) until the level cleans it
+        // up; driving orders into it only churns a controller that no longer exists.
+        // Hook Diagnostics guards are excluded: their death pipeline is managed there.
+        // (Snapshot taken before the squad lock so the two locks never nest.)
+        const std::vector<UObject*> hookGuards = HookBodyguardSnapshot();
+        auto companionDead = [&hookGuards](UObject* a)
+        {
+            for (UObject* guard : hookGuards) if (guard == a) return false;
+            uint8_t* b = reinterpret_cast<uint8_t*>(a);
+            if (Mem::IsReadable(b + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(b + AH::Char_bIsDead))
+                return true;
+            float cur = 0.0f, mx = 0.0f;
+            return ReadCharacterHealth(a, cur, mx) && mx > 0.001f && std::isfinite(cur) && cur <= 0.0f;
+        };
         std::vector<UObject*> squad;
         {
             std::lock_guard<std::mutex> lk(g_squadMutex);
             g_spawnedAllies.erase(
                 std::remove_if(g_spawnedAllies.begin(), g_spawnedAllies.end(),
-                    [](UObject* a)
+                    [&companionDead](UObject* a)
                     {
-                        if (!IsLiveObject(a)) { Bodyguards::Forget(a); miss.erase(a); LOG("Squad prune: member %p gone (unreadable) -> dropped", (void*)a); return true; } // truly gone
+                        // Per-member state is dropped with the member: the next actor
+                        // allocated at this address must not inherit it (a stale sprint
+                        // record would "restore" someone else's walk speed onto it). A
+                        // member that is still there gets its own damage values back, so
+                        // a revived or dropped robot is not left invulnerable.
+                        if (!IsLiveObject(a)) { Bodyguards::Forget(a); miss.erase(a); g_companionOriginals.erase(a); g_inject.erase(a); LOG("Squad prune: member %p gone (unreadable) -> dropped", (void*)a); return true; } // truly gone
+                        if (companionDead(a)) { Bodyguards::Forget(a); miss.erase(a); RestoreCompanionVitals(a); g_inject.erase(a); LOG("Squad prune: companion %p died -> dropped", (void*)a); return true; }
                         if (FollowPawnUsable(a)) { miss.erase(a); return false; }       // healthy -> keep
-                        if (++miss[a] >= 30) { Bodyguards::Forget(a); LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
+                        if (++miss[a] >= 30) { Bodyguards::Forget(a); RestoreCompanionVitals(a); g_inject.erase(a); LOG("Squad prune: member %p dropped after 30 misses (FollowPawnUsable=false)", (void*)a); miss.erase(a); return true; }
                         return false; // ~30 consecutive misses (~several s) -> give up; else KEEP
                     }),
                 g_spawnedAllies.end());
@@ -5840,6 +6065,7 @@ namespace
         const bool invincible = Features::Get().aiInvincibleAllies;
         const bool squadAggr  = Features::Get().aiSquadAggressive;
         int dbgDriven = 0, dbgEngaged = 0; float dbgNearThreat = -1.0f; uint8_t dbgTeam = 255;
+        std::vector<UObject*> regular; // companions run by the Bodyguards policy
         for (UObject* ally : squad)
         {
             if (!FollowPawnUsable(ally) || ally == player)
@@ -5857,18 +6083,10 @@ namespace
             ++dbgDriven;
             if (!hookOwned && Bodyguards::Contains(ally))
             {
-                UObject* attacker = nullptr;
-                float best = 3.4e38f;
-                for (const InjNode& candidate : threats)
-                {
-                    if (!candidate.ok || BodyguardEngine::Protected(candidate.actor)) continue;
-                    UObject* target = ReadAiTargetField(candidate.actor);
-                    if (target != player && !BodyguardEngine::Protected(target)) continue;
-                    float distance = DistanceMetres(candidate.loc, playerLoc);
-                    if (distance < best) { best = distance; attacker = candidate.actor; }
-                }
-                Bodyguards::Update(ally, player, playerLoc, attacker);
-                if (invincible && AiUsable(ally)) SetCharacterHealthFull(ally);
+                // Vitals before the policy pass: the originals are captured before
+                // the follow drive raises the walk-speed floor.
+                try { ApplyCompanionVitals(ally); } catch (...) {}
+                regular.push_back(ally);
                 continue;
             }
             // Legacy squad members keep their old grounding heartbeat. Hook Twins
@@ -5989,6 +6207,26 @@ namespace
                 }
             }
             catch (...) {} // one stale member must not abort the rest
+        }
+
+        // Regular companions: one policy pass for the whole squad, so simultaneous
+        // attackers are shared out and whoever is attacking you is answered first.
+        // Civilians and other non-combat NPCs are never offered as threats.
+        if (!regular.empty())
+        {
+            const auto& st = Features::Get();
+            Bodyguards::Settings policy;
+            policy.defendRadiusM = st.aiDefendRadiusM;
+            policy.interceptRadiusM = st.aiInterceptRadiusM;
+            policy.leashRadiusM = st.aiLeashRadiusM;
+            Bodyguards::Configure(policy);
+            std::vector<Bodyguards::Threat> threatList;
+            threatList.reserve(threats.size());
+            for (const InjNode& node : threats)
+                if (node.ok && AiIsCombatCapable(node.actor))
+                    threatList.push_back({ node.actor, node.loc });
+            try { Bodyguards::UpdateAll(regular, player, playerLoc, threatList); }
+            catch (...) { LOG("SquadCombat: companion policy pass faulted (ignored)"); }
         }
 
         // Throttled combat heartbeat so the fight state is observable in the log:
@@ -12933,6 +13171,10 @@ void Features::AiDeleteActor(unsigned long long id)
             // Stop every Hook/squad state machine from touching it before it dies.
             ReleaseHookNativeMovement(ai, true);
             SquadRemove(ai);
+            RestoreCompanionVitals(ai); // in case the destroy below cannot run
+            g_inject.erase(ai);
+            g_engagedUntilMs.erase(ai);
+            g_lastThreatMs.erase(ai);
             ForgetHookBodyguardRuntimeState(ai, true);
 
             UFunction* fn = CachedFn(AH::Fn_K2DestroyActor);
@@ -14105,54 +14347,236 @@ static std::vector<UObject*> DispatchTargets()
     return g_spawnedAllies;
 }
 
+namespace
+{
+    // The cached enemy closest to the centre of the screen: within a 12 degree cone
+    // of the camera and 150 m, never one of the player's own units, never a corpse.
+    // Raw reads only (camera POV + the worker's cache), so the menu may call it.
+    UObject* AimedEnemy()
+    {
+        FVector camLoc{};
+        FRotator camRot{};
+        float fov = 90.0f;
+        if (!ReadCameraPOV(camLoc, camRot, fov))
+            return nullptr;
+        constexpr float kDegToRad = 3.14159265358979f / 180.0f;
+        const float cp = cosf(camRot.Pitch * kDegToRad), sp = sinf(camRot.Pitch * kDegToRad);
+        const float cy = cosf(camRot.Yaw * kDegToRad), sy = sinf(camRot.Yaw * kDegToRad);
+        const FVector forward{ cp * cy, cp * sy, sp };
+        UObject* best = nullptr;
+        float bestCos = cosf(12.0f * kDegToRad);
+        for (const AiCachedActor& e : CopyAiSnapshot())
+        {
+            if (e.healthFrac == 0.0f || !IsLiveObject(e.actor) || IsProtectedUnit(e.actor))
+                continue;
+            FVector d{ e.location.X - camLoc.X, e.location.Y - camLoc.Y, e.location.Z - camLoc.Z };
+            float length = sqrtf(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
+            if (length < 1.0f || length > 150.0f * kUnitsPerMetre)
+                continue;
+            float c = (d.X * forward.X + d.Y * forward.Y + d.Z * forward.Z) / length;
+            if (c > bestCos) { bestCos = c; best = e.actor; }
+        }
+        return best;
+    }
+
+    // Companions only: an order must never convert a selected enemy robot (the
+    // selection is also used for recruiting) by sending it into InjectAttack.
+    std::vector<UObject*> CompanionTargets()
+    {
+        std::vector<UObject*> units = DispatchTargets();
+        units.erase(std::remove_if(units.begin(), units.end(),
+            [](UObject* u) { return !IsSquadMember(u) || IsHookBodyguard(u); }), units.end());
+        return units;
+    }
+
+    // One companion at one enemy, through the policy for regular companions so the
+    // order survives the next automatic target selection.
+    bool OrderAttack(UObject* unit, UObject* target, UObject* player)
+    {
+        if (!AiUsable(unit) || unit == target)
+            return false;
+        if (Bodyguards::Contains(unit))
+            return Bodyguards::AttackTarget(unit, target);
+        return InjectAttack(unit, target, player, 0 /*friendly to you*/);
+    }
+
+    // Beside the player, spread by slot so a group does not land in one spot:
+    // alternating left/right behind the camera, widening every two slots.
+    bool TeleportActorBeside(UObject* actor, const FVector& playerLoc, int slot)
+    {
+        UFunction* fn = CachedFn(AH::Fn_K2_TeleportTo);
+        if (!IsLiveObject(actor) || !fn)
+            return false;
+        FRotator rot{};
+        GetControlRotation(rot);
+        const float side = (slot % 2) ? 1.0f : -1.0f;
+        const float angle = (rot.Yaw + 180.0f + side * (25.0f + 20.0f * (float)(slot / 2))) * 0.01745329251994329577f;
+        const float radius = 250.0f + 80.0f * (float)(slot / 4);
+        P_TeleportTo p{};
+        p.DestLocation = { playerLoc.X + cosf(angle) * radius, playerLoc.Y + sinf(angle) * radius, playerLoc.Z + 30.0f };
+        p.DestRotation = { 0.0f, rot.Yaw, 0.0f };
+        return actor->ProcessEvent(fn, &p) && p.ReturnValue;
+    }
+}
+
 void Features::AiDispatchAttack()
 {
-    std::vector<UObject*> units = DispatchTargets();
-    if (units.empty()) { LOG("AiDispatchAttack: no selection/squad"); return; }
+    std::vector<UObject*> units = CompanionTargets();
+    if (units.empty()) { LOG("AiDispatchAttack: no companions selected or in the squad"); return; }
+    // What you are aiming at wins; otherwise each companion takes the threat nearest it.
+    if (AimedEnemy())
+    {
+        AiAttackAimTarget();
+        return;
+    }
     InstallProcessEventHook();
     QueueGameThread([units]()
     {
         try
         {
             UObject* player = GetLocalPawn();
-            FVector playerLoc{}; ReadLocalPawnLocationFast(playerLoc);
-            // Pick the nearest enemy to the player that is NOT one of our units.
+            // Candidates: live combat AI that is not the player's own. Civilians and
+            // other companions are never offered.
             std::vector<UObject*> all = CollectAllCachedAi(kMaxCachedAiActors);
             std::vector<InjNode> enemies;
             {
                 std::vector<UObject*> src;
                 for (UObject* a : all)
-                {
-                    bool isUnit = false;
-                    for (UObject* u : units) if (u == a) { isUnit = true; break; }
-                    if (!isUnit) src.push_back(a);
-                }
+                    if (!IsProtectedUnit(a) && IsLiveCombatTarget(a) && AiIsCombatCapable(a))
+                        src.push_back(a);
                 BuildInjNodes(src, enemies);
             }
             int n = 0;
             for (UObject* u : units)
             {
-                if (!AiUsable(u)) continue;
-                FVector loc{}; if (!ReadActorLocationFast(u, loc)) continue;
+                FVector loc{}; if (!AiUsable(u) || !ReadActorLocationFast(u, loc)) continue;
                 UObject* target = NearestNode(enemies, loc, player, -1, u);
-                if (Bodyguards::Contains(u))
-                {
-                    if (Bodyguards::AttackTarget(u, target)) ++n;
-                    continue;
-                }
-
-                if (target && InjectAttack(u, target, player, 0 /*friendly to you*/)) ++n;
+                if (target && OrderAttack(u, target, player)) ++n;
             }
-            LOG("AiDispatchAttack: %d unit(s) sent at the nearest enemy", n);
+            LOG("AiDispatchAttack: %d companion(s) sent at the nearest enemy", n);
         }
         catch (...) {}
     });
 }
 
+void Features::AiAttackAimTarget()
+{
+    if (!G::sdkReady.load()) return;
+    std::vector<UObject*> units = CompanionTargets();
+    if (units.empty()) { LOG("AiAttackAimTarget: no companions selected or in the squad"); return; }
+    UObject* target = AimedEnemy();
+    if (!target)
+    {
+        LOG("AiAttackAimTarget: no enemy under the crosshair");
+        return;
+    }
+    const int32_t index = target->Index();
+    if (!QueueGameAction([units, target, index]()
+    {
+        try
+        {
+            // The aim was taken a frame ago on the render thread; the enemy may have
+            // died, or its memory been reused, since.
+            if (!IsLiveObject(target) || target->Index() != index || !IsLiveCombatTarget(target) ||
+                IsProtectedUnit(target))
+                return;
+            UObject* player = GetLocalPawn();
+            int n = 0;
+            for (UObject* u : units)
+                if (OrderAttack(u, target, player)) ++n;
+            LOG("AiAttackAimTarget: %d companion(s) sent at %s", n, SafeObjectName(target).c_str());
+        }
+        catch (...) {}
+    }))
+        LOG("AiAttackAimTarget skipped: no game-thread pump yet");
+}
+
+void Features::AiRegroup()
+{
+    std::vector<UObject*> units;
+    { std::lock_guard<std::mutex> lk(g_squadMutex); units = g_spawnedAllies; }
+    if (units.empty()) return;
+    if (!QueueGameAction([units]()
+    {
+        try
+        {
+            UObject* player = GetLocalPawn();
+            FVector playerLoc{};
+            if (!IsLiveObject(player) || !ReadActorLocationFast(player, playerLoc))
+                return;
+            int moved = 0, slot = 0, recalled = 0;
+            for (UObject* u : units)
+            {
+                if (!FollowPawnUsable(u) || IsHookBodyguard(u))
+                    continue;
+                // Break off fights and holds; aggressive companions stay aggressive.
+                Bodyguards::Order order{};
+                if (Bodyguards::GetOrder(u, order))
+                {
+                    Bodyguards::SetOrder(u, order == Bodyguards::Order::FollowAndAttack
+                        ? Bodyguards::Order::FollowAndAttack : Bodyguards::Order::FollowAndDefend);
+                    ++recalled;
+                }
+                FVector loc{};
+                if (ReadActorLocationFast(u, loc) && DistanceMetres(loc, playerLoc) > 20.0f &&
+                    TeleportActorBeside(u, playerLoc, slot++))
+                    ++moved;
+            }
+            LOG("AiRegroup: %d companion(s) recalled, %d straggler(s) brought beside you", recalled, moved);
+        }
+        catch (...) {}
+    }))
+        LOG("AiRegroup skipped: no game-thread pump yet");
+}
+
+void Features::AiToggleHoldAll()
+{
+    if (!QueueGameAction([]()
+    {
+        std::vector<UObject*> units;
+        { std::lock_guard<std::mutex> lk(g_squadMutex); units = g_spawnedAllies; }
+        bool anyMoving = false;
+        for (UObject* u : units)
+        {
+            Bodyguards::Order order{};
+            if (Bodyguards::GetOrder(u, order) && order != Bodyguards::Order::Hold) { anyMoving = true; break; }
+        }
+        const Bodyguards::Order next = anyMoving ? Bodyguards::Order::Hold : Bodyguards::Order::FollowAndDefend;
+        int n = 0;
+        for (UObject* u : units)
+            if (Bodyguards::Contains(u) && !IsHookBodyguard(u)) { Bodyguards::SetOrder(u, next); ++n; }
+        LOG("AiToggleHoldAll: %d companion(s) -> %s", n, anyMoving ? "hold position" : "follow + defend");
+    }))
+        LOG("AiToggleHoldAll skipped: no game-thread pump yet");
+}
+
+void Features::AiHealCompanions()
+{
+    if (!QueueGameAction([]()
+    {
+        std::vector<UObject*> units;
+        { std::lock_guard<std::mutex> lk(g_squadMutex); units = g_spawnedAllies; }
+        int n = 0;
+        for (UObject* u : units)
+        {
+            if (!AiUsable(u))
+                continue;
+            // Topping a corpse's health does not bring it back; it only confuses it.
+            uint8_t* b = reinterpret_cast<uint8_t*>(u);
+            bool dead = Mem::IsReadable(b + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(b + AH::Char_bIsDead);
+            if (!dead && SetCharacterHealthFull(u)) ++n;
+        }
+        LOG("AiHealCompanions: healed %d companion(s)", n);
+    }))
+        LOG("AiHealCompanions skipped: no game-thread pump yet");
+}
+
 void Features::AiDispatchKill()
 {
-    std::vector<UObject*> units = DispatchTargets();
-    if (units.empty()) return;
+    // The explicit selection only. Falling back to the whole squad, as orders do,
+    // turned "Kill selected" with nothing selected into "kill all my companions".
+    std::vector<UObject*> units = g_selectedAi;
+    if (units.empty()) { LOG("AiDispatchKill: nothing selected"); return; }
     InstallProcessEventHook();
     QueueGameThread([units]()
     {
@@ -16055,7 +16479,7 @@ void DriveSquadVelocityGameThread()
     { std::lock_guard<std::mutex> lk(g_squadMutex); squad = g_spawnedAllies; }
 
     int followed = 0, mercuna = 0, unpinned = 0, directMoves = 0, velocityMoves = 0;
-    int hookMoving = 0, recoveries = 0;
+    int hookMoving = 0, recoveries = 0, followSlot = 0;
     float nearest = -1.0f, nearVel = -1.0f;
     std::string nearSched = "?";
     ULONGLONG nowm = GetTickCount64();
@@ -16118,8 +16542,14 @@ void DriveSquadVelocityGameThread()
         float dist = sqrtf(to.X * to.X + to.Y * to.Y + to.Z * to.Z);
         float planarDist = sqrtf(to.X * to.X + to.Y * to.Y);
         InjectState& followState = g_inject[ai];
-        const float memberStopU = (hookOwned ? kHookFollowStopM : stopM) * kUnitsPerMetre;
-        const float memberStartU = (stopM + 1.0f) * kUnitsPerMetre;
+        // Each companion stops outside its own body -- a boss's capsule is several
+        // times a robot's -- and every second and third one a little further out, so
+        // a squad settles around you in layers instead of shoving into you and each
+        // other at one spot.
+        const float memberStopM = hookOwned ? kHookFollowStopM
+            : (std::max)(stopM, CapsuleRadiusM(ai) + 0.9f) + (float)(followSlot++ % 3) * 0.6f;
+        const float memberStopU = memberStopM * kUnitsPerMetre;
+        const float memberStartU = memberStopU + kUnitsPerMetre;
         bool wasMoving = followState.followMoving;
         bool needsToMove = wasMoving ? planarDist > memberStopU : planarDist > memberStartU;
         followState.followMoving = needsToMove;
@@ -16218,6 +16648,33 @@ void DriveSquadVelocityGameThread()
             {
                 goal = aiLoc; // already within the ring -> destination == her position -> stop
             }
+            // Pace to the gap: walk up close, run to catch up, sprint when far behind.
+            // (A fixed 260 -- tuned for the Twin's walk cycle -- left robots trailing
+            // further and further behind a running player.)
+            const float gapU = planarDist - memberStopU;
+            const bool sprint = needsToMove && gapU > 1000.0f;
+            const float followSpeed = !needsToMove ? 300.0f : sprint ? 900.0f : gapU > 400.0f ? 650.0f : 400.0f;
+            // The movement component caps whatever pace is asked for, so raise its
+            // walk speed for the sprint and put the previous value back once caught up.
+            if (uint8_t* mv = GetCharacterMovementPtr(ai))
+            {
+                float& maxWalk = *reinterpret_cast<float*>(mv + AH::Move_MaxWalkSpeed);
+                if (sprint && std::isfinite(maxWalk) && maxWalk < 900.0f)
+                {
+                    if (!followState.speedBoosted)
+                    {
+                        followState.speedBeforeBoost = maxWalk;
+                        followState.speedBoosted = true;
+                    }
+                    maxWalk = 900.0f;
+                }
+                else if (!sprint && followState.speedBoosted)
+                {
+                    maxWalk = followState.speedBeforeBoost;
+                    followState.speedBoosted = false;
+                }
+            }
+
             bool refreshGoal = wasMoving != needsToMove ||
                                nowm - followState.lastFollowGoalMs >= 250;
             if (refreshGoal)
@@ -16228,7 +16685,7 @@ void DriveSquadVelocityGameThread()
                 SetControllerVectorKeyAt(ctrl, AH::AICtrl_Key_CurrentWaypoint, goal);
                 SetControllerForceFollow(ctrl, needsToMove);
                 SetControllerBoolKeyAt(ctrl, AH::AICtrl_Key_CanReachFollowLoc, true);
-                SetControllerFollowSpeed(ctrl);
+                SetControllerFollowSpeed(ctrl, followSpeed);
                 if (needsToMove)
                     ClearControllerFocus(ctrl); // face velocity, not backwards toward the player
                 else
@@ -16684,6 +17141,90 @@ bool Features::TestTurn(float degrees)
     });
 }
 
+namespace
+{
+    // The TargetEnemy key of an AI's own blackboard, read through its controller's
+    // key-name field and UBlackboardComponent.GetValueAsObject. The controller comes
+    // from the raw APawn::Controller field (no dispatch) and must be an
+    // AHAIController, the class that carries the key-name fields. Game thread only.
+    UObject* ReadBlackboardTargetEnemy(UObject* ai)
+    {
+        if (!AiUsable(ai))
+            return nullptr;
+        uint8_t* base = reinterpret_cast<uint8_t*>(ai);
+        if (!Mem::IsReadable(base + Offsets::O_Pawn_Controller, sizeof(void*)))
+            return nullptr;
+        UObject* ctrl = *reinterpret_cast<UObject**>(base + Offsets::O_Pawn_Controller);
+        static UClass* ahController = nullptr;
+        if (!Mem::IsReadable(ahController, 0x30))
+            ahController = FindObjectFast(AH::Cls_AHAIController);
+        if (!Mem::IsReadable(ahController, 0x30) || !ControllerBlackboardReady(ctrl) || !ctrl->IsA(ahController))
+            return nullptr;
+        uint8_t* cb = reinterpret_cast<uint8_t*>(ctrl);
+        if (!Mem::IsReadable(cb + AH::AICtrl_Key_TargetEnemy, sizeof(FName)))
+            return nullptr;
+        FName key = *reinterpret_cast<FName*>(cb + AH::AICtrl_Key_TargetEnemy);
+        if (key.ComparisonIndex <= 0)
+            return nullptr;
+        UObject* bb = *reinterpret_cast<UObject**>(cb + AH::AICtrl_Blackboard);
+        UFunction* fn = CachedObjectClassFn(bb, "GetValueAsObject");
+        if (!fn)
+            return nullptr;
+        struct { FName KeyName; UObject* ReturnValue; } p{ key, nullptr };
+        if (!bb->ProcessEvent(fn, &p))
+            return nullptr;
+        return IsLiveObject(p.ReturnValue) ? p.ReturnValue : nullptr;
+    }
+
+    // "Is this AI hostile to the player?" answered by the game itself:
+    // AIUtils.AreFriendlyCharacters with neutral counted as friendly, so only what the
+    // game treats as an enemy qualifies. Falls back to a team comparison when the
+    // function is unavailable. Cached for two seconds per actor: both are dispatches.
+    struct HostileVerdict { int32_t index; bool hostile; ULONGLONG until; };
+    std::unordered_map<UObject*, HostileVerdict> g_hostileCache; // game thread
+
+    bool ComputeHostile(UObject* ai, UObject* player)
+    {
+        UObject* lib = CachedObject(AH::Obj_AIUtils);
+        UFunction* fn = CachedFn(AH::Fn_AIUtils_AreFriendlyCharacters);
+        if (IsLiveObject(lib) && fn)
+        {
+            P_AreFriendlyCharacters p{};
+            p.CharacterOne = ai;
+            p.CharacterTwo = player;
+            p.CountNeutralAsFriendly = true;
+            if (lib->ProcessEvent(fn, &p))
+                return !p.ReturnValue;
+        }
+        uint8_t team = 255, playerTeam = 255;
+        UFunction* get = CachedFn(AH::Fn_AHBaseCharacter_GetGenericTeamId);
+        if (!get || !ReadAiTeamId(ai, team))
+            return false;
+        P_GetGenericTeamId pt{};
+        if (!player->ProcessEvent(get, &pt))
+            return false;
+        playerTeam = pt.ReturnValue;
+        // FGenericTeamId::NoTeam (255) is neutral to everyone.
+        return team != 255 && playerTeam != 255 && team != playerTeam;
+    }
+
+    bool HostileToPlayerCached(UObject* ai, UObject* player)
+    {
+        if (!AiUsable(ai) || !IsLiveObject(player))
+            return false;
+        ULONGLONG now = GetTickCount64();
+        auto it = g_hostileCache.find(ai);
+        if (it != g_hostileCache.end() && it->second.index == ai->Index() && now < it->second.until)
+            return it->second.hostile;
+        if (g_hostileCache.size() > 512)
+            g_hostileCache.clear();
+        bool hostile = false;
+        try { hostile = ComputeHostile(ai, player); } catch (...) { hostile = false; }
+        g_hostileCache[ai] = { ai->Index(), hostile, now + 2000 };
+        return hostile;
+    }
+}
+
 bool BodyguardEngine::Usable(UE::UObject* actor) { return FollowPawnUsable(actor); }
 bool BodyguardEngine::CombatCapable(UE::UObject* actor)
 {
@@ -16695,7 +17236,33 @@ bool BodyguardEngine::Protected(UE::UObject* actor)
         IsHookBodyguard(actor) || Bodyguards::Contains(actor));
 }
 bool BodyguardEngine::LiveEnemy(UE::UObject* actor) { return IsLiveCombatTarget(actor); }
-UE::UObject* BodyguardEngine::Target(UE::UObject* actor) { return ReadAiTargetField(actor); }
+UE::UObject* BodyguardEngine::Target(UE::UObject* actor) { return AiUsable(actor) ? ReadAiTargetField(actor) : nullptr; }
+UE::UObject* BodyguardEngine::BlackboardTarget(UE::UObject* actor) { return ReadBlackboardTargetEnemy(actor); }
+UE::UObject* BodyguardEngine::Sensed(UE::UObject* actor)
+{
+    if (!AiUsable(actor))
+        return nullptr;
+    uint8_t* base = reinterpret_cast<uint8_t*>(actor);
+    if (!Mem::IsReadable(base + AH::AICh_LastSensedCharacter, sizeof(void*)))
+        return nullptr;
+    return *reinterpret_cast<UObject**>(base + AH::AICh_LastSensedCharacter);
+}
+bool BodyguardEngine::HostileTo(UE::UObject* actor, UE::UObject* player) { return HostileToPlayerCached(actor, player); }
+bool BodyguardEngine::Passive(UE::UObject* actor)
+{
+    if (!AiUsable(actor))
+        return false;
+    uint8_t* base = reinterpret_cast<uint8_t*>(actor);
+    return Mem::IsReadable(base + AH::AICh_bIsPassive, 1) && *reinterpret_cast<bool*>(base + AH::AICh_bIsPassive);
+}
+bool BodyguardEngine::Health(UE::UObject* actor, float& fraction)
+{
+    float cur = 0.0f, mx = 0.0f;
+    if (!ReadCharacterHealth(actor, cur, mx) || !(mx > 0.001f) || !std::isfinite(cur))
+        return false;
+    fraction = (std::max)(0.0f, (std::min)(1.0f, cur / mx));
+    return true;
+}
 bool BodyguardEngine::Location(UE::UObject* actor, UE::FVector& out) { return ReadActorLocationFast(actor, out); }
 
 bool BodyguardEngine::Friendly(UE::UObject* actor, UE::UObject* player)
@@ -16759,7 +17326,7 @@ void BodyguardEngine::PrepareFollow(UE::UObject* actor, UE::UObject* player, con
 }
 void Features::AiOrderSelected(int order)
 {
-    if (order < 0 || order > 2) return;
+    if (order < 0 || order > 3) return;
     auto targets = DispatchTargets();
     QueueGameThread([targets, order]()
     {

@@ -166,7 +166,7 @@ void TestHarness::RenderTick()
     else if (command == "squad_recruit") Features::AiRecruitNearby();
     else if (command == "squad_release") Features::AiReleaseSquad();
     else if (command == "squad_aggressive") { f.aiSquadAggressive = value != 0; Features::AiOrderSelected(value != 0 ? 0 : 1); }
-    else if (command == "squad_order" && value >= 0 && value <= 2 && std::floor(value) == value)
+    else if (command == "squad_order" && value >= 0 && value <= 3 && std::floor(value) == value)
         Features::AiOrderSelected(static_cast<int>(value));
     else if (command == "weapon_rgb" && (value == 0 || value == 1)) f.weaponRgb = value != 0;
     else if (command == "verify_offsets") Features::DebugVerifyMemberOffsets();
