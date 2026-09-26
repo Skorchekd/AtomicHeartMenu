@@ -130,6 +130,7 @@ namespace
 
     DWORD WINAPI DumpObjectsThread(LPVOID)
     {
+        G::HookScope hookScope; // eject waits for this worker to finish
         try
         {
             LOG("Object dump started");

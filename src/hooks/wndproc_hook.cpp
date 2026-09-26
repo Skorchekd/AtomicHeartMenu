@@ -26,6 +26,7 @@ namespace
     WNDPROC g_originalWndProc = nullptr;
     HWND    g_hwnd = nullptr;
     bool    g_wasMenuOpen = false;
+    std::recursive_mutex g_inputMutex;
     ULONGLONG g_lastInsertToggleMs = 0;
     const LPCSTR kArrowCursor = MAKEINTRESOURCEA(32512);
     constexpr ULONGLONG kOverlayInputGraceMs = 750;
@@ -139,6 +140,15 @@ namespace
 
     LRESULT CALLBACK Hooked(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
+        G::HookScope hookScope;
+        WNDPROC original = g_originalWndProc;
+        // Eject in progress: forward everything untouched. ImGui may already be gone.
+        if (!G::running.load())
+        {
+            return original ? CallWindowProc(original, hWnd, msg, wParam, lParam)
+                            : DefWindowProc(hWnd, msg, wParam, lParam);
+        }
+
         // UE4 pumps window messages on the game thread, so THIS is the game thread.
         // Pin it so the ProcessEvent pump never runs a spawn on a loading/audio worker.
         Features::NoteGameThread();
@@ -172,7 +182,14 @@ namespace
                 ApplyMenuCursorState();
                 if (captureInput)
                 {
-                    ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+                    {
+                        // The render thread consumes this queue inside NewFrame under
+                        // the same lock; unsynchronised, the two corrupt ImGui's
+                        // event vector while the menu is open.
+                        std::lock_guard<std::recursive_mutex> inputLock(g_inputMutex);
+                        if (ImGui::GetCurrentContext())
+                            ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+                    }
                     if (msg == WM_SETCURSOR)
                     {
                         SetCursor(LoadCursorA(nullptr, kArrowCursor));
@@ -205,10 +222,22 @@ namespace
         catch (const std::exception& e) { LOG("WndProc: std::exception ignored: %s", e.what()); }
         catch (...) { LOG("WndProc: exception ignored."); }
 
-        return g_originalWndProc
-            ? CallWindowProc(g_originalWndProc, hWnd, msg, wParam, lParam)
+        return original
+            ? CallWindowProc(original, hWnd, msg, wParam, lParam)
             : DefWindowProc(hWnd, msg, wParam, lParam);
     }
+}
+
+std::recursive_mutex& WndProcHook::InputMutex()
+{
+    return g_inputMutex;
+}
+
+bool WndProcHook::IsTopLevel()
+{
+    if (!g_hwnd || !g_originalWndProc)
+        return false;
+    return reinterpret_cast<WNDPROC>(GetWindowLongPtr(g_hwnd, GWLP_WNDPROC)) == Hooked;
 }
 
 void WndProcHook::Install(HWND hwnd)
@@ -229,15 +258,24 @@ void WndProcHook::Tick()
     // managed exclusively from the WndProc (window thread) on input messages.
 }
 
-void WndProcHook::Remove()
+bool WndProcHook::Remove()
 {
     if (g_originalWndProc && g_hwnd)
     {
         if (GetCapture() == g_hwnd)
             ReleaseCapture();
+        if (!IsTopLevel())
+        {
+            // Another hook subclassed after ours and still calls into it. Restoring
+            // our saved original would cut that hook out of the chain, so leave ours
+            // in place: it forwards untouched while ImGui is gone.
+            LOG("WndProc: another hook subclassed after ours; leaving the chain intact.");
+            return false;
+        }
         SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_originalWndProc);
         g_originalWndProc = nullptr;
         g_wasMenuOpen = false;
         LOG("WndProc restored");
     }
+    return true;
 }

@@ -19,4 +19,12 @@ namespace DX12Hook
 {
     bool Install();   // grab vtables, create MinHook hooks, enable
     void Remove();    // disable hooks, tear down ImGui + D3D objects
+
+    // First step of eject, before any teardown: disable every MinHook detour in the
+    // process at once, unhook the window procedure, then wait until no thread is
+    // still executing inside one of them (G::hooksInFlight). Returns false when that
+    // did not happen within timeoutMs: nothing may be freed then, and the module
+    // must stay loaded. windowProcReleased reports whether the window procedure
+    // could be restored; when it could not, teardown is fine but unloading is not.
+    bool Quiesce(unsigned timeoutMs, bool* windowProcReleased);
 }

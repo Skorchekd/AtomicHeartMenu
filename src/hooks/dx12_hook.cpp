@@ -463,6 +463,10 @@ namespace
 
         if (g_imguiReady)
         {
+            // The window procedure can still be delivering a message on the game
+            // thread (it stays installed if another overlay chained after it), so
+            // take its input lock before the context it writes into goes away.
+            std::lock_guard<std::recursive_mutex> inputLock(WndProcHook::InputMutex());
             ImGui_ImplDX12_Shutdown();
             ImGui_ImplWin32_Shutdown();
             ImGui::DestroyContext();
@@ -541,6 +545,7 @@ namespace
     // ---- hooked Present ----------------------------------------------------
     HRESULT WINAPI hkPresent(IDXGISwapChain3* sc, UINT sync, UINT flags)
     {
+        G::HookScope hookScope;
         if (!oPresent) return DXGI_ERROR_INVALID_CALL;
         if (!G::running.load()) return oPresent(sc, sync, flags);
 
@@ -599,8 +604,13 @@ namespace
                 return oPresent(sc, sync, flags);
 
             ImGui_ImplDX12_NewFrame();
-            ImGui_ImplWin32_NewFrame();
-            ImGui::NewFrame();
+            {
+                // NewFrame drains the input queue the window procedure appends to on
+                // the game thread; see WndProcHook::InputMutex.
+                std::lock_guard<std::recursive_mutex> inputLock(WndProcHook::InputMutex());
+                ImGui_ImplWin32_NewFrame();
+                ImGui::NewFrame();
+            }
             ImGui::GetIO().MouseDrawCursor = G::menuOpen.load();
 
             Menu::Render();
@@ -676,6 +686,7 @@ namespace
     // ---- hooked ResizeBuffers ---------------------------------------------
     HRESULT WINAPI hkResizeBuffers(IDXGISwapChain3* sc, UINT bufferCount, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags)
     {
+        G::HookScope hookScope;
         try
         {
             if (g_init)
@@ -711,6 +722,7 @@ namespace
     // ---- hooked ExecuteCommandLists (capture the command queue) ------------
     void WINAPI hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT num, ID3D12CommandList* const* lists)
     {
+        G::HookScope hookScope;
         try
         {
             if (!g_commandQueue && queue && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -902,6 +914,49 @@ bool DX12Hook::Install()
         LOG("DX12Hook::Install: exception.");
         return false;
     }
+}
+
+bool DX12Hook::Quiesce(unsigned timeoutMs, bool* windowProcReleased)
+{
+    // One suspend/resume pass for every detour (Present, ProcessEvent, the AI and
+    // native guards). MinHook moves any thread parked on a patched prologue back to
+    // the original, but it cannot move one already running our detour body -- that
+    // is what the in-flight count below is for.
+    MH_STATUS disabled = MH_DisableHook(MH_ALL_HOOKS);
+    LOG("Eject: all detours disabled (status=%d).", disabled);
+
+    bool wndProcReleased = WndProcHook::Remove();
+    if (windowProcReleased)
+        *windowProcReleased = wndProcReleased;
+
+    const ULONGLONG start = GetTickCount64();
+    ULONGLONG quietSince = 0;
+    for (;;)
+    {
+        ULONGLONG now = GetTickCount64();
+        if (G::hooksInFlight.load(std::memory_order_acquire) == 0)
+        {
+            // Stay at zero for a while: a thread can be on a detour's first
+            // instruction, not yet counted, at the moment the count is read.
+            if (!quietSince)
+                quietSince = now;
+            else if (now - quietSince >= 100)
+                break;
+        }
+        else
+        {
+            quietSince = 0;
+        }
+        if (now - start >= timeoutMs)
+        {
+            LOG("Eject: %d thread(s) still inside a hook after %u ms; the DLL stays loaded.",
+                G::hooksInFlight.load(), timeoutMs);
+            return false;
+        }
+        Sleep(5);
+    }
+    LOG("Eject: hooks quiesced after %llums.", GetTickCount64() - start);
+    return true;
 }
 
 void DX12Hook::Remove()

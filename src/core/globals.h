@@ -28,4 +28,19 @@ namespace G
     inline uint8_t* moduleBase = nullptr;       // game exe base (0x140000000)
     inline size_t   moduleSize = 0;
     inline void*    hGameWindow = nullptr;       // HWND of the game
+
+    // Threads currently executing inside one of our detours or our window
+    // procedure. Eject disables every hook first and then waits for this to drain:
+    // freeing a trampoline, or unloading the DLL, while a thread is still inside
+    // one of those functions crashes in code that no longer exists.
+    inline std::atomic<int> hooksInFlight{ 0 };
+
+    // Place at the very top of every detour body.
+    struct HookScope
+    {
+        HookScope()  { hooksInFlight.fetch_add(1, std::memory_order_acq_rel); }
+        ~HookScope() { hooksInFlight.fetch_sub(1, std::memory_order_acq_rel); }
+        HookScope(const HookScope&) = delete;
+        HookScope& operator=(const HookScope&) = delete;
+    };
 }

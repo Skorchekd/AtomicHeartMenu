@@ -68,6 +68,7 @@ namespace
     // null one. The required primary firewall is permanently gated on while live.
     void* __fastcall hkPrimary(void* self)
     {
+        G::HookScope hookScope;
         Entry& e = g_entries[H_PRIMARY];
         e.calls.fetch_add(1, std::memory_order_relaxed);
         e.lastCaller.store(reinterpret_cast<uintptr_t>(_ReturnAddress()), std::memory_order_relaxed);
@@ -82,6 +83,7 @@ namespace
 
     void* __fastcall hkSibling(void* self)
     {
+        G::HookScope hookScope;
         Entry& e = g_entries[H_SIBLING];
         e.calls.fetch_add(1, std::memory_order_relaxed);
         e.lastCaller.store(reinterpret_cast<uintptr_t>(_ReturnAddress()), std::memory_order_relaxed);

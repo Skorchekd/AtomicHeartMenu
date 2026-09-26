@@ -170,7 +170,7 @@ namespace
         }
 
         UObject* o = character->Outer();
-        for (int d = 0; o && d < 64; ++d)
+        for (int d = 0; o && d < 64 && Mem::IsReadable(o, 0x30); ++d)
         {
             maybeClear(o);
             o = o->Outer();
@@ -203,12 +203,12 @@ namespace
                     if (count > 0 && count < 1024)
                     {
                         void** arr = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(asc) + 0x128);
-                        if (arr)
+                        if (arr && Mem::IsReadable(arr, sizeof(void*) * (size_t)count))
                         {
                             for (int i = 0; i < count; ++i)
                             {
                                 UObject* ab = reinterpret_cast<UObject*>(arr[i]);
-                                if (!ab || !ab->Class()) continue;
+                                if (!Mem::IsReadable(ab, 0x30) || !Mem::IsReadable(ab->Class(), 0x30)) continue;
                                 std::string abName = ab->Class()->GetName();
                                 if (abName.find("FightStaging") != std::string::npos)
                                 {
@@ -227,12 +227,13 @@ namespace
         }
 
         // Fallback: scan the character's outer chain for a UAIFightStagingAbility.
-        if (!result)
+        if (!result && Mem::IsReadable(character, 0x30))
         {
             UObject* o = character->Outer();
             for (int d = 0; o && d < 64; ++d)
             {
-                if (!o->Class()) { o = o->Outer(); continue; }
+                if (!Mem::IsReadable(o, 0x30)) break;
+                if (!Mem::IsReadable(o->Class(), 0x30)) { o = o->Outer(); continue; }
                 std::string cn = o->Class()->GetName();
                 if (cn.find("FightStaging") != std::string::npos)
                 {
@@ -266,7 +267,12 @@ namespace
     std::unordered_map<UObject*, UObject*> g_stashedSchedule;
     // Death/event tombstones: some robots stay readable with stale health after K2_OnDeath,
     // so health-only threat filtering can make Hook Twins keep attacking a corpse/spot.
-    std::unordered_map<UObject*, ULONGLONG> g_aiDeathEventMs;
+    // Game-thread state only (see TrackAiDeathEventFromProcessEvent). Each entry carries
+    // the identity of the object that died, not just its address: the allocator hands
+    // a destroyed actor's block straight to the next spawn, and a pointer-only key made
+    // a fresh enemy -- or a new companion -- in that block count as dead for minutes.
+    struct DeathTombstone { ULONGLONG ms; int32_t index; FName name; };
+    std::unordered_map<UObject*, DeathTombstone> g_aiDeathEventMs;
     std::unordered_map<UObject*, ULONGLONG> g_hookSuppressedThreatUntilMs;
     // Set by combat teardown, consumed by the native follow driver after
     // HookNativeFollowState exists. This stops any outstanding enemy MoveTo/path before
@@ -361,6 +367,7 @@ namespace
     // Defined far below (needs the param structs + IsSquadMember); declared here so
     // hkProcessEvent can call it. Returns true => swallow this dispatch (block it).
     bool OwnershipShouldSwallow(void* obj, void* fn, void* params);
+    bool IsTombstoned(UObject* actor);
     bool IsHookBodyguard(UObject* ai);
     bool IsMixedNavCharacter(UObject* ai);
     bool ReadCharacterHealth(UObject* ch, float& cur, float& mx);
@@ -374,6 +381,7 @@ namespace
     void HookTwinForensicsProcessEvent(void* obj, void* fn, void* params);
     void UpdateHookTwinForensics();
     std::string SafeObjectFullName(UObject* o);
+    std::string SafeClassName(UObject* o);
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params);
 
     bool HookFriendshipShouldForce(void* fn, void* params);
@@ -443,6 +451,7 @@ namespace
 
     void hkProcessEvent(void* obj, void* fn, void* params)
     {
+        G::HookScope hookScope;
         const bool outermost = (t_peDepth == 0);
         ++t_peDepth;
         // Always restore the depth, even if oProcessEvent unwinds.
@@ -702,12 +711,16 @@ namespace
         return true;
     }
 
-    void QueueGameThread(std::function<void()> fn)
+    // Returns false when the task was dropped (queue full or eject in progress). A
+    // caller that guards "one task in flight" with a flag must clear that flag on
+    // false, or the feature it paces stops for the rest of the session.
+    bool QueueGameThread(std::function<void()> fn)
     {
         std::lock_guard<std::mutex> lk(g_gtQueueMutex);
-        if (g_preparingUnload.load() || g_gtQueue.size() >= 128) return;
+        if (g_preparingUnload.load() || g_gtQueue.size() >= 128) return false;
         g_gtQueue.push_back(std::move(fn));
         g_gtHasWork = true;
+        return true;
     }
 
     constexpr float kNormalDamageMultiplier = 1.0f;
@@ -1569,6 +1582,11 @@ namespace
         return true;
     }
 
+    // True while the game's instant-puzzle flag is left ON by us, so the world pump
+    // keeps running long enough to switch it back off.
+    std::atomic<bool> g_puzzleResolveOwned{ false };
+
+    // GAME THREAD (world pump).
     void UpdateInstantPuzzleResolveToggle()
     {
         static bool applied = false;
@@ -1591,6 +1609,7 @@ namespace
         {
             applied = true;
             lastAppliedValue = desired;
+            g_puzzleResolveOwned = desired;
         }
     }
 
@@ -1643,7 +1662,9 @@ namespace
         UFunction* fn2 = nullptr;
         ULONGLONG lastSlowClassScanMs = 0;
     };
-    struct PendingCompletion { UObject* obj; UFunction* fn1; UFunction* fn2; const char* label; };
+    // cls/index pin the identity the worker saw, so a puzzle destroyed before the
+    // drain (its slot recycled by an unrelated object) is skipped, not dispatched on.
+    struct PendingCompletion { UObject* obj; UFunction* fn1; UFunction* fn2; const char* label; UClass* cls; int32_t index; };
 
     std::mutex                     g_puzzleMutex;
     std::vector<PendingCompletion> g_puzzlePending;           // discovered; render thread drains
@@ -1842,7 +1863,7 @@ namespace
                     *reinterpret_cast<bool*>((uint8_t*)o + pt.flagOffset) == pt.skipWhenFlag)
                 { ++skippedDone; break; }
 
-                found.push_back({ o, r.fn1, r.fn2, pt.label });
+                found.push_back({ o, r.fn1, r.fn2, pt.label, r.cls, o->Index() });
                 break; // an object matches at most one target
             }
         }
@@ -1894,9 +1915,34 @@ namespace
         return (int)found.size();
     }
 
-    // Render thread only. Fires the completion functions on whatever the worker
-    // discovered -- ProcessEvent stays on the render thread like every other
-    // feature in this menu.
+    bool PuzzleCompletionsPending()
+    {
+        std::lock_guard<std::mutex> lk(g_puzzleMutex);
+        return !g_puzzlePending.empty();
+    }
+
+    // Dispatch a UFunction with a zeroed parameter frame sized from its own
+    // reflection data. ProcessEvent copies the parameter block in and writes out-
+    // params and the return value back, so a null frame (what this used to pass) is
+    // a read and write through null inside game code for any function that has
+    // parameters. PropertiesSize covers the parameters (plus script locals for a
+    // blueprint function), so it is never smaller than what ProcessEvent touches.
+    bool CallWithZeroedParams(UObject* target, UFunction* fn)
+    {
+        if (!IsLiveObject(target) || !IsLiveObject(fn))
+            return false;
+        uint8_t* f = reinterpret_cast<uint8_t*>(fn);
+        if (!Mem::IsReadable(f + Offsets::O_UStruct_PropertiesSize, sizeof(int32_t)))
+            return false;
+        int32_t size = *reinterpret_cast<int32_t*>(f + Offsets::O_UStruct_PropertiesSize);
+        if (size < 0 || size > 0x4000)
+            return false;
+        std::vector<uint8_t> params((size_t)size + 16, 0);
+        return target->ProcessEvent(fn, params.data());
+    }
+
+    // GAME THREAD (world pump). Completing a puzzle opens doors, broadcasts delegates
+    // and runs blueprint logic -- gameplay work that must never run from Present.
     void DrainPuzzleCompletions()
     {
         std::vector<PendingCompletion> batch;
@@ -1915,13 +1961,17 @@ namespace
         int done = 0;
         for (const PendingCompletion& p : batch)
         {
-            if (!Mem::IsReadable(p.obj, 0x30))
+            // Liveness plus the identity the worker recorded: a destroyed puzzle's
+            // memory stays readable and its slot may already hold something else.
+            if (!IsLiveObject(p.obj) || p.obj->Index() != p.index ||
+                !Mem::IsReadable(p.cls, 0x30) || !p.obj->IsA(p.cls))
                 continue;
             try
             {
-                if (p.fn1) p.obj->ProcessEvent(p.fn1, nullptr);
-                if (p.fn2) p.obj->ProcessEvent(p.fn2, nullptr);
-                ++done;
+                bool fired = false;
+                if (p.fn1) fired = CallWithZeroedParams(p.obj, p.fn1) || fired;
+                if (p.fn2) fired = CallWithZeroedParams(p.obj, p.fn2) || fired;
+                if (fired) ++done;
             }
             catch (...) { /* one bad instance must not abort the batch */ }
         }
@@ -2232,10 +2282,16 @@ namespace
         if (!guard || !IsHookBodyguard(guard) || !target)
             return false;
 
+        // The suppression/tombstone maps are game-thread state; other threads that
+        // dispatch these functions are never ours to filter.
+        unsigned long gameThread = g_gameThreadId.load(std::memory_order_relaxed);
+        if (gameThread == 0 || GetCurrentThreadId() != gameThread)
+            return false;
+
         ULONGLONG now = GetTickCount64();
         auto sup = g_hookSuppressedThreatUntilMs.find(target);
         bool suppressed = (sup != g_hookSuppressedThreatUntilMs.end() && sup->second > now);
-        bool tombstoned = (g_aiDeathEventMs.find(target) != g_aiDeathEventMs.end());
+        bool tombstoned = IsTombstoned(target);
         if (!suppressed && !tombstoned)
             return false;
 
@@ -3363,19 +3419,41 @@ namespace
         return *reinterpret_cast<UObject**>(base + AH::AICh_CachedTargetEnemy);
     }
 
+    // True only while the object that died still occupies this address; an entry
+    // whose address now holds a different object is dropped on sight.
+    bool IsTombstoned(UObject* actor)
+    {
+        auto it = g_aiDeathEventMs.find(actor);
+        if (it == g_aiDeathEventMs.end())
+            return false;
+        if (IsLiveObject(actor))
+        {
+            FName name = *actor->NamePtr();
+            if (actor->Index() == it->second.index &&
+                name.ComparisonIndex == it->second.name.ComparisonIndex &&
+                name.Number == it->second.name.Number)
+                return true;
+        }
+        g_aiDeathEventMs.erase(it);
+        return false;
+    }
+
     void MarkAiDeathTombstone(UObject* actor, const char* reason)
     {
-        if (!actor || !Mem::IsReadable(actor, 0x30) || IsHookBodyguard(actor))
+        if (!actor || !IsLiveObject(actor) || IsHookBodyguard(actor))
+            return;
+        // A companion is protected state, never a threat to filter out.
+        if (IsSquadMember(actor))
             return;
         ULONGLONG now = GetTickCount64();
-        bool first = (g_aiDeathEventMs.find(actor) == g_aiDeathEventMs.end());
-        g_aiDeathEventMs[actor] = now;
+        bool first = !IsTombstoned(actor);
+        g_aiDeathEventMs[actor] = { now, actor->Index(), *actor->NamePtr() };
         if (first)
             LOG("[AI-DEATH] tombstone actor=%p reason=%s", (void*)actor, reason ? reason : "unknown");
         if (g_aiDeathEventMs.size() > 512)
         {
             for (auto it = g_aiDeathEventMs.begin(); it != g_aiDeathEventMs.end(); )
-                if (!Mem::IsReadable(it->first, 0x30) || now - it->second > 10 * 60 * 1000ULL) it = g_aiDeathEventMs.erase(it);
+                if (!IsLiveObject(it->first) || now - it->second.ms > 10 * 60 * 1000ULL) it = g_aiDeathEventMs.erase(it);
                 else ++it;
         }
     }
@@ -3384,8 +3462,7 @@ namespace
     {
         if (!target || !AiUsable(target))
             return false;
-        auto dit = g_aiDeathEventMs.find(target);
-        if (dit != g_aiDeathEventMs.end())
+        if (IsTombstoned(target))
         {
             // Tombstone is authoritative for this session. Do not let a stale corpse
             // with readable/nonzero health keep a Twin in combat forever.
@@ -3412,6 +3489,17 @@ namespace
 
     void ResolveHookTwinDeathPipelineFns()
     {
+        // Reached from the ProcessEvent detour on every dispatch while Hook mode is
+        // on; each CachedFn probe builds a string and takes a lock, so probe at most
+        // once a second.
+        static std::atomic<ULONGLONG> lastProbeMs{ 0 };
+        ULONGLONG nowProbe = GetTickCount64();
+        ULONGLONG previousProbe = lastProbeMs.load(std::memory_order_relaxed);
+        if (previousProbe && nowProbe - previousProbe < 1000)
+            return;
+        if (!lastProbeMs.compare_exchange_strong(previousProbe, nowProbe, std::memory_order_relaxed))
+            return;
+
         auto cache = [](std::atomic<void*>& slot, const char* fullName)
         {
             if (!slot.load(std::memory_order_relaxed))
@@ -3449,16 +3537,19 @@ namespace
     // downed/final/QTE token. Normal movement/combat stages pass through.
     void __fastcall hkTryFightStaging(void* ability, void* params, bool param_3)
     {
+        G::HookScope hookScope;
         // param_1 is UAIFightStagingAbility*, not AHAICharacter*.
         // Get the character from CachedAIOwner at offset +0x658.
         UObject* ch = HookTwinOwnerFromDeathAbility(ability);
-        std::string chName = ch && ch->Class() ? ch->Class()->GetName() : "(null)";
+        if (!Mem::IsReadable(ch, 0x30))
+            ch = nullptr;
+        std::string chName = ch ? SafeClassName(ch) : "(null)";
 
         // param_2 is the new selected object being set (verified via FUN_14277c040 call).
         // Do NOT read from ability + 0x690 — that is the write destination, not the input.
         void* selObj = params;
         UObject* selUObj = reinterpret_cast<UObject*>(selObj);
-        std::string selName = selUObj && selUObj->Class() ? selUObj->Class()->GetName() : "(none)";
+        std::string selName = Mem::IsReadable(selUObj, 0x30) ? SafeClassName(selUObj) : "(none)";
 
         // Check the CHARACTER (CachedAIOwner), not the ability itself.
         bool isTwin = ch && IsHookTwinBodyguard(ch);
@@ -3495,16 +3586,15 @@ namespace
     // after fight-staging selection on Hook Twins.
     void* __fastcall hkActionContainerFactory(void* obj, void* params)
     {
+        G::HookScope hookScope;
         void* container = g_oActionContainerFactory(obj, params);
         if (container && IsHookTwinBodyguard(reinterpret_cast<UObject*>(obj)))
         {
             g_hookTwinActionContainerHookLive.store(true, std::memory_order_relaxed);
             g_hookTwinFightStagingContainerLogs.fetch_add(1, std::memory_order_relaxed);
             UObject* cont = reinterpret_cast<UObject*>(container);
-            std::string contName = cont && cont->Class() ? cont->Class()->GetName() : "(none)";
-            std::string objName = reinterpret_cast<UObject*>(obj) && 
-                                  reinterpret_cast<UObject*>(obj)->Class() ? 
-                                  reinterpret_cast<UObject*>(obj)->Class()->GetName() : "(none)";
+            std::string contName = Mem::IsReadable(cont, 0x30) ? SafeClassName(cont) : "(none)";
+            std::string objName = Mem::IsReadable(obj, 0x30) ? SafeClassName(reinterpret_cast<UObject*>(obj)) : "(none)";
             LOG("[AI-FSTAGE] Hook Twin action-container create obj=%p objClass=%s container=%p containerClass=%s",
                 obj, objName.c_str(), container, contName.c_str());
         }
@@ -3515,6 +3605,19 @@ namespace
     // Idempotent: if the hook is already live, returns true immediately.
     bool EnsureHookTwinFightStagingNativeHook()
     {
+        // Called from the ProcessEvent detour; once the verdict is in, answer from it
+        // instead of re-running the function-entry scan on every dispatch.
+        if (g_hookTwinFightStagingSelectorHookLive.load(std::memory_order_relaxed))
+            return true;
+        static std::atomic<bool> refused{ false };
+        if (refused.load(std::memory_order_relaxed))
+            return false;
+        struct RefuseOnFailure
+        {
+            std::atomic<bool>& flag; bool ok = false;
+            ~RefuseOnFailure() { if (!ok) flag.store(true, std::memory_order_relaxed); }
+        } verdict{ refused };
+
         void* target = g_fnHookTryFightStagingNative.load(std::memory_order_relaxed);
         if (!target && G::moduleBase)
         {
@@ -3558,6 +3661,7 @@ namespace
 
         g_hookTwinFightStagingSelectorHookLive.store(true, std::memory_order_relaxed);
         LOG_HOOK("TryActivateFightStagingAbility native hook LIVE @ %p", target);
+        verdict.ok = true;
         return true;
     }
 
@@ -3570,6 +3674,15 @@ namespace
             return true;
         if (!G::moduleBase)
             return false;
+        // Same per-dispatch caching as the fight-staging selector above.
+        static std::atomic<bool> refused{ false };
+        if (refused.load(std::memory_order_relaxed))
+            return false;
+        struct RefuseOnFailure
+        {
+            std::atomic<bool>& flag; bool ok = false;
+            ~RefuseOnFailure() { if (!ok) flag.store(true, std::memory_order_relaxed); }
+        } verdict{ refused };
 
         void* target = reinterpret_cast<void*>(
             reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1CA06E0);
@@ -3603,6 +3716,7 @@ namespace
 
         g_hookTwinActionContainerHookLive.store(true, std::memory_order_relaxed);
         LOG_HOOK("ActionContainerFactory native hook LIVE @ %p", target);
+        verdict.ok = true;
         return true;
     }
 
@@ -7472,12 +7586,13 @@ namespace
         lastQueueMs = now;
 
         g_aiPumpInFlight = true;
-        QueueGameThread([]()
+        if (!QueueGameThread([]()
         {
             try { DrainAiGameThreadWork(); }
             catch (...) {}
             g_aiPumpInFlight = false;
-        });
+        }))
+            g_aiPumpInFlight = false; // dropped: never leave the pump wedged "in flight"
     }
 
     // Worker thread only: rebuild the AI list (ESP + every World->Enemy AI
@@ -8643,12 +8758,13 @@ namespace
         lastQueueMs = now;
 
         g_visualPumpInFlight = true;
-        QueueGameThread([]()
+        if (!QueueGameThread([]()
         {
             try { DrainVisualGameThreadWork(); }
             catch (...) {}
             g_visualPumpInFlight = false;
-        });
+        }))
+            g_visualPumpInFlight = false; // dropped: never leave the pump wedged "in flight"
     }
 
     // ---- world: global time dilation --------------------------------------
@@ -8663,25 +8779,78 @@ namespace
         return true;
     }
 
+    // True while the world's global time dilation is left at a value we set, so the
+    // world pump keeps running long enough to put it back to 1.0.
+    std::atomic<bool> g_dilationOwned{ false };
+
+    // GAME THREAD (world pump). The single owner of global time dilation: bullet time
+    // wins, then the plain time-dilation setting. SetGlobalTimeDilation writes world
+    // settings the game thread reads every tick, so it no longer runs from Present.
+    // Refreshed while active because scripted scenes set it too; reset to 1.0 once.
     void ApplyTimeDilation()
     {
         auto& st = Features::Get();
-        if (st.bulletTime)
-            return; // bullet time owns global time dilation while active
-        static bool  wasOn = false;
-        static float lastApplied = -1.0f;
+        static float applied = 1.0f;
         static ULONGLONG lastMs = 0;
-        if (!st.timeDilation)
+
+        float want = 1.0f;
+        ULONGLONG refreshMs = 1000;
+        if (st.bulletTime)
         {
-            if (wasOn) { SetTimeDilation(1.0f); wasOn = false; lastApplied = 1.0f; LOG("Time dilation reset to 1.0"); }
-            return;
+            want = st.bulletTimeScale;
+            if (want < 0.05f) want = 0.05f;
+            if (want > 1.0f)  want = 1.0f;
+            refreshMs = 300;
         }
-        ULONGLONG now = GetTickCount64();
-        if (st.timeScale != lastApplied || now - lastMs > 1000)
+        else if (st.timeDilation && std::isfinite(st.timeScale) && st.timeScale > 0.0f)
         {
-            if (SetTimeDilation(st.timeScale)) { lastApplied = st.timeScale; wasOn = true; }
+            want = st.timeScale;
+        }
+
+        ULONGLONG now = GetTickCount64();
+        bool changed = want != applied;
+        if (!changed && (want == 1.0f || now - lastMs < refreshMs))
+            return;
+        if (SetTimeDilation(want))
+        {
+            if (changed && want == 1.0f)
+                LOG("Time dilation reset to 1.0");
+            applied = want;
             lastMs = now;
         }
+        g_dilationOwned = applied != 1.0f;
+    }
+
+    // GAME THREAD (world pump). SetActorScale3D rescales the capsule, meshes and
+    // physics bodies and refreshes overlaps -- a structural change, not a field write.
+    std::atomic<bool> g_scaleOwned{ false };
+    void ApplyPlayerScale()
+    {
+        auto& st = Features::Get();
+        static UObject* scaledPawn = nullptr;
+        static float lastScale = -1.0f;
+        UObject* pawn = GetLocalPawn();
+        if (st.customScale && IsLiveObject(pawn))
+        {
+            float s = st.playerScale;
+            if (!std::isfinite(s) || s < 0.1f) s = 0.1f;
+            if (s > 10.0f) s = 10.0f;
+            if ((pawn != scaledPawn || s != lastScale) && SetActorScale3D(pawn, { s, s, s }))
+            {
+                scaledPawn = pawn;
+                lastScale = s;
+                LOG("Player scale -> %.2f", s);
+            }
+        }
+        else if (scaledPawn)
+        {
+            if (IsLiveObject(scaledPawn) && scaledPawn == pawn)
+                SetActorScale3D(scaledPawn, { 1.0f, 1.0f, 1.0f });
+            scaledPawn = nullptr;
+            lastScale = -1.0f;
+            LOG("Player scale reset to 1.0");
+        }
+        g_scaleOwned = scaledPawn != nullptr;
     }
 
     void RefreshFlyStreaming(UObject* pawn, bool force)
@@ -9003,7 +9172,9 @@ namespace
         }
         g_flyStepQueuedMs.store(nowMs, std::memory_order_relaxed);
 
-        QueueGameThread([pawn]()
+        // A dropped task never runs to clear the pending flag, which would wedge fly
+        // for the rest of the session; release it here instead.
+        if (!QueueGameThread([pawn]()
         {
             // Consume unconditionally: an abandoned step must not leave its time
             // banked for the next one to apply as a lurch.
@@ -9030,7 +9201,11 @@ namespace
             }
             catch (...) {}
             g_flyStepPending.store(false);
-        });
+        }))
+        {
+            g_flyPendingDt.store(0.0f, std::memory_order_relaxed);
+            g_flyStepPending.store(false);
+        }
     }
 
     // RefreshFlyStreaming dispatches InvalidateStreaming and EnableLevelStreaming,
@@ -9582,10 +9757,15 @@ namespace
 
         if (g_inventoryBackup.inventory && g_inventoryBackup.inventory != inventory)
         {
-            if (g_inventoryBackup.ammoCountValid)
-                WriteInt32Field(g_inventoryBackup.inventory, AH::Inventory_AmmoCount, g_inventoryBackup.ammoCount);
-            if (g_inventoryBackup.infiniteAmmoCountValid)
-                WriteInt32Field(g_inventoryBackup.inventory, AH::Inventory_InfiniteAmmoCount, g_inventoryBackup.infiniteAmmoCount);
+            // The old inventory may be gone (death, level change); its memory then
+            // belongs to something else and must not be written.
+            if (IsLiveObject(g_inventoryBackup.inventory))
+            {
+                if (g_inventoryBackup.ammoCountValid)
+                    WriteInt32Field(g_inventoryBackup.inventory, AH::Inventory_AmmoCount, g_inventoryBackup.ammoCount);
+                if (g_inventoryBackup.infiniteAmmoCountValid)
+                    WriteInt32Field(g_inventoryBackup.inventory, AH::Inventory_InfiniteAmmoCount, g_inventoryBackup.infiniteAmmoCount);
+            }
             g_inventoryBackup = {};
         }
 
@@ -9600,6 +9780,12 @@ namespace
     {
         if (!g_inventoryBackup.inventory)
             return;
+        if (!IsLiveObject(g_inventoryBackup.inventory))
+        {
+            // Destroyed since capture: its memory is someone else's now.
+            g_inventoryBackup = {};
+            return;
+        }
 
         if (g_inventoryBackup.ammoCountValid)
             WriteInt32Field(g_inventoryBackup.inventory, AH::Inventory_AmmoCount, g_inventoryBackup.ammoCount);
@@ -9615,6 +9801,15 @@ namespace
     {
         if (!g_weaponAmmoBackup.weapon)
             return;
+        if (!IsLiveObject(g_weaponAmmoBackup.weapon))
+        {
+            // The weapon was destroyed (dropped, swapped out, level change) since the
+            // capture; writing the old values would land in recycled memory.
+            g_weaponAmmoBackup = {};
+            return;
+        }
+        if (g_weaponAmmoBackup.barrel && !IsLiveObject(static_cast<UObject*>(g_weaponAmmoBackup.barrel)))
+            g_weaponAmmoBackup.barrel = nullptr;
 
         if (g_weaponAmmoBackup.ammoSizeValid)
             WriteInt32Field(g_weaponAmmoBackup.weapon, AH::Weapon_AmmoSize, g_weaponAmmoBackup.ammoSize);
@@ -10174,9 +10369,45 @@ namespace
         catch (...) { return {}; }
     }
 
+    // Name-based death detection, memoised per UFunction. The old fallback built a
+    // full object name (outer chain, name-pool lookups, several string allocations)
+    // for EVERY ProcessEvent the game made -- thousands per frame -- which was a
+    // steady stutter source whenever the menu was hooked. A recycled UFunction slot
+    // is caught by the InternalIndex check.
+    bool IsDeathNamedFunction(void* fn)
+    {
+        struct Entry { int32_t index; bool death; };
+        thread_local std::unordered_map<void*, Entry> memo;
+        UObject* f = static_cast<UObject*>(fn);
+        if (!Mem::IsReadable(f, 0x30))
+            return false;
+        int32_t index = f->Index();
+        auto it = memo.find(fn);
+        if (it != memo.end() && it->second.index == index)
+            return it->second.death;
+        if (memo.size() > 16384)
+            memo.clear();
+        std::string lower = LowerCopy(SafeObjectFullName(f));
+        bool death = lower.find("k2_ondeath") != std::string::npos || lower.find(".ondeath") != std::string::npos;
+        memo[fn] = { index, death };
+        return death;
+    }
+
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params)
     {
         if (!fn)
+            return;
+        // Tombstones only feed the AI features; while none of them is running this
+        // costs nothing per dispatch.
+        if (g_spawnedAllyCount.load(std::memory_order_relaxed) <= 0 &&
+            !g_hookBodyguardMode.load(std::memory_order_relaxed) &&
+            !g_state.aiFightEachOther && !g_hordeActive.load(std::memory_order_relaxed))
+            return;
+        // AI death events arrive on the game thread and the tombstone map is game-
+        // thread state. Async loading and animation workers dispatch ProcessEvent too;
+        // letting them insert here raced every reader of the map.
+        unsigned long gameThread = g_gameThreadId.load(std::memory_order_relaxed);
+        if (gameThread == 0 || GetCurrentThreadId() != gameThread)
             return;
         // Hot ProcessEvent path: use cached death UFunction pointers. Refresh at most
         // once a second so subsystem death events with params are caught without doing
@@ -10218,15 +10449,10 @@ namespace
             actor = HookTwinOwnerFromDeathAbility(obj);
             reason = "DestroyOwnerCharacter";
         }
-        else
+        else if (IsDeathNamedFunction(fn))
         {
-            std::string name = SafeObjectFullName(static_cast<UObject*>(fn));
-            std::string lower = LowerCopy(name);
-            if (lower.find("k2_ondeath") != std::string::npos || lower.find(".ondeath") != std::string::npos)
-            {
-                actor = Mem::IsReadable(obj, 0x30) ? static_cast<UObject*>(obj) : nullptr;
-                reason = "death-name-fallback";
-            }
+            actor = Mem::IsReadable(obj, 0x30) ? static_cast<UObject*>(obj) : nullptr;
+            reason = "death-name-fallback";
         }
 
         if (!actor || !AiUsable(actor) || IsHookBodyguard(actor))
@@ -11253,6 +11479,7 @@ namespace
     };
     DWORD WINAPI DiagWriteThread(LPVOID param)
     {
+        G::HookScope hookScope; // eject waits for this worker to finish
         DiagWriteJob* job = reinterpret_cast<DiagWriteJob*>(param);
         try
         {
@@ -11613,6 +11840,7 @@ namespace
     struct TargetedDumpJob { std::string dir, substr; };
     DWORD WINAPI TargetedDumpThread(LPVOID param)
     {
+        G::HookScope hookScope; // eject waits for this worker to finish
         TargetedDumpJob* job = reinterpret_cast<TargetedDumpJob*>(param);
         try { WriteTargetedActorDump(job->dir, job->substr); }
         catch (...) { LOG("Targeted dump: exception (ignored)"); }
@@ -11686,6 +11914,7 @@ namespace
     struct LiveTargetJob { std::string path; UObject* target; UObject* ctrl; };
     DWORD WINAPI LiveTargetThread(LPVOID param)
     {
+        G::HookScope hookScope; // eject waits for this worker to finish
         LiveTargetJob* j = reinterpret_cast<LiveTargetJob*>(param);
         try
         {
@@ -11815,6 +12044,7 @@ namespace
     struct HookTwinForensicsWriteJob { std::string path, json, hex; };
     DWORD WINAPI HookTwinForensicsWriteThread(LPVOID param)
     {
+        G::HookScope hookScope; // eject waits for this worker to finish
         HookTwinForensicsWriteJob* job = reinterpret_cast<HookTwinForensicsWriteJob*>(param);
         try
         {
@@ -12176,6 +12406,117 @@ namespace
                 setAmmo ? "yes" : "no");
             lastLogMs = nowMs;
         }
+    }
+
+    // True while infinite ammo holds restore bookkeeping (captured inventory/weapon
+    // fields), so the world pump keeps running long enough to put them back.
+    std::atomic<bool> g_ammoOwned{ false };
+
+    // GAME THREAD (world pump). Infinite ammo adds inventory items
+    // (AHInventory.AddItemsToInventory) and reloads the barrel (EBBarrel.SetAmmo):
+    // inventory mutation, the same class of work the weapon grants were moved off
+    // the render thread for (issue #6). Running it from Present every half second
+    // raced the game's own inventory and shooting code.
+    void TickInfiniteAmmo()
+    {
+        static UObject* lastAmmoPawn = nullptr;
+        static UObject* lastAmmoWeapon = nullptr;
+        static ULONGLONG lastAmmoTickMs = 0;
+        static ULONGLONG lastAmmoWeaponPollMs = 0;
+
+        if (!Features::Get().infiniteAmmo)
+        {
+            if (g_ammoOwned.exchange(false))
+            {
+                RestoreWeaponAmmoBackup();
+                RestoreInventoryBackup();
+                LOG("InfiniteAmmo disabled");
+            }
+            lastAmmoPawn = nullptr;
+            lastAmmoWeapon = nullptr;
+            lastAmmoTickMs = 0;
+            lastAmmoWeaponPollMs = 0;
+            return;
+        }
+
+        UObject* pawn = GetLocalPawn();
+        if (!IsLiveObject(pawn) || !PlayerCharacterUsable(pawn))
+            return;
+
+        bool forceAmmo = !g_ammoOwned.exchange(true);
+        if (pawn != lastAmmoPawn)
+        {
+            lastAmmoPawn = pawn;
+            lastAmmoWeapon = nullptr;
+            lastAmmoTickMs = 0;
+        }
+
+        ULONGLONG ammoNowMs = GetTickCount64();
+        UObject* weapon = nullptr;
+        if (forceAmmo || ammoNowMs - lastAmmoWeaponPollMs > 1000)
+        {
+            weapon = GetCurrentWeaponObject(pawn);
+            lastAmmoWeaponPollMs = ammoNowMs;
+            if (weapon && weapon != lastAmmoWeapon)
+            {
+                forceAmmo = true;
+                lastAmmoWeapon = weapon;
+            }
+        }
+
+        UObject* effectiveWeapon = weapon;
+        if (!effectiveWeapon && IsLiveObject(lastAmmoWeapon))
+            effectiveWeapon = lastAmmoWeapon;
+
+        if (forceAmmo || ammoNowMs - lastAmmoTickMs > 500)
+        {
+            ApplyInfiniteAmmo(pawn, effectiveWeapon, forceAmmo, true, forceAmmo ? " enable/weapon-change" : " tick");
+            lastAmmoTickMs = ammoNowMs;
+        }
+    }
+
+    // ---- world pump ---------------------------------------------------------
+    // Player/world features that dispatch gameplay UFunctions run here, on the game
+    // thread, instead of inside Present: infinite ammo, puzzle auto-completion, the
+    // instant-puzzle flag, global time dilation and player scale. The render tick
+    // only schedules one bounded task at a time (same mechanism as the AI pump).
+    std::atomic<bool> g_worldPumpInFlight{ false };
+
+    void DrainWorldGameThreadWork()
+    {
+        try { UpdateInstantPuzzleResolveToggle(); } catch (...) {}
+        try { DrainPuzzleCompletions(); } catch (...) {}
+        try { ApplyTimeDilation(); } catch (...) {}
+        try { ApplyPlayerScale(); } catch (...) {}
+        try { TickInfiniteAmmo(); } catch (...) {}
+    }
+
+    void ScheduleWorldGameThreadWork()
+    {
+        const auto& st = Features::Get();
+        bool wanted = st.instantPuzzleResolve || g_puzzleResolveOwned.load() ||
+                      st.infiniteAmmo || g_ammoOwned.load() ||
+                      st.customScale || g_scaleOwned.load() ||
+                      st.bulletTime || st.timeDilation || g_dilationOwned.load() ||
+                      PuzzleCompletionsPending();
+        if (!wanted || g_worldPumpInFlight.load())
+            return;
+
+        static ULONGLONG lastQueueMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastQueueMs < 50)
+            return;
+        if (!InstallProcessEventHook())
+            return; // no game thread yet: never do this work from Present
+        lastQueueMs = now;
+
+        g_worldPumpInFlight = true;
+        if (!QueueGameThread([]()
+        {
+            DrainWorldGameThreadWork();
+            g_worldPumpInFlight = false;
+        }))
+            g_worldPumpInFlight = false;
     }
 
     // GAME THREAD ONLY. The catch is not a recovery -- unwinding back out through
@@ -12571,7 +12912,7 @@ void Features::AiDeleteActor(unsigned long long id)
         std::vector<AiCachedActor> snap = CopyAiSnapshot();
         for (const AiCachedActor& e : snap) if (e.actor == ai) { known = true; break; }
     }
-    if (!known || !Mem::IsReadable(ai, 0x30))
+    if (!known || !IsLiveObject(ai))
     {
         LOG("AiDeleteActor: id %llu not a live cached actor (ignored)", id);
         return;
@@ -12579,12 +12920,16 @@ void Features::AiDeleteActor(unsigned long long id)
 
     g_selectedAi.erase(std::remove(g_selectedAi.begin(), g_selectedAi.end(), ai), g_selectedAi.end());
 
+    // K2_DestroyActor on a pointer whose actor already died would destroy whatever
+    // now occupies that memory, so the identity is pinned here and re-checked on
+    // the game thread.
+    const int32_t index = ai->Index();
     InstallProcessEventHook();
-    QueueGameThread([ai]()
+    QueueGameThread([ai, index]()
     {
         try
         {
-            if (!Mem::IsReadable(ai, 0x30)) return;
+            if (!IsLiveObject(ai) || ai->Index() != index || !PawnUsable(ai)) return;
             // Stop every Hook/squad state machine from touching it before it dies.
             ReleaseHookNativeMovement(ai, true);
             SquadRemove(ai);
@@ -12665,21 +13010,26 @@ int Features::AiQueueLaunchAll()
 void Features::MaxWeaponUpgrades()
 {
     if (!G::sdkReady.load()) { LOG("MaxWeaponUpgrades failed: SDK not ready"); return; }
-    try
+    // FullUpgrade swaps weapon modules and meshes: game-thread work, like a grant.
+    if (!QueueGameAction([]()
     {
-        UObject* pawn = GetLocalPawn();
-        UObject* weapon = pawn ? GetCurrentWeaponObject(pawn) : nullptr;
-        UFunction* fn = CachedFn(AH::Fn_BaseWeapon_FullUpgrade);
-        if (!weapon || !fn)
+        try
         {
-            LOG("MaxWeaponUpgrades failed: weapon=%p fn=%p", (void*)weapon, (void*)fn);
-            return;
+            UObject* pawn = GetLocalPawn();
+            UObject* weapon = IsLiveObject(pawn) ? GetCurrentWeaponObject(pawn) : nullptr;
+            UFunction* fn = CachedFn(AH::Fn_BaseWeapon_FullUpgrade);
+            if (!IsLiveObject(weapon) || !fn)
+            {
+                LOG("MaxWeaponUpgrades failed: weapon=%p fn=%p", (void*)weapon, (void*)fn);
+                return;
+            }
+            uint8_t noParams = 0;
+            if (weapon->ProcessEvent(fn, &noParams))
+                LOG("MaxWeaponUpgrades: FullUpgrade applied to current weapon %p", (void*)weapon);
         }
-        uint8_t noParams = 0;
-        weapon->ProcessEvent(fn, &noParams);
-        LOG("MaxWeaponUpgrades: FullUpgrade applied to current weapon %p", (void*)weapon);
-    }
-    catch (...) { LOG("MaxWeaponUpgrades: exception (ignored)"); }
+        catch (...) { LOG("MaxWeaponUpgrades: exception (ignored)"); }
+    }))
+        LOG("MaxWeaponUpgrades skipped: no game-thread pump yet");
 }
 
 void Features::RunConsoleCommand(const char* command)
@@ -14043,6 +14393,7 @@ namespace
 
     DWORD WINAPI VerifyOffsetsThread(LPVOID)
     {
+        G::HookScope hookScope; // eject waits for this worker to finish
         int matched = 0, moved = 0, unresolvedProp = 0, unresolvedClass = 0;
         try
         {
@@ -14450,9 +14801,11 @@ void Features::SavePosition()
 {
     try
     {
+        // Menu click = the render thread: read the root component directly rather
+        // than dispatching K2_GetActorLocation from here.
         UObject* pawn = GetLocalPawn();
         FVector loc{};
-        if (!pawn || !ReadActorLocation(pawn, loc))
+        if (!IsLiveObject(pawn) || !ReadActorLocationFast(pawn, loc))
         {
             LOG("SavePosition failed: pawn=%p", (void*)pawn);
             return;
@@ -14493,18 +14846,22 @@ void Features::RefillAmmoNow()
         return;
     }
 
-    try
+    // Inventory mutation and EBBarrel.SetAmmo: game-thread work (see TickInfiniteAmmo).
+    if (!QueueGameAction([]()
     {
-        UObject* pawn = GetLocalPawn();
-        if (!pawn)
+        try
         {
-            LOG("RefillAmmoNow failed: no local pawn");
-            return;
+            UObject* pawn = GetLocalPawn();
+            if (!IsLiveObject(pawn) || !PlayerCharacterUsable(pawn))
+            {
+                LOG("RefillAmmoNow failed: no local player character");
+                return;
+            }
+            ApplyInfiniteAmmo(pawn, GetCurrentWeaponObject(pawn), true, false, " manual");
         }
-
-        ApplyInfiniteAmmo(pawn, GetCurrentWeaponObject(pawn), true, false, " manual");
-    }
-    catch (...) { LOG("RefillAmmoNow: exception (ignored)"); }
+        catch (...) { LOG("RefillAmmoNow: exception (ignored)"); }
+    }))
+        LOG("RefillAmmoNow skipped: no game-thread pump yet");
 }
 
 void Features::SolveCurrentPuzzle()
@@ -14515,28 +14872,35 @@ void Features::SolveCurrentPuzzle()
         return;
     }
 
-    try
+    // Hand the interactive puzzles (minigame button grids/dials AND the
+    // BP_LockComponent door locks) to the worker thread -- discovery sweeps
+    // GObjects and must NOT run on the render/Present path. The worker picks this
+    // up within ~50ms and the world pump fires a small bounded batch.
+    g_puzzleSolveOnce = true;
+
+    // The debug unlock/QTE calls finish puzzles and QTEs: gameplay logic that runs
+    // on the game thread, never from Present.
+    if (!QueueGameAction([]()
     {
-        bool pulseInstant = false;
-        if (!g_state.instantPuzzleResolve)
-            pulseInstant = ApplyInstantPuzzleResolve(true, true);
+        try
+        {
+            bool pulseInstant = false;
+            if (!g_state.instantPuzzleResolve)
+                pulseInstant = ApplyInstantPuzzleResolve(true, true);
 
-        bool lock = CallDebugNoParams(AH::Fn_Debug_InstantLockUnlock, "InstantLockUnlock");
-        bool qte = CallDebugNoParams(AH::Fn_Debug_WinQTE, "WinQTE");
-        // Hand the interactive puzzles (minigame button grids/dials AND the
-        // BP_LockComponent door locks) to the worker thread -- discovery sweeps
-        // GObjects and must NOT run on the render/Present path. The worker picks
-        // this up within ~50ms and the render Tick fires a small bounded batch.
-        g_puzzleSolveOnce = true;
-        if (pulseInstant)
-            ApplyInstantPuzzleResolve(false, true);
+            bool lock = CallDebugNoParams(AH::Fn_Debug_InstantLockUnlock, "InstantLockUnlock");
+            bool qte = CallDebugNoParams(AH::Fn_Debug_WinQTE, "WinQTE");
+            if (pulseInstant)
+                ApplyInstantPuzzleResolve(false, true);
 
-        LOG("SolveCurrentPuzzle: instantPulse=%s lock=%s qte=%s (minigame solve queued)",
-            pulseInstant ? "yes" : (g_state.instantPuzzleResolve ? "already-on" : "no"),
-            lock ? "yes" : "no",
-            qte ? "yes" : "no");
-    }
-    catch (...) { LOG("SolveCurrentPuzzle: exception (ignored)"); }
+            LOG("SolveCurrentPuzzle: instantPulse=%s lock=%s qte=%s (minigame solve queued)",
+                pulseInstant ? "yes" : (g_state.instantPuzzleResolve ? "already-on" : "no"),
+                lock ? "yes" : "no",
+                qte ? "yes" : "no");
+        }
+        catch (...) { LOG("SolveCurrentPuzzle: exception (ignored)"); }
+    }))
+        LOG("SolveCurrentPuzzle: debug unlock skipped (no game-thread pump yet); minigame solve still queued");
 }
 
 void Features::WorkerTick()
@@ -14604,55 +14968,50 @@ void Features::WorkerTick()
     }
 }
 
+namespace
+{
+    // The DebugSubsystem calls below unlock doors, win QTEs and advance quests: they
+    // run quest scripts, stream levels and start cutscenes. That is game-thread
+    // work; dispatching it from the menu (the Present hook) raced the game's own
+    // tick. Queue it and report acceptance, the way the weapon grants do.
+    void QueueDebugCall(const char* functionName, const char* label)
+    {
+        if (!G::sdkReady.load())
+        {
+            LOG("%s failed: SDK not ready", label);
+            return;
+        }
+        std::string fnName = functionName, text = label;
+        if (!Features::QueueGameAction([fnName, text]()
+        {
+            try { CallDebugNoParams(fnName.c_str(), text.c_str()); }
+            catch (...) { LOG("%s: exception (ignored)", text.c_str()); }
+        }))
+            LOG("%s skipped: no game-thread pump yet", label);
+    }
+}
+
 void Features::UnlockCurrentLock()
 {
-    if (!G::sdkReady.load())
-    {
-        LOG("UnlockCurrentLock failed: SDK not ready");
-        return;
-    }
-
-    try { CallDebugNoParams(AH::Fn_Debug_InstantLockUnlock, "InstantLockUnlock"); }
-    catch (...) { LOG("UnlockCurrentLock: exception (ignored)"); }
+    QueueDebugCall(AH::Fn_Debug_InstantLockUnlock, "InstantLockUnlock");
 }
 
 void Features::WinCurrentQTE()
 {
-    if (!G::sdkReady.load())
-    {
-        LOG("WinCurrentQTE failed: SDK not ready");
-        return;
-    }
-
-    try { CallDebugNoParams(AH::Fn_Debug_WinQTE, "WinQTE"); }
-    catch (...) { LOG("WinCurrentQTE: exception (ignored)"); }
+    QueueDebugCall(AH::Fn_Debug_WinQTE, "WinQTE");
 }
 
 void Features::SkipObjective()
 {
-    if (!G::sdkReady.load())
-    {
-        LOG("SkipObjective failed: SDK not ready");
-        return;
-    }
-
     // PromoteAllActiveQuests advances every active quest one step -- the game's own
     // debug "skip the current objective" (jumps past gates like "you need a ticket
     // for the train"). Press again to skip the next objective.
-    try { CallDebugNoParams(AH::Fn_Debug_PromoteAllActiveQuests, "PromoteAllActiveQuests"); }
-    catch (...) { LOG("SkipObjective: exception (ignored)"); }
+    QueueDebugCall(AH::Fn_Debug_PromoteAllActiveQuests, "PromoteAllActiveQuests");
 }
 
 void Features::CompleteActiveQuests()
 {
-    if (!G::sdkReady.load())
-    {
-        LOG("CompleteActiveQuests failed: SDK not ready");
-        return;
-    }
-
-    try { CallDebugNoParams(AH::Fn_Debug_CompleteAllActiveQuests, "CompleteAllActiveQuests"); }
-    catch (...) { LOG("CompleteActiveQuests: exception (ignored)"); }
+    QueueDebugCall(AH::Fn_Debug_CompleteAllActiveQuests, "CompleteAllActiveQuests");
 }
 
 // Called from the ImGui button, which runs inside the Present hook. A grant is
@@ -15984,13 +16343,12 @@ static void TickImpl()
     TestHarness::RenderTick();
     Workbench::Tick();
     UpdateGameInputBlock();
-    UpdateInstantPuzzleResolveToggle();
     UpdateDebugDiagnostics();
     UpdateHookTwinForensics();
-    // Fire any puzzle completions the worker thread discovered (render thread).
-    DrainPuzzleCompletions();
-    // World-level toggles that don't need the pawn.
-    ApplyTimeDilation();
+    // Puzzle completions, the instant-puzzle flag, time dilation, player scale and
+    // infinite ammo all dispatch gameplay UFunctions: marshal them to the game
+    // thread (they used to run right here, inside Present).
+    ScheduleWorldGameThreadWork();
     // AI commands auto-fire onto the cache (no ProcessEvent here -- safe on the
     // render thread); the actual AI ProcessEvent work is marshalled to the game
     // thread by the scheduler below to avoid racing the engine's AI tick.
@@ -16229,100 +16587,28 @@ static void TickImpl()
     }
 
     // --- bullet time (matrix mode): slow the whole world, keep the player fast --
-    // Global time dilation slows everything; the player's own CustomTimeDilation
-    // is set to 1/scale so the player effectively runs at real-time in the slowed
-    // world -- i.e. you move many times faster than everything else.
+    // Global time dilation (the world pump sets it on the game thread) slows
+    // everything; the player's own CustomTimeDilation is set to 1/scale so the
+    // player effectively runs at real time in the slowed world. That part is a
+    // plain field write, so it stays here.
     {
         static bool wasBullet = false;
-        static ULONGLONG lastGlobalMs = 0;
         if (st.bulletTime)
         {
             float s = st.bulletTimeScale;
             if (s < 0.05f) s = 0.05f;
             if (s > 1.0f)  s = 1.0f;
-            ULONGLONG nowB = GetTickCount64();
-            if (!wasBullet || nowB - lastGlobalMs > 300) { SetTimeDilation(s); lastGlobalMs = nowB; }
             SetActorTimeDilation(pawn, 1.0f / s); // counter the global slow for the player only
         }
         else if (wasBullet)
         {
-            SetTimeDilation(1.0f);
             SetActorTimeDilation(pawn, 1.0f);
             LOG("Bullet time off");
         }
         wasBullet = st.bulletTime;
     }
 
-    // --- player scale (giant / tiny) ---------------------------------------
-    {
-        static bool wasScale = false;
-        static float lastScale = -1.0f;
-        if (st.customScale)
-        {
-            float s = st.playerScale;
-            if (s < 0.1f) s = 0.1f;
-            if (s > 10.0f) s = 10.0f;
-            if (s != lastScale) { SetActorScale3D(pawn, { s, s, s }); lastScale = s; LOG("Player scale -> %.2f", s); }
-        }
-        else if (wasScale)
-        {
-            SetActorScale3D(pawn, { 1.0f, 1.0f, 1.0f });
-            lastScale = -1.0f;
-            LOG("Player scale reset to 1.0");
-        }
-        wasScale = st.customScale;
-    }
-
-    // --- infinite ammo: refill reserve inventory and top current weapon -----
-    static bool wasInfiniteAmmo = false;
-    static UObject* lastAmmoPawn = nullptr;
-    static UObject* lastAmmoWeapon = nullptr;
-    static ULONGLONG lastAmmoTickMs = 0;
-    static ULONGLONG lastAmmoWeaponPollMs = 0;
-    if (st.infiniteAmmo)
-    {
-        if (pawn != lastAmmoPawn)
-        {
-            lastAmmoPawn = pawn;
-            lastAmmoWeapon = nullptr;
-            lastAmmoTickMs = 0;
-        }
-
-        ULONGLONG ammoNowMs = GetTickCount64();
-        UObject* weapon = nullptr;
-        bool forceAmmo = !wasInfiniteAmmo;
-        if (forceAmmo || ammoNowMs - lastAmmoWeaponPollMs > 1000)
-        {
-            weapon = GetCurrentWeaponObject(pawn);
-            lastAmmoWeaponPollMs = ammoNowMs;
-            if (weapon && weapon != lastAmmoWeapon)
-            {
-                forceAmmo = true;
-                lastAmmoWeapon = weapon;
-            }
-        }
-
-        UObject* effectiveWeapon = weapon;
-        if (!effectiveWeapon && Mem::IsReadable(lastAmmoWeapon, 0x30))
-            effectiveWeapon = lastAmmoWeapon;
-
-        if (forceAmmo || ammoNowMs - lastAmmoTickMs > 500)
-        {
-            ApplyInfiniteAmmo(pawn, effectiveWeapon, forceAmmo, true, forceAmmo ? " enable/weapon-change" : " tick");
-            lastAmmoTickMs = ammoNowMs;
-        }
-    }
-    else if (wasInfiniteAmmo)
-    {
-        RestoreWeaponAmmoBackup();
-        RestoreInventoryBackup();
-        LOG("InfiniteAmmo disabled");
-        lastAmmoPawn = nullptr;
-        lastAmmoWeapon = nullptr;
-        lastAmmoTickMs = 0;
-        lastAmmoWeaponPollMs = 0;
-    }
-    wasInfiniteAmmo = st.infiniteAmmo;
+    // Player scale and infinite ammo run on the game thread (world pump).
 }
 
 void Features::Tick()

@@ -127,6 +127,16 @@ void Log::Clear()
 
 void Log::Write(const char* fmt, ...)
 {
+    // The vectored exception handler logs from whichever thread faulted. A thread
+    // that faulted inside this function already holds g_mtx, and locking it again
+    // deadlocks that thread for good -- a hang rather than the crash it reports.
+    // Drop the nested line instead.
+    thread_local bool inWrite = false;
+    if (inWrite)
+        return;
+    inWrite = true;
+    struct ResetFlag { bool& flag; ~ResetFlag() { flag = false; } } resetFlag{ inWrite };
+
     std::lock_guard<std::mutex> lk(g_mtx);
 
     char buf[2048];

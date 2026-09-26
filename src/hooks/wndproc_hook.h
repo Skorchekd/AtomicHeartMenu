@@ -13,6 +13,7 @@
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
 #pragma once
 #include <Windows.h>
+#include <mutex>
 
 // Subclasses the game window so ImGui sees raw input and the INSERT key toggles
 // the menu. Installed once we know the swapchain's HWND.
@@ -20,5 +21,18 @@ namespace WndProcHook
 {
     void Install(HWND hwnd);
     void Tick();
-    void Remove();
+    // False when our procedure had to stay installed (see IsTopLevel); the module
+    // must then stay loaded.
+    bool Remove();
+
+    // True when our procedure is still the window's top-level one. Another overlay
+    // that subclassed after us keeps calling into ours, so it cannot be unhooked
+    // (and this DLL cannot be unloaded) without breaking its chain.
+    bool IsTopLevel();
+
+    // ImGui is single-threaded. Its input queue is appended by the window procedure
+    // (the game thread) and consumed by NewFrame (the render thread); both sides
+    // hold this lock across those calls. Recursive because ReleaseCapture inside the
+    // handler re-enters the window procedure synchronously on the same thread.
+    std::recursive_mutex& InputMutex();
 }

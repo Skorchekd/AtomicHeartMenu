@@ -150,7 +150,22 @@ namespace
         }
 
         G::running = false;
+        // Disable every detour and wait for threads already inside one to leave
+        // BEFORE any trampoline is freed or ImGui is destroyed. Tearing down under a
+        // thread still inside a detour (the game thread lives in the ProcessEvent
+        // hook, the render thread in Present) was a crash on eject.
+        bool windowProcReleased = false;
+        if (!DX12Hook::Quiesce(5000, &windowProcReleased))
+        {
+            LOG("Eject: hooks did not quiesce; nothing was freed and the DLL stays loaded (inert).");
+            return exitCode;
+        }
         SafeRemoveHooks();
+        if (!windowProcReleased)
+        {
+            LOG("Eject: another overlay still chains through our window procedure; the DLL stays loaded (inert).");
+            return exitCode;
+        }
         if (!UE::WaitForObjectNameIndex())
         {
             LOG("Name-index worker is still exiting; retaining the DLL to avoid unloading running code.");
