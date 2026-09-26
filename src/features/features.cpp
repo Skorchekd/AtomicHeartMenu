@@ -15,6 +15,7 @@
 #include "bodyguards.h"
 #include "workbench.h"
 #include "possession.h"
+#include "sandbox.h"
 #include "test_harness.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
@@ -13980,6 +13981,13 @@ bool Features::PrepareUnload()
         return false;
     }
     freeFlyOffMs = 0;
+    // Unloading lifts the save block; the next autosave would then write sandbox
+    // progress over the campaign save.
+    if (Sandbox::GetStatus().holdingSaves)
+    {
+        Notify("Saves are blocked since the sandbox: return to the title menu before ejecting, or the game could save over your progress.");
+        return false;
+    }
     if (!G::sdkReady.load()) return true;
     if (!InstallProcessEventHook()) return false;
     if (g_preparingUnload.exchange(true)) return false;
@@ -18024,6 +18032,7 @@ static void TickImpl()
     UpdateHookTwinForensics();
     ProcessHotkeys();
     Possession::Tick(); // input and camera for a character being played
+    Sandbox::Tick();    // a sandbox map's save block follows world changes
     // Puzzle completions, the instant-puzzle flag, time dilation, player scale and
     // infinite ammo all dispatch gameplay UFunctions: marshal them to the game
     // thread (they used to run right here, inside Present).

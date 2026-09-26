@@ -20,6 +20,7 @@
 #include "../features/workbench.h"
 #include "../features/bodyguards.h"
 #include "../features/possession.h"
+#include "../features/sandbox.h"
 #include "../hooks/native_hooks.h"
 #include "../hooks/ai_movement_hooks.h"
 #include "../sdk/ue4.h"
@@ -456,6 +457,81 @@ namespace
             ImGui::SameLine();
             if (ImGui::Button("Respawn snapshot as companions")) Features::AiRespawnZone();
         }
+    }
+
+    // Sandbox (World page): the game's map list and a plain level load.
+    void DrawSandboxSection()
+    {
+        const Sandbox::Status sb = Sandbox::GetStatus();
+        ImGui::TextWrapped("Loads a map straight from the game's own map list with the engine's normal level load. "
+                           "No campaign or post-game save is involved, and from the load until you are back at the "
+                           "title menu the game's saves are blocked, so the sandbox cannot overwrite your progress. "
+                           "Some maps expect the story to set them up and may start empty; the sandbox kit below helps.");
+        static char filter[96] = "";
+        static char typed[160] = "";
+        static bool mainOnly = true;
+        static std::string selected;
+        ImGui::BeginDisabled(sb.busy || sb.loading || !G::sdkReady.load());
+        if (!sb.listed)
+        {
+            if (ImGui::Button("Read the map list")) { LOG("UI: sandbox read maps"); Sandbox::RefreshMaps(); }
+        }
+        else
+        {
+            ImGui::SetNextItemWidth(-170.0f);
+            ImGui::InputTextWithHint("##mapFilter", "filter maps", filter, sizeof(filter));
+            ImGui::SameLine();
+            ImGui::Checkbox("Main maps only", &mainOnly);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Hides streamed sublevels by name. Untick it if the map you want is missing.");
+            std::vector<Sandbox::MapEntry> maps = Sandbox::Maps(filter, 400, mainOnly);
+            const bool widened = maps.empty() && mainOnly;
+            if (widened) // no name looked like a main map: show them all rather than nothing
+                maps = Sandbox::Maps(filter, 400, false);
+            ImGui::BeginChild("sandboxMaps", ImVec2(0, 200), ImGuiChildFlags_Borders);
+            for (const auto& map : maps)
+                if (ImGui::Selectable(map.package.c_str(), selected == map.package))
+                    selected = map.package;
+            ImGui::EndChild();
+            ButtonRow row;
+            ImGui::BeginDisabled(selected.empty());
+            if (row.Button("Load selected map")) { LOG("UI: sandbox open %s", selected.c_str()); Sandbox::OpenMap(selected); }
+            ImGui::EndDisabled();
+            if (row.Button("Read the list again")) Sandbox::RefreshMaps();
+            ImGui::TextDisabled("%d maps%s", sb.mapCount, widened ? " (none looked like a main map, so all are shown)" : "");
+        }
+        ImGui::SetNextItemWidth(-170.0f);
+        ImGui::InputTextWithHint("##mapByName", "or type a map path, e.g. /Game/Maps/...", typed, sizeof(typed));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(typed[0] == 0);
+        if (ImGui::Button("Load by name")) { LOG("UI: sandbox open by name %s", typed); Sandbox::OpenMapByName(typed); }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("For when the list cannot be read. A name the game does not have fails the\n"
+                              "load, and the game then falls back to its title menu.");
+        ImGui::EndDisabled();
+        bool block = Sandbox::BlockSaves();
+        if (ImGui::Checkbox("Block game saves from a sandbox load until the title menu", &block)) Sandbox::SetBlockSaves(block);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keeps the sandbox, and any level or save the game moves on to from it, from\n"
+                              "saving over your campaign. Unticking it lifts a block that is up.");
+        if (!sb.currentMap.empty())
+            ImGui::Text("Current map: %s", sb.currentMap.c_str());
+        if (sb.loading)
+            ImGui::TextColored(ImVec4(1, .85f, .3f, 1), "Loading the requested map...");
+        if (sb.sandboxActive)
+            ImGui::TextColored(ImVec4(.4f, .95f, .55f, 1), "In a sandbox map");
+        if (sb.holdingSaves)
+            ImGui::TextColored(ImVec4(1, .65f, .2f, 1), "Game saves are blocked until you return to the title menu.");
+        ImGui::TextWrapped("%s", sb.message.c_str());
+
+        ImGui::TextDisabled("Sandbox kit:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Give all weapons")) { LOG("UI: sandbox give all weapons"); Features::GiveAllWeapons(false); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Unlock all skills")) { LOG("UI: sandbox unlock skills"); Workbench::UnlockSkills(); }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Skills follow the game's normal save behaviour; with saves blocked they last until you leave.");
     }
 
     // ===================================================================
@@ -1336,14 +1412,23 @@ void Menu::Render()
 
         if (page == 6)
         {
-            ImGui::SeparatorText("Stages and free roam");
+            ImGui::SeparatorText("Sandbox: load any map, no save needed");
+            DrawSandboxSection();
+
             const auto worldStatus = Workbench::GetStatus();
+            if (ImGui::CollapsingHeader("The game's own free roam (needs a finished-campaign save)"))
+            {
+                ImGui::BeginDisabled(worldStatus.busy);
+                if (ImGui::Button("Stage selector (experimental)")) Workbench::ToggleDebugMenu();
+                ImGui::SameLine();
+                if (ImGui::Button("Close stage selector")) Workbench::CloseDebugMenu();
+                if (ImGui::Button("Continue open-world save")) Workbench::ContinueOpenWorld();
+                ImGui::EndDisabled();
+                ImGui::TextWrapped("From the title main menu only. The stage selector needs the game's hidden level-switcher "
+                                   "Blueprint to be loaded, and open-world continuation needs a post-game save. Use the "
+                                   "sandbox above when you have neither.");
+            }
             ImGui::BeginDisabled(worldStatus.busy);
-            if (ImGui::Button("Stage selector (experimental)")) Workbench::ToggleDebugMenu();
-            ImGui::SameLine();
-            if (ImGui::Button("Close stage selector")) Workbench::CloseDebugMenu();
-            if (ImGui::Button("Continue open-world save")) Workbench::ContinueOpenWorld();
-            ImGui::TextWrapped("Use these controls from the title main menu. Stage selection is not yet verified in this shipping build. Open-world continuation requires an eligible post-game save and does not remove campaign objectives.");
             bool hidden = worldStatus.objectiveHidden;
             if (ImGui::Checkbox("Hide tracked objective", &hidden)) Workbench::SetObjectiveHidden(hidden);
             ImGui::TextDisabled("Objective display only; mission scripts continue in campaign saves.");
