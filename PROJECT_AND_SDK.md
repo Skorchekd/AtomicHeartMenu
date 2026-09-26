@@ -50,21 +50,25 @@ AtomicHeartMenu/
 ├── build.bat                 One-click build -> bin\AtomicHeartMenu.dll
 │
 ├── src/                      The menu's own source
-│   ├── dllmain.cpp           Entry: worker thread, hook install, INSERT/END handling
+│   ├── dllmain.cpp           Entry: worker thread, hook install, settings load, END eject
 │   ├── core/
 │   │   ├── globals.h         Shared atomics (running / menuOpen / sdkReady) + module info
 │   │   ├── log.{h,cpp}       Live console + AtomicHeartMenu.log next to the game exe
 │   │   └── memory.{h,cpp}    Mem::IsReadable - pointer-safety guard used everywhere
 │   ├── hooks/
 │   │   ├── dx12_hook.{h,cpp} Present/ResizeBuffers/ExecuteCommandLists hooks + ImGui DX12
-│   │   └── wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggle
+│   │   └── wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggle,
+│   │                             numpad hotkeys, END key
 │   ├── menu/menu.{h,cpp}     The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Debug tabs)
 │   ├── features/features.{h,cpp}  Per-frame cheat logic (god mode, fly, one-hit, …)
+│   ├── features/bodyguards.{h,cpp}  Companion policy (targets, orders); engine calls go
+│   │                             through BodyguardEngine, so tests can fake them
 │   └── sdk/                  *Minimal* hand-written UE4 runtime SDK (see §4)
 │       ├── ue4.{h,cpp}       FName/UObject/GObjects/GWorld + ProcessEvent + lookups
 │       ├── scanner.{h,cpp}   AOB scanner - the fallback when the static RVAs fail
 │       └── offsets.h         *** ALL build-specific offsets live here ***
 │
+├── tests/bodyguard_policy_tests.cpp  Fake-engine policy checks (CMake AHM_BUILD_TESTS)
 ├── tools/injector.cpp        Minimal LoadLibrary injector -> bin\injector.exe
 ├── tools/find_globals.py     Recover GObjects/GNames/GWorld from the exe after a patch
 ├── deps/imgui, deps/minhook  Vendored dependencies
@@ -253,10 +257,10 @@ the managed squad so the pump keeps driving them, and the default stop radius is
 | Give weapon | dropdown resolves `DA_Item_*` weapon data assets and calls `AAHPlayerCharacter::InstantTakeWeapon`; selected grant also calls `EquipWeaponByDataAsset`, give-all grants every listed weapon. Kalash is labelled `Kalash Rifle / AK-47`. **Game-thread only:** both grants go through `QueueGameThread` and the buttons return once the request is accepted, never once the weapon arrives - a grant mutates the inventory and spawns/attaches a weapon actor, and running that from the Present hook raised an access violation inside the engine that then hung the game (`Skorchekd/AtomicHeartMenu#6`). The pawn is resolved inside the queued task, so a possession change between click and drain cannot hand game code the wrong receiver. **Two type gates before either dispatch:** the receiver must `IsA(AtomicHeart.AHPlayerCharacter)` (ProcessEvent does not check its receiver, so an AHPlayerCharacter-only function reaching another pawn class runs the native thunk against members that class does not define), and the asset must `IsA` the class the UFunction's own `WeaponItemDataAsset` parameter declares, read via `Reflect::ObjectPropertyClassInStruct` - the object-name fallback that resolves these assets matches on a name substring alone and cannot rule a wrong type out by itself. Reading the expected class off the function means a patch that retypes the parameter is followed rather than guessed. **Weapons with no content in the install are skipped BEFORE the take** (`WeaponAssetHasContent`): some `kWeapons` entries resolve to a data asset carrying no content, and one of those still takes and lands in storage as a named but EMPTY slot. `LargeIcon` on the item data asset separates the two - set on every weapon confirmed working, unset on PTRD (the crash) and on the empty storage slots; it split 19 usable from 18 stubs, the SAME 18 in a base game session and a DLC2 one, so this tracks the install rather than which campaign is loaded. Read live off the asset so the set is never hardcoded, since a patch or a DLC purchase moves it; an absent `LargeIcon` property (a rename on a future build) passes rather than refusing every weapon. A correlate rather than a proven cause, so `WeaponModelReady` backs it up after the take by reading the spawned weapon's `Mesh` component and then its `SkeletalMesh`/`StaticMesh` (engine property names, so build-independent), fail-closed: anything unreadable counts as not ready, because a refused equip leaves a usable weapon in the inventory while a wrong "yes" ends the session. **Equip is deferred, not inline:** `InstantTakeWeapon` returns before the weapon actor it spawns exists, and `EquipWeaponByDataAsset` against an asset with no instance yet returns having done nothing - the weapon reached the inventory and the wheel but never the player's hands. The grant records a pending equip that the render tick paces (`ProcessPendingEquip`, 60 ms apart, 24 attempts) and the pump executes, using `FindWeaponByDataAsset` as the readiness test: a non-null answer is the spawned weapon, so the equip has something to switch to. Builds without that function fall back to equipping on the first deferred attempt. A grant that faults latches `g_giveWeaponFaulted` for the session and refuses every later grant, including an in-flight give-all: the fault leaves the engine part-way through an inventory mutation, and a second grant on top of that is how one survivable fault becomes an unrecoverable one | ✅ |
 | Misc puzzle bypass | resolves `DebugSubsystem_0` and calls `DebugSubsystem.SetInstantPuzzleResolve`, `InstantLockUnlock`, and `WinQTE`; includes an auto-resolve toggle plus one-shot solve/pass, lock, and QTE buttons | ✅ |
 | Heal to full | button-driven raw write of the player attribute set `Health = MaxHealth` (`Features::FullHeal`); no `ProcessEvent`, so it's safe straight from the menu thread | ✅ |
-| Invincible allies | `aiInvincibleAllies` (default on): each AI pump tops every spawned ally + recruited guard to `MaxHealth` (`SetCharacterHealthFull`, raw guarded write - no restore bookkeeping). Turn it off and they take normal damage again. This is what makes the squad actually usable instead of dying in seconds | ✅ |
+| Invincible allies | `aiInvincibleAllies` (default on): each AI pump sets a companion's `IncomingDamageMultiplier` (Base and Current) to `0`, the attribute god mode uses, and tops it to `MaxHealth`; topping health alone lost to a single burst between two pumps. `aiCompanionDamage` (default 3) scales `InstigatedDamageMultiplier`. The originals are captured per companion, keyed by pointer plus `InternalIndex` and `FName` so a recycled address starts clean, and are restored on release, on removal, when the option is turned off, and when a dead or dropped companion leaves the squad (`ApplyCompanionVitals` / `RestoreCompanionVitals`) | ✅ (live test pending) |
 | World / sky tint | recolors every `Engine.Light` in the loaded level via `ALight.SetLightColor` (the directional sun tints the whole sky/scene). **Perf-fixed:** the light list is cached and rebuilt only every ~4 s (`RebuildLightListIfStale`), and the colour is **quantised to ~32 steps/channel** so a static colour re-applies exactly once and a rainbow re-applies only a few dozen times per cycle - instead of re-dirtying hundreds of lights' render state at 10 Hz, which was tanking frame times. Off resets the cached lights to white | ✅ |
 | Chams + console + viewmodes | enemy model recolour via `MeshComponent.SetVector/ScalarParameterValueOnMaterials` (+ optional custom-depth), and `KismetSystemLibrary.ExecuteConsoleCommand` for viewmodes / show-flags / `r.*` cvars. All run on the game-thread visual pump (mirror of the AI pump) so they never race the renderer | ✅ |
-| Interactive puzzles (minigames + door locks) | the debug subsystem does **not** touch two families of puzzle: `BPC_MiniGameBase_C` minigames (dials/grids, tri-way electric lockpick `MiniGame_TriWay_C`) completed via `MiniGame_SetComplete`/`SetGameComplete`, and `BP_LockComponent_C` door locks (the CodeLock button grid, ColorsLockPick, CoinLock, UniversalLock) opened via `Unlock()`. Both are handled by one worker-thread routine driven from a `kPuzzleTargets` table: it resolves each component UClass (`Cls_MiniGameBase` / `Cls_LockComponent`) and walks its `Children` list for the functions by short name (the BP packages mount under `/Game/...`, so a `Function Pkg.Class.Fn` full-name needle never matches - `FindFunctionInClass` sidesteps the path), then a single IsA-sweep of GObjects enqueues live, non-template, not-already-done instances; the render `Tick` fires `ProcessEvent` on the queue. Driven continuously by the *Instant puzzle resolve* toggle and one-shot by the *Solve* button (which also dumps live puzzle-class candidates on a miss). **Discovery is worker-thread only** so the Present hook never stalls | ✅ |
+| Interactive puzzles (minigames + door locks) | the debug subsystem does **not** touch two families of puzzle: `BPC_MiniGameBase_C` minigames (dials/grids, tri-way electric lockpick `MiniGame_TriWay_C`) completed via `MiniGame_SetComplete`/`SetGameComplete`, and `BP_LockComponent_C` door locks (the CodeLock button grid, ColorsLockPick, CoinLock, UniversalLock) opened via `Unlock()`. Both are handled by one worker-thread routine driven from a `kPuzzleTargets` table: it resolves each component UClass (`Cls_MiniGameBase` / `Cls_LockComponent`) and walks its `Children` list for the functions by short name (the BP packages mount under `/Game/...`, so a `Function Pkg.Class.Fn` full-name needle never matches - `FindFunctionInClass` sidesteps the path), then a single IsA-sweep of GObjects enqueues live, non-template, not-already-done instances; the world pump fires `ProcessEvent` on the queue on the game thread, with a zeroed parameter frame and after re-checking each object's identity. Driven continuously by the *Instant puzzle resolve* toggle and one-shot by the *Solve* button (which also dumps live puzzle-class candidates on a miss). **Discovery is worker-thread only** so the Present hook never stalls | ✅ |
 
 Fly blocks normal game movement input while active, but leaves look input alone,
 so mouse look still drives the camera and the menu's own free-fly movement reads
@@ -344,8 +348,19 @@ violations. Layered defenses:
 - This is what makes injecting at the **loading screen / menu** safe - if the renderer
   or object graph isn't ready, we skip our frame instead of taking the game down.
 
-**Eject** with **END** after closing Nora and disabling fly/noclip. Cleanup is
-queued on the verified game thread; an unsafe or unavailable cleanup defers eject.
+- **Eject quiesces before it frees anything.** Every detour, the window procedure
+  and our worker threads hold a `G::HookScope`. `DX12Hook::Quiesce` disables every
+  MinHook detour, unhooks the window procedure and waits until `G::hooksInFlight`
+  has read 0 for 100 ms. On a timeout (5 s), or when another overlay subclassed the
+  window after us, nothing is freed and the DLL stays loaded but inert.
+- **ImGui input is locked.** The window procedure (game thread) appends to ImGui's
+  input queue and `NewFrame` (render thread) drains it; both hold
+  `WndProcHook::InputMutex`.
+
+**Eject** with **END** (the dedicated key, with the game window focused) after
+closing Nora. The first press switches fly/noclip off if needed; press again once
+movement is restored. Cleanup is queued on the verified game thread; an unsafe or
+unavailable cleanup defers eject.
 
 
 ## September 2026 official-build investigation
@@ -506,3 +521,114 @@ Blueprint VM calls are intercepted. The current process also lacks the loaded
 selector Blueprint. No arbitrary mission-free campaign transition is implemented.
 The desktop is locked and the current game is in MainMenuScene. Latest source
 build is in bin, not injected into PID 22048; runtime acceptance is pending.
+
+
+### September 26 continuation: crash fixes, companion policy and quality of life
+
+Made without access to the game. The sources pass a clang syntax check against
+MinGW headers; the existing MSVC-only `createHook` function-pointer conversion in
+`dx12_hook.cpp` is the only error that check reports. The MSVC Release build and
+every in-game behaviour below still need testing. `bodyguard_policy_tests` now has
+47 checks and passes, built with g++ on Linux against a stub `Windows.h`, also
+under AddressSanitizer and UndefinedBehaviorSanitizer. It has still not run on
+Windows.
+
+Threading. These moved from the Present hook to the game thread:
+
+| Work | Now runs from |
+|---|---|
+| Infinite ammo tick, restores on disable | world pump (`TickInfiniteAmmo`) |
+| Puzzle completions, instant-puzzle flag | world pump (`DrainPuzzleCompletions`, `UpdateInstantPuzzleResolveToggle`) |
+| Global time dilation (bullet time and plain) | world pump (`ApplyTimeDilation`, single owner) |
+| Player scale | world pump (`ApplyPlayerScale`) |
+| Refill ammo now, Max weapon upgrades | `QueueGameAction` |
+| Unlock lock, win QTE, skip objective, complete quests, solve puzzle | `QueueGameAction` (`QueueDebugCall`) |
+
+The world pump is scheduled by the render tick one bounded task at a time, like
+the AI and visual pumps, and keeps running while any of those features still owns
+state it has to put back. Only the player's `CustomTimeDilation` field write stays
+on the render thread. `QueueGameThread` reports a dropped task, and the AI, visual,
+world and fly pumps clear their in-flight flags when that happens.
+
+Other crash fixes:
+- Puzzle completions call their UFunctions with a zeroed frame sized from
+  `UStruct::PropertiesSize`, not `nullptr`, after re-checking the object's
+  `InternalIndex` and class recorded by the worker.
+- Death tombstones store `InternalIndex` and `FName`; an address now holding a
+  different object is not treated as dead. Companions are never tombstoned.
+- The death tracker memoises name-based death detection per UFunction, runs only
+  while companions, Hook mode, fight-each-other or a horde run is active, and only
+  on the game thread. The stale-target filter also runs on the game thread only,
+  the Twin death-pipeline lookup probes at most once a second, and the
+  fight-staging and action-container hooks remember a refusal instead of
+  rescanning on every dispatch.
+- Ammo restores skip an inventory, weapon or barrel that is no longer live.
+  `AiDeleteActor` pins `InternalIndex` before queueing `K2_DestroyActor`.
+- `Log::Write` ignores re-entry on the same thread.
+
+Companion policy (`src/features/bodyguards.cpp`). `Bodyguards::UpdateAll` runs one
+pass per AI pump for all regular companions, engaged ones first. For each
+companion:
+1. If its raw target (`CachedTargetEnemy`) or its blackboard `TargetEnemy` is the
+   player or a protected unit, combat is cleared first.
+2. Allegiance is re-checked every 750 ms; an unconfirmed companion neither fights
+   nor follows.
+3. Only Follow + defend and Follow + attack may fight. Each threat qualifies by
+   the first matching rule: explicit order (inside the leash), attacks the player
+   or attacks a companion (the nearer of enemy-to-player and enemy-to-companion
+   inside the defend radius), continue the current fight (inside the leash),
+   passive enemies never, hunt (Follow + attack, hostile, inside the defend
+   radius), intercept (its target, blackboard target or `LastSensedCharacter` is
+   you or a companion, hostile, within the intercept radius of you).
+4. Scores: explicit -6000, attacks player -5000, continue -4000, attacks
+   companion -3000, intercept -2000, hunt -1000, plus the distance to the player
+   in metres, plus 12 per companion already assigned to that enemy, minus 15 for
+   the current target. The lowest wins, so attackers are shared out without
+   dropping ongoing fights.
+5. With no target: Hold stops movement, every other order follows.
+
+"Attacks the player" reads the blackboard through the controller's
+`TargetEnemy` key-name field and `UBlackboardComponent.GetValueAsObject`, after
+checking `IsA(AHAIController)` and `ControllerBlackboardReady`. Hostility is
+`AIUtils.AreFriendlyCharacters(ai, player, CountNeutralAsFriendly=true)` negated,
+with a team-id comparison as fallback, cached per actor for 2 s. Settings are
+`Bodyguards::Configure`d every pass from `aiDefendRadiusM` (5 to 100),
+`aiInterceptRadiusM` (0 to defend) and `aiLeashRadiusM` (defend to 150).
+`InjectAttack` re-kicks a squad member's aggressive state every 5 s instead of
+every 1.5 s, which restarted attack and ability montages.
+
+Follow (`DriveSquadVelocityGameThread`): each regular companion stops at
+max(follow distance, capsule radius + 0.9 m) plus 0.6 m for every second and
+third slot. The capsule radius is read by reflection (`CapsuleComponent`,
+`CapsuleRadius`) and memoised per class. The follow-location speed is 400, 650 or
+900 depending on the gap; for a sprint `MaxWalkSpeed` is raised to 900 and put back
+once caught up. The squad prune drops dead companions (`bIsDead` or zero health),
+restores their vitals and erases their per-actor state.
+
+Commands: `AiAttackAimTarget` (the cached enemy nearest the screen centre within
+12 degrees and 150 m, companions and corpses excluded), `AiDispatchAttack`
+(crosshair target first, then each companion's nearest combat-capable enemy),
+`AiRegroup` (recall, then `K2_TeleportTo` beside the player for companions past
+20 m), `AiToggleHoldAll`, `AiHealCompanions`, `AiOrderCompanion`. World AI
+operations (kill, passive, launch, freeze) skip `IsProtectedUnit`, and
+`AiDispatchKill` acts on the explicit selection only. Harness `squad_order` accepts
+3 (Follow + attack).
+
+Quality of life:
+- Hotkeys: `WndProcHook` reports `WM_KEYDOWN` (not auto-repeat) to
+  `Features::NoteHotkey`, which records a bit while the menu is closed and the SDK
+  is ready; `ProcessHotkeys` runs the action on the next render tick, exactly like
+  the menu control. Keys are never swallowed.
+- Eject: the window procedure sets `G::ejectRequested` for `VK_END` with the
+  extended-key bit (so not numpad 1 with NumLock off) unless an ImGui text field
+  has focus. Before the window procedure is installed, the main thread falls back
+  to `GetAsyncKeyState`, only while a window of the game process is in front.
+- Notices: `Features::Notify` (any thread) keeps one message for 2.5 s; the overlay
+  draws it at the top of the screen and stays active while a notice is up.
+- Settings: `Features::LoadSettings` runs before any hook is installed.
+  `SaveSettingsIfChanged` runs on the worker every 2 s and once after the hooks
+  are quiesced on eject. It writes `AtomicHeartMenu_settings.json` beside the game
+  exe through a `.tmp` file and `MoveFileExA`. Every value is clamped to its menu
+  control's range on load. Cheat toggles are never stored.
+- `Features::TurnOffAllCheats` clears every cheat toggle; each feature then
+  restores its state through its normal disable path.

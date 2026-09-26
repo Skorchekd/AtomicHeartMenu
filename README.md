@@ -118,15 +118,19 @@ src/
   hooks/
     dx12_hook.{h,cpp}  DX12 Present / ResizeBuffers / ExecuteCommandLists hooks (MinHook)
                        + ImGui DX12 backend, RTV/SRV heaps, command-queue capture
-    wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggles menu
+    wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggles menu,
+                          numpad hotkeys and the END eject key
   menu/
     menu.{h,cpp}       The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Debug tabs)
   features/
     features.{h,cpp}   Per-frame cheat application (godmode, fly, speed, teleport...)
+    bodyguards.{h,cpp} Companion policy: who each companion fights, orders, status
   sdk/
     ue4.{h,cpp}        Minimal UE4 SDK: FName/UObject/GObjects/GWorld + ProcessEvent
     scanner.{h,cpp}    AOB / signature scanner for resolving engine globals
     offsets.h          *** ALL build-specific offsets & signatures live here ***
+tests/
+    bodyguard_policy_tests.cpp  Fake-engine checks for the companion policy
 tools/
     injector.cpp       Minimal LoadLibrary injector -> bin\injector.exe
     find_globals.py    Recover GObjects/GNames/GWorld from the exe after a patch
@@ -134,7 +138,12 @@ deps/
     imgui/  minhook/   Vendored dependencies (already cloned)
 ```
 
-**Controls:** `INSERT` opens/closes the menu. `END` ejects the DLL cleanly.
+**Controls:** `INSERT` (or `F7`) opens/closes the menu. `END` restores everything
+and ejects the DLL cleanly. Only the dedicated End key counts, and only while the
+game window has focus: numpad 1 with NumLock off, End pressed in another program
+and End inside a menu text field no longer eject. If Fly or Noclip is on, the first
+END switches it off so movement can be restored, and a second press ejects. With
+NumLock on, the numpad hotkeys (listed under **Tools**) work while the menu is closed.
 With **Fly** or **Noclip** enabled and the menu closed, movement is Minecraft-style
 free-fly: `W/A/S/D` move relative to camera yaw, `SPACE` goes up, and `SHIFT` goes
 down. **Noclip** additionally turns the player's collision off so you pass straight
@@ -263,33 +272,60 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   hardcoded list, so a patch or a DLC purchase moves the set on its own. The
   Kalash rifle is listed as **Kalash Rifle / AK-47**
   (`DA_Item_AK47`)
-- **AI / Squad tab** - full control over the AI (the headline feature):
-  - **AI control roster** - a live list of nearby AI. **Tick** units to select them
-    (selected + squad units get an in-world **glow box + arrow overhead**), then
-    **Recruit sel.** / **Recruit all nearby** to add them to your **squad**, or
-    **Attack >** / **Kill sel.** to dispatch them. Recruiting is now **explicit** - the
-    old "bodyguard mode / follow me" auto-recruit toggles are gone, replaced by this
-    managed roster.
-  - **Squad** members **walk-follow** you and fight your threats. Follow now layers
-    the game's AHAI blackboard escort keys, a guarded SDK `AIController.MoveToActor`
-    fallback with a stop radius, and a small `Pawn.AddMovementInput` nudge for quest
-    NPCs whose BT only turns to face you. They no longer teleport by default - enable
-    **Allow teleport leash** if you want a far/stuck member to snap to you.
-    **Invincible squad** (on by default) keeps them alive.
-  - **Spawn** - **Model dropdown** lists the **live loaded enemy/boss types** (incl.
-    the Twins when loaded); **Clone nearest** copies what you stand by. Spawns are
-    **streamed** (one ~every 300 ms) so a squad never freezes the game.
-  - **Saved characters** - **Save** records a type; **Spawn** brings it back **anywhere,
-    with no proximity needed** - the class is **loaded on demand** (the old version
-    needed you near the NPC and did a 6-second scan that froze the game). Same-session
-    respawns are instant.
-  - **Release selected / Stand down squad** turn units back into **normal, killable
-    enemies** (forced Hostile to you through the engine - fixes "stuck invincible").
-  - **Zone respawn** - **Snapshot zone** records the current enemies; **Respawn zone**
-    brings that whole set back. Plus **Enemies fight each other**, **Freeze nearby**,
-    **KILL ALL** / **LAUNCH ALL**.
+- **AI / Squad tab** - companions that follow you and fight for you:
+  - **Spawn** a companion from the model dropdown (the live loaded enemy and boss
+    types) or **Recruit nearby AI** into the squad. Spawns are streamed (one about
+    every 300 ms) so a squad never freezes the game. **More models and saved
+    characters** searches every loaded type and brings saved ones back.
+  - **Orders** apply to the selected companions, or to all of them when none are
+    selected: **Follow + defend** (the default), **Follow + attack**, **Follow
+    only** and **Hold position**. Every companion row also has its own order box.
+  - **Commands**: **Regroup** (everyone follows again; companions more than 20 m
+    away are brought beside you), **Attack my target** (the enemy under your
+    crosshair), **Attack nearest**, **Hold / follow** for the whole squad and
+    **Heal all**.
+  - **Companion table**: health bar, order, what each companion is doing and at
+    whom, distance, and a **Remove** button. A companion the game does not report
+    as friendly yet is marked and stays out of fights until it is. With **Enemy
+    ESP** on, companions get a green highlight box and arrow, selected units a cyan
+    one.
+  - **How companions defend you**: one squad-wide pass picks targets in this order:
+    an explicit order, anything attacking you, the current fight, anything
+    attacking a companion, hostile enemies that have spotted you inside the
+    **intercept radius**, and (Follow + attack only) hostiles inside the **defend
+    radius**. Attackers are shared out, so several companions do not chase one
+    enemy while another one hits you, and a fight is dropped once the enemy is past
+    the **leash**. Companions fight with their own weapons and abilities. They
+    never target you or each other: a companion whose target, or whose own
+    blackboard target, is you or another companion has its combat cleared at once.
+    Hostility is taken from the game, so civilians and neutral NPCs are left alone.
+  - **Keep companions alive** (on by default) sets their incoming-damage
+    multiplier to 0 and keeps them at full health; **Companion damage** scales
+    what they deal (x3 by default). Both are restored when a companion is released
+    or removed.
+  - **Follow** stops outside each companion's own body, settles the squad around
+    you in layers, and runs or sprints to catch up. Companions walk to you; turn on
+    **Recover stuck companions by teleporting** to let a stuck one snap to you.
+  - **Release selected / Release all** turn companions back into normal, killable
+    enemies with their original AI, faction and damage values.
+  - **World AI controls**: **Freeze nearby enemies**, **Enemies fight each other**,
+    **Kill selected**, **Kill nearby enemies** and zone **Snapshot / Respawn**.
+    World commands never affect your companions, and **Kill selected** does
+    nothing while nothing is selected.
   - (Giving guns to the squad is not wired - that needs AI weapon-loadout functions
     that aren't verified yet.)
+- **Quality of life**:
+  - **Numpad hotkeys** (NumLock on, menu closed): Num 1 god mode, Num 2 fly,
+    Num 3 noclip, Num 4 regroup companions, Num 5 companions attack your target,
+    Num 6 companions hold / follow, Num 7 infinite ammo, Num 8 one-hit kill,
+    Num 9 heal and refill ammo, Num 0 enemy ESP. The keys still reach the game.
+    **Tools** lists them and can switch them off.
+  - **On-screen notices** confirm hotkeys and companion commands, also while the
+    menu is closed.
+  - **Saved preferences**: sliders, colours, the ESP layout, companion settings,
+    hotkeys and text size are kept in `AtomicHeartMenu_settings.json` beside the
+    game exe. Cheat toggles are never saved, so every session starts with them off.
+  - **Tools → Turn off all cheats** unticks every cheat at once.
 - **Visuals → RGB gun** - rainbow/recolor your equipped weapon via its mesh material
   parameters (same engine path as chams; no GPU pipeline hook).
 - **Debug → Dump nearby volumes** - stand where the game teleports you (e.g. the
@@ -367,8 +403,8 @@ you can trigger from here once the SDK resolves.
   write. Symptoms are subtle rather than loud: the camera desynchronising from the
   character mesh for a frame, or a call like `SetMovementMode` returning having done
   nothing. Marshal that work to the game thread with `QueueGameThread`, which drains
-  inside the `ProcessEvent` hook, the way fly, the teleports, the weapon grants and
-  the AI features do. When it goes wrong it does not always go wrong loudly: an
+  inside the `ProcessEvent` hook, the way fly, the teleports, the weapon grants,
+  the AI features, infinite ammo, puzzles, time dilation and player scale do. When it goes wrong it does not always go wrong loudly: an
   access violation raised inside engine code unwinds back out through engine frames
   that were never written to be unwound, so whatever they held is never released and
   the symptom is a hang rather than a crash. `catch (...)` around a call into game
@@ -408,8 +444,9 @@ in-game acceptance testing is still in progress. This is not a validated release
   exposes the game's open-world continuation, which requires an eligible save.
   Hiding the tracked objective only changes its display; campaign scripts continue.
 - END eject restores portable Nora, price data and the tracked objective on the
-  game thread. Close Nora and disable fly/noclip first. Logging stays in the file
-  without opening a console over the game.
+  game thread. Close Nora first; fly/noclip are switched off by the first END
+  press and a second press ejects. Logging stays in the file without opening a
+  console over the game.
 - Agent tests page provides an opt-in local agent harness with session-scoped commands,
   observed positions, movement mode, ally targets, Nora state and sampled prices.
   A dispatched command is not a passed test. See `PROJECT_AND_SDK.md` for protocol.
@@ -445,3 +482,37 @@ world control requires an eligible post-game save; it is not a mission-free sand
 Policy test compilation succeeds, but Windows ASR currently blocks execution.
 See the September 12 continuation in `PROJECT_AND_SDK.md` for exact evidence and
 pending checks. This is not a validated release.
+
+
+## September 26 update: crash fixes, companions and quality of life
+
+Made without access to the game. The sources pass a clang syntax check against
+MinGW headers (an MSVC Release build still has to be run), and the companion
+policy passes its 47 fake-engine checks, also under AddressSanitizer and
+UndefinedBehaviorSanitizer. Everything below still needs in-game testing.
+
+Crash fixes:
+- Eject waits until no thread is inside one of our hooks before anything is freed.
+  If that does not happen within 5 s, or another overlay still chains through our
+  window procedure, the DLL stays loaded but inert instead of unloading under a
+  live call.
+- The window procedure (game thread) and the overlay (render thread) no longer
+  touch ImGui's input queue at the same time.
+- Infinite ammo, Refill ammo, Max weapon upgrades, puzzle completion, the unlock,
+  QTE and objective buttons, time dilation and player scale now run on the game
+  thread instead of inside the Present hook.
+- Puzzle completions pass a real parameter frame instead of a null pointer.
+- Ammo restores, actor deletion and the AI death tracker check that an object is
+  still the same live object, because a destroyed actor's memory is reused by the
+  next spawn.
+- The AI death tracker no longer builds an object name for every ProcessEvent (a
+  stutter source) and only runs while an AI feature is active.
+- A dropped game-thread task can no longer stop a feature pump for the rest of the
+  session.
+
+Companions: see the AI / Squad tab above. They defend you first, share attackers
+out, never target you or each other, cannot die while Keep companions alive is on,
+keep up with you, and are left alone by world commands.
+
+Quality of life: the companion panel, numpad hotkeys, on-screen notices, saved
+preferences, Turn off all cheats, and the END key fixes described under Controls.
