@@ -311,20 +311,56 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   - **World AI controls**: **Freeze nearby enemies**, **Enemies fight each other**,
     **Kill selected**, **Kill nearby enemies** and zone **Snapshot / Respawn**.
     World commands never affect your companions, and **Kill selected** does
-    nothing while nothing is selected.
+    nothing while nothing is selected. Kills use the game's own death, and a kill
+    that does not take is retried and then undone, so a robot is never left alive
+    at 0 HP. The fight's second side is checked with the game so both sides stay
+    hostile to you, and switching the fight or the freeze off gives every robot it
+    touched its own team, behaviour and speed back.
+  - **Repair bugged AI** checks every loaded robot, including ones missing from
+    the lists: a robot stuck alive at 0 HP gets its health back so it can be
+    killed normally, and teams, freezes and damage immunity left behind by the mod
+    are undone. The panel warns when it sees robots stuck at 0 HP.
   - (Giving guns to the squad is not wired - that needs AI weapon-loadout functions
     that aren't verified yet.)
+- **Play as** (experimental) - take control of a robot, a boss or a companion
+  and play as it: its body, its movement and its own attacks and abilities. Aim
+  at it and press **Num .**, or pick it from the list on the **Play as** page.
+  WASD moves, the mouse looks, Space jumps (fliers climb), Ctrl descends, Shift
+  sprints; the left and right mouse buttons and keys 1-9 fire its abilities at
+  whatever is under the crosshair. Third-person camera distance and height, look
+  sensitivity and invert are adjustable. Your own character waits where you left
+  it, invulnerable, and the game does not save until you are back (**Num .** or
+  **Return**). Play ends by itself if the character dies. Some abilities only
+  work while the character's own AI is in charge.
+- **Sandbox** (World page) - load any of the game's maps straight from its own
+  map list, with no save involved. **Read the map list**, filter, pick a map and
+  load it; **Load by name** takes a typed map path when the list cannot be read.
+  From the load until you are back at the title menu the game's saves are
+  blocked, so neither the sandbox nor anything the game moves on to from it can
+  overwrite your campaign; eject waits for the title menu too. **Give all
+  weapons** and **Unlock all skills** are at hand. Some maps expect the story to
+  set them up and may start empty. The game's own free roam (stage selector and
+  open-world continuation, which need a finished-campaign save) is still under a
+  collapsed header.
+- **Player → Repair** - **Repair player state** clears stuck input blocks, a
+  leftover flying movement mode, disabled collision, a stuck time dilation, a
+  false "dead" flag and damage multipliers no cheat owns, without touching cheats
+  that are on. **Rebind controls** also re-possesses your character the way a
+  respawn does, rebuilding its input bindings: try it when an ability such as
+  Shok stops responding while walking still works.
 - **Quality of life**:
   - **Numpad hotkeys** (NumLock on, menu closed): Num 1 god mode, Num 2 fly,
     Num 3 noclip, Num 4 regroup companions, Num 5 companions attack your target,
     Num 6 companions hold / follow, Num 7 infinite ammo, Num 8 one-hit kill,
-    Num 9 heal and refill ammo, Num 0 enemy ESP. The keys still reach the game.
+    Num 9 heal and refill ammo, Num 0 enemy ESP, Num . play as the character
+    under the crosshair (again to return). The keys still reach the game.
     **Tools** lists them and can switch them off.
   - **On-screen notices** confirm hotkeys and companion commands, also while the
     menu is closed.
   - **Saved preferences**: sliders, colours, the ESP layout, companion settings,
-    hotkeys and text size are kept in `AtomicHeartMenu_settings.json` beside the
-    game exe. Cheat toggles are never saved, so every session starts with them off.
+    play-as camera and handling, hotkeys and text size are kept in
+    `AtomicHeartMenu_settings.json` beside the game exe. Cheat toggles are never
+    saved, so every session starts with them off.
   - **Tools → Turn off all cheats** unticks every cheat at once.
 - **Visuals → RGB gun** - rainbow/recolor your equipped weapon via its mesh material
   parameters (same engine path as chams; no GPU pipeline hook).
@@ -516,3 +552,38 @@ keep up with you, and are left alone by world commands.
 
 Quality of life: the companion panel, numpad hotkeys, on-screen notices, saved
 preferences, Turn off all cheats, and the END key fixes described under Controls.
+
+
+## September 26 update, part 2: robots that bug out, Shok, play as and a real sandbox
+
+Also made without access to the game: the sources pass the same clang check and
+the 47 policy checks pass (also under AddressSanitizer and
+UndefinedBehaviorSanitizer). All of it needs in-game testing.
+
+Robots that bugged out (fought on, did not show in the AI list or Kill all, could
+not be killed or controlled) came from the mod itself. These fixes are described
+under the AI / Squad tab above.
+- The kill wrote 0 health instead of letting the game run its death, which could
+  leave a robot alive at 0 HP. The AI list skips 0-HP actors, so it disappeared
+  from every list.
+- Enemies fight each other moved robots to a team that was never checked. It may
+  be neutral to you, which makes robots immune to your weapons and Shok. Their
+  team and aggression were also never put back afterwards.
+- A companion dropped from the squad while alive stayed on your team, and a
+  release could be swallowed while the robot was still a squad member.
+- The freeze thawed only robots still near you.
+
+Every team, behaviour flag and freeze the mod changes is now recorded and put
+back, by the feature that owns it or by a safety sweep every 2 s. **Repair bugged
+AI** fixes robots left over from earlier sessions. Eject returns every robot to
+the way the game had it and removes the companions the mod spawned.
+
+Shok: no part of the mod blocks game input or swallows keys. The fight-team fix
+above removes the most likely cause. **Player → Repair player state** and
+**Rebind controls** clear the rest. If it started after **Unlock all skills**,
+check the equipped abilities in Nora.
+
+The sandbox replaces the save-dependent route (stage selector and open-world
+continuation), which needs a finished-campaign save and did not work without one.
+Play as and the sandbox are experimental. See the September 26 part 2 notes in
+`PROJECT_AND_SDK.md` for the details and the calls still to confirm in the game.

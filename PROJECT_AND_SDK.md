@@ -63,8 +63,11 @@ AtomicHeartMenu/
 │   ├── features/features.{h,cpp}  Per-frame cheat logic (god mode, fly, one-hit, …)
 │   ├── features/bodyguards.{h,cpp}  Companion policy (targets, orders); engine calls go
 │   │                             through BodyguardEngine, so tests can fake them
+│   ├── features/possession.{h,cpp}  Play as: possess a character, drive it, fire its abilities
+│   ├── features/sandbox.{h,cpp}  Sandbox: the game's map list and a save-free level load
 │   └── sdk/                  *Minimal* hand-written UE4 runtime SDK (see §4)
 │       ├── ue4.{h,cpp}       FName/UObject/GObjects/GWorld + ProcessEvent + lookups
+│       ├── reflect_call.h    RefCall::Call - UFunction calls laid out from the game's reflection
 │       ├── scanner.{h,cpp}   AOB scanner - the fallback when the static RVAs fail
 │       └── offsets.h         *** ALL build-specific offsets live here ***
 │
@@ -632,3 +635,162 @@ Quality of life:
   control's range on load. Cheat toggles are never stored.
 - `Features::TurnOffAllCheats` clears every cheat toggle; each feature then
   restores its state through its normal disable path.
+
+### September 26 continuation, part 2: AI integrity, play as and a save-free sandbox
+
+Also made without access to the game. The same clang check passes on every source
+(the only errors are still the three MSVC-only `createHook` conversions in
+`dx12_hook.cpp`), and the 47 policy checks pass, also under AddressSanitizer and
+UndefinedBehaviorSanitizer. Nothing below has run in the game yet.
+
+**Invincible robots missing from every list.** Several mod paths could leave a
+robot in a state nothing owned any more:
+
+| Cause | What it left behind | Fix |
+|---|---|---|
+| The kill wrote `Health = 0` before `Suicide` | Death is an event pipeline (death event, `K2_OnDeath`, the death ability); a raw write fires none of it. When `Suicide` did not finish the job the robot stayed alive at 0 HP. The AI cache drops 0-health actors, so it vanished from the list and from Kill all, took no damage and kept fighting | Kills go through `Suicide` only (`ApplyAiKill`). `VerifyPendingKills` re-checks each kill after 3 s, tries `Suicide` once more, and 3 s later gives a robot that still will not die its health back and clears its tombstone, so it stays listed and killable. The horde's non-destroy path uses the same kill |
+| Fight each other moved half the robots to team 231, unchecked | A team the game counts as neutral or friendly makes robots immune to your weapons and Shok. Neither the team nor the aggression flags were restored when the brawl ended | `ResolveFightTeamB` asks the game (`AIUtils.AreFriendlyCharacters`) on one brawler, trying 231, 1 to 16 and 0, skipping group A's team, yours and 255, and keeps the first candidate hostile to both group A and you. The brawler's own team is written straight back. No qualifying team means the robots are not split. Every robot the brawl drives is recorded in `g_fightParticipants` with a timestamp |
+| Aggression flags written with no record | Robots latched "always aggressive" or passive for good | `RememberAggroFlags` records `bIsPassive`, `bPassiveButWithSenses` and `bIsAlwaysAggressive` before the first write; release and stand-down put them back |
+| Freeze thawed only robots still inside its radius | A robot you walked away from stayed frozen, and one killed while frozen could never play its death out | `g_frozenAi` records every frozen robot; switching the freeze off thaws all of them, and a robot being killed is thawed first and never re-frozen |
+| The squad prune dropped a member that was still alive without restoring it | A robot on your team, unlisted and immune to your weapons | Members dropped alive are released (Hook roster too) after `g_squadMutex` is let go; dead ones get their own team and flags back, so a revived robot is an ordinary enemy |
+| Release ran while the robot was still a squad member | The ownership lock swallowed the switch back to its faction | `SquadRemove` now runs before `ApplyAiRelease` everywhere (Release selected, Release all, the Hook roster, the queued release) |
+| Kill selected on a companion | Incoming damage multiplier 0, so the kill never took, and the robot stayed friendly | The companion is released first, then killed |
+| The companion damage boost was never captured | Outgoing damage stayed boosted after a robot left the squad | `SetCharacterInstigatedDamage` captures the original the way the vitals do |
+
+The safety net is the **AI state ledger**: `g_origTeam`, `g_origAggro`, `g_frozenAi`
+and `g_fightParticipants`. `RestoreOrphanedAiState` runs every 2 s in the AI pump.
+It restores every entry that no feature owns any more: not a companion, a Hook
+guard or the character being played; not in the running horde; and not a brawler
+while the brawl is on or drove it in the last 120 s. The pump keeps running until
+the ledger and the pending kills are empty. Health-span checks in
+`SetCharacterHealthFull`, `ReadCharacterHealth` and `FullHeal` now cover `Health`
+(0x48), which sits after `MaxHealth` (0x38).
+
+**Repair bugged AI** (`Features::AiRepairAnomalies`). The worker sweeps GObjects
+for every live `AHAICharacter` (CDOs and templates skipped, capped like Deep kill),
+so it reaches robots the AI cache misses. On the game thread,
+`RepairAiAnomaliesGameThread` does the following for each robot:
+- A robot alive at 0 HP gets full health and loses its tombstone.
+- Companions, the horde and active brawlers are skipped from here on.
+- A ledger team is restored. A robot still on a fight team (231, or one resolved
+  earlier) with no record, for example from an older build or session, is switched
+  hostile to you.
+- A robot left at the freeze's exact 0.0001 time dilation is thawed while the
+  freeze is off.
+- A robot the game reports as hostile but with an incoming damage multiplier of 0
+  gets 1 back.
+
+`RefreshAiActors` counts 0-HP robots that are still possessed, and the menu shows
+that count above the button.
+
+**Eject.** Once the Workbench cleanup has succeeded, the eject lambda runs
+`Possession::CleanupGameThread` and then `AiCleanupForUnload`:
+- Fight and freeze are switched off and a horde run is ended.
+- Companions the mod spawned (`g_modSpawned`, keyed by `InternalIndex`) are
+  destroyed with `K2_DestroyActor`, and recruited ones are released.
+- Brawlers stand down, every frozen robot is thawed, and whatever is left in the
+  ledger is restored.
+- Pending kills that left a 0-HP robot are healed.
+
+**Shok and other inputs.** The mod never raises the engine's ignore-input
+counters (`UpdateGameInputBlock` is a no-op) and never swallows a key; hotkeys only
+observe `WM_KEYDOWN`. No code path was found that blocks an ability. The likely
+causes were:
+- Robots moved to a neutral fight team, which Shok will not treat as a target.
+  This is fixed above.
+- Player state left behind by a cutscene, a dialogue or an interrupted feature.
+
+`Features::RepairPlayerState(rebindInput)` runs on the game thread and puts the
+player back to normal without fighting a switch that is still on:
+- `ResetIgnoreInputFlags` and `WidgetBlueprintLibrary.SetInputMode_GameOnly`.
+- Movement mode None or Flying becomes Falling, and collision is switched back
+  on, unless fly or noclip is on.
+- Time dilation goes back to 1 unless bullet time is on.
+- `bIsDead` is cleared when health is above 0.
+- The incoming damage multiplier is reset from 0 unless god mode is on. The
+  outgoing one is reset from above 50 or non-finite unless one-hit kill is on.
+
+With `rebindInput` the controller unpossesses and re-possesses the character, as a
+respawn does. That rebuilds its input component and its ability system's actor
+info. It refuses while playing as another character.
+
+**Save guard.** `hkProcessEvent` swallows `SaveProgress`, `SavePersistentData` and
+`CheckpointSaveProgress` while the horde (`g_blockSaves`) or any bit of
+`g_saveBlockOwners` is set. `Features::SetSaveBlock(owner, on)` takes
+`SaveBlockPlayAs` or `SaveBlockSandbox`. It has to be switched on from the game
+thread, because it resolves the save UFunctions; switching it off works from any
+thread.
+
+**Play as** (`src/features/possession.cpp`, experimental).
+- `BeginGameThread` records the player's body and the target's AI controller. It
+  then calls `PlayerController.Possess(target)` and checks `GetLocalPawn()`. If
+  the game refuses, the body is re-possessed and the AI controller put back.
+- While playing, `SaveBlockPlayAs` is held and the body's incoming damage
+  multiplier is held at 0. The target's is held at 0 too while Invulnerable is
+  ticked. Both originals are put back afterwards.
+- AI characters bind no player input, so `Possession::Tick` (render thread) reads
+  the keys with `GetAsyncKeyState`, only while the game window is in front and
+  the menu is closed. The window procedure adds raw `WM_INPUT` mouse deltas.
+- One `Drive` task is queued on the game thread at a time. It calls:
+  - `AddYawInput` and `AddPitchInput` with the mouse delta times 0.07 times the
+    sensitivity.
+  - `AddMovementInput` relative to the `GetControlRotation` yaw. Space adds up
+    and Ctrl adds down, for fliers.
+  - `Jump` and `StopJumping`.
+  - For sprint, `MaxWalkSpeed` is raised to max(1.8 times, 900) and restored.
+- The third-person camera is a `CameraComponent` added with `AddComponentByClass`
+  and placed every drive with `K2_SetWorldLocationAndRotation`. If the add is
+  refused once, the view stays first-person.
+- Abilities are the distinct classes in `AbilitySystemComponent.ActivatableAbilities.Items[i].Ability`.
+  The item stride comes from `GameplayAbilitySpec`'s reflected `PropertiesSize`.
+  They fire with `TryActivateAbilityByClass`. First the crosshair character
+  becomes the target (`SetTargetEnemy`, `CachedTargetEnemy`), and the body turns
+  to face it.
+- Play ends when the character dies or disappears, or the game moves the
+  controller elsewhere. The body is only re-possessed when the controller is
+  still on the target or on nothing. The character gets its old AI controller
+  back, or `SpawnDefaultController`.
+- `IsProtectedUnit` covers the played character, so world commands, brawls and
+  repairs leave it alone. The Num . hotkey toggles play.
+
+**Sandbox** (`src/features/sandbox.cpp`). This replaces the save-dependent
+free-roam route for players without a finished-campaign save.
+- `AssetRegistryHelpers.GetAssetRegistry` gives the registry, and
+  `GetAssetsByClass(World, bSearchSubClasses)` returns `FAssetData` (0x60 bytes,
+  read once). `/Engine/` and `/Script/` packages are dropped.
+- Names that look like persistent maps (`_P`, `persistent`, `_main`,
+  `openworld`, `mainmenu`) are sorted first. When that filter would hide
+  everything, all maps are shown.
+- A map loads with `GameplayStatics.OpenLevel(WorldContextObject, LevelName, bAbsolute = true)`,
+  using the registry's own `PackageName` FName.
+- Load by name converts typed text with `KismetStringLibrary.Conv_StringToName`.
+  The text must be ASCII letters, digits and `/ _ -`. Anything from a dot on is
+  dropped, because FURL would read a dot as a network host.
+- `SaveBlockSandbox` goes up before `OpenLevel` and stays up until the title
+  menu. The title menu is detected as `BP_MainMenuPlayerController_C`, spawned in
+  the running world.
+- `Sandbox::Tick` follows the world by pointer, `InternalIndex`, package name and
+  any non-live gap between them. The first world to arrive after a load becomes
+  the sandbox, even when a failed load fell back to the title menu. If a minute
+  passes with no world change, the request was dropped, and the block is lifted
+  unless it was already up.
+- A level the game moves on to, or a campaign save loaded from the sandbox's pause
+  menu, keeps the block and gets a notice.
+- Eject is refused while the block is up. Unticking the setting lifts it.
+
+**Calls the game has not confirmed yet.** Every call above goes through
+`RefCall::Call` (`src/sdk/reflect_call.h`). It resolves the UFunction on the
+receiver's class and lays each parameter out by name, at the offset and size the
+running game's reflection reports. It refuses, and logs "Reflected call
+unavailable", on any name or size mismatch, so a wrong guess is a logged no-op
+rather than a corrupt frame. These are the calls still to confirm on this build:
+- `AHAICharacter.Suicide` finishing every robot type.
+- The team candidates `AreFriendlyCharacters` accepts.
+- `Controller.Possess` on AI characters, and `AddComponentByClass` in a shipping
+  build.
+- Which abilities `TryActivateAbilityByClass` starts outside their own behaviour
+  tree.
+- The asset registry being present in the cooked build.
+- `OpenLevel` bringing up a playable pawn on a map entered cold.
+
+The first `AtomicHeartMenu.log` from a test run answers most of them.
