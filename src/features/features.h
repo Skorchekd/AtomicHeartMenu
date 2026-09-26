@@ -258,6 +258,10 @@ namespace Features
     // Returns a reference to an internal buffer (single-threaded render use).
     const std::vector<EspEntry>& BuildEspFrame(float screenW, float screenH);
     void FullHeal();          // top the player's health attribute now
+    // Input flags/mode, movement mode, collision, time dilation, death flag and
+    // unowned damage multipliers back to normal; rebindInput re-possesses the
+    // character to rebuild its input bindings (fixes abilities that stop responding).
+    void RepairPlayerState(bool rebindInput);
     void SavePosition();      // capture current pawn location
     void TeleportToSaved();   // move pawn to saved location
     void ReturnToFlyStart();  // recovery point captured when fly is enabled

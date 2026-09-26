@@ -18,6 +18,7 @@
 #include "test_harness.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
+#include "../sdk/reflect_call.h"
 #include "../sdk/scanner.h"
 #include "../core/globals.h"
 #include "../core/log.h"
@@ -15994,6 +15995,112 @@ void Features::FullHeal()
         }
     }
     catch (...) { LOG("FullHeal: exception (ignored)"); }
+}
+
+// ---- player repair ------------------------------------------------------------
+// Puts the player back into a normal, controllable state without fighting any
+// switch that is still on: input flags and mode, movement mode, collision, time
+// dilation, the death flag, and damage multipliers no feature owns. With
+// `rebindInput` the character is also unpossessed and possessed again, which is
+// what a respawn does: it rebuilds the character's input bindings and its ability
+// system's actor info (a lost binding leaves an ability such as Shok dead while
+// walking still works).
+void Features::RepairPlayerState(bool rebindInput)
+{
+    if (!G::sdkReady.load()) return;
+    if (Possession::IsActive())
+    {
+        Notify("Repair: return to your own character first (Play as > Return)");
+        return;
+    }
+    if (!QueueGameAction([rebindInput]()
+    {
+        try
+        {
+            UObject* pc = GetPlayerController();
+            UObject* pawn = GetLocalPawn();
+            if (!IsLiveObject(pc) || !IsLiveObject(pawn) || !PlayerCharacterUsable(pawn))
+            {
+                Notify("Repair: no player character in control");
+                return;
+            }
+            const auto& st = Get();
+            int fixes = 0;
+            if (RefCall::CallNoArgs(pc, "ResetIgnoreInputFlags")) ++fixes;
+            if (UObject* widgets = FindObjectFast("WidgetBlueprintLibrary /Script/UMG.Default__WidgetBlueprintLibrary"))
+            {
+                RefCall::Call gameOnly(widgets, "SetInputMode_GameOnly");
+                gameOnly.Set("PlayerController", pc);
+                if (gameOnly.Run()) ++fixes;
+            }
+            if (!st.flyHack && !st.noclip)
+            {
+                // Left flying (or in no mode) by an interrupted fly: fall, and land walking.
+                if (uint8_t* mv = GetCharacterMovementPtr(pawn))
+                {
+                    UObject* movement = reinterpret_cast<UObject*>(mv);
+                    int modeOffset = Reflect::FindPropertyOffset(movement, "MovementMode");
+                    uint8_t mode = 0;
+                    if (RefCall::ReadAt(mv, modeOffset, mode) && (mode == 0 /*None*/ || mode == 5 /*Flying*/))
+                    {
+                        RefCall::Call fall(movement, "SetMovementMode");
+                        fall.Set("NewMovementMode", static_cast<uint8_t>(3 /*Falling*/));
+                        if (fall.Run()) ++fixes;
+                    }
+                }
+                if (SetActorCollisionEnabled(pawn, true)) ++fixes;
+            }
+            if (!st.bulletTime && SetActorTimeDilation(pawn, 1.0f)) ++fixes;
+            uint8_t* base = reinterpret_cast<uint8_t*>(pawn);
+            float cur = 0.0f, mx = 0.0f;
+            if (ReadCharacterHealth(pawn, cur, mx) && cur > 0.0f &&
+                Mem::IsReadable(base + AH::Char_bIsDead, 1) && *reinterpret_cast<bool*>(base + AH::Char_bIsDead))
+            {
+                *reinterpret_cast<bool*>(base + AH::Char_bIsDead) = false;
+                ++fixes;
+            }
+            if (Mem::IsReadable(base + AH::Char_AttributeSet, sizeof(void*)))
+            {
+                uint8_t* set = *reinterpret_cast<uint8_t**>(base + AH::Char_AttributeSet);
+                if (Mem::IsReadable(set, AH::Set_InstigatedDmgMult + AH::Attr_CurrentValue + sizeof(float)))
+                {
+                    float* incoming = reinterpret_cast<float*>(set + AH::Set_IncomingDamageMult + AH::Attr_CurrentValue);
+                    float* instigated = reinterpret_cast<float*>(set + AH::Set_InstigatedDmgMult + AH::Attr_CurrentValue);
+                    if (!st.godMode && !(*incoming > 0.0f))
+                    {
+                        *reinterpret_cast<float*>(set + AH::Set_IncomingDamageMult + AH::Attr_BaseValue) = 1.0f;
+                        *incoming = 1.0f;
+                        ++fixes;
+                    }
+                    if (!st.oneHitKill && (*instigated > 50.0f || !std::isfinite(*instigated)))
+                    {
+                        *reinterpret_cast<float*>(set + AH::Set_InstigatedDmgMult + AH::Attr_BaseValue) = 1.0f;
+                        *instigated = 1.0f;
+                        ++fixes;
+                    }
+                }
+            }
+            if (rebindInput)
+            {
+                RefCall::CallNoArgs(pc, "UnPossess");
+                RefCall::Call possess(pc, "Possess");
+                possess.Set("InPawn", pawn);
+                const bool back = possess.Run() && GetLocalPawn() == pawn;
+                if (!back)
+                {
+                    // One more attempt: the character must never be left without control.
+                    RefCall::Call again(pc, "Possess");
+                    again.Set("InPawn", pawn);
+                    again.Run();
+                }
+                LOG("RepairPlayerState: re-possessed the character (%s)", GetLocalPawn() == pawn ? "ok" : "FAILED");
+                ++fixes;
+            }
+            Notify("Player state repaired (%d fix(es))%s", fixes, rebindInput ? ", controls rebound" : "");
+        }
+        catch (...) { LOG("RepairPlayerState: exception (ignored)"); }
+    }))
+        Notify("Repair skipped: no game-thread pump yet");
 }
 
 void Features::SavePosition()

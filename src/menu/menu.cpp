@@ -1160,6 +1160,27 @@ void Menu::Render()
                 Features::FullHeal();
             }
 
+            ImGui::SeparatorText("Repair");
+            if (ImGui::Button("Repair player state"))
+            {
+                LOG("UI: repair player state");
+                Features::RepairPlayerState(false);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Clears stuck input blocks, a leftover flying movement mode, disabled collision,\n"
+                                  "a stuck time dilation, a false 'dead' flag and damage multipliers no cheat owns.\n"
+                                  "Cheats that are switched on stay on. Use it with no game menu open.");
+            ImGui::SameLine();
+            if (ImGui::Button("Rebind controls"))
+            {
+                LOG("UI: rebind controls");
+                Features::RepairPlayerState(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Everything above, then re-possesses your character, rebuilding its input\n"
+                                  "bindings the way a respawn does. Try this when an ability such as Shok stops\n"
+                                  "responding while walking still works.");
+
             ImGui::SeparatorText("Movement");
             LogCheckbox("Fly", &f.flyHack, "flyHack");
             LogCheckbox("Noclip (fly through walls)", &f.noclip, "noclip");
