@@ -5,6 +5,7 @@
 #include "workbench.h"
 #include "features.h"
 #include "../sdk/reflect.h"
+#include "../sdk/reflect_call.h"
 #include "../core/memory.h"
 #include "../core/globals.h"
 #include "../core/log.h"
@@ -25,6 +26,10 @@
 namespace
 {
     using namespace UE;
+    using RefCall::ObjectRef;
+    using RefCall::ReadAt;
+    using RefCall::Function;
+    using RefCall::Call;
     std::mutex statusMutex;
     Workbench::Status status;
     std::atomic<bool> tickPending{ false };
@@ -37,30 +42,6 @@ namespace
         LOG("Workbench: %s", text.c_str());
     }
 
-    // Index alone cannot distinguish an object recycled into the same slot.
-    // These references also verify the object's engine-assigned name.
-    struct ObjectRef
-    {
-        UObject* ptr = nullptr;
-        int index = -1;
-        FName name{};
-        ObjectRef() = default;
-        explicit ObjectRef(UObject* object)
-        {
-            if (IsLiveObject(object))
-            {
-                ptr = object;
-                index = object->Index();
-                name = *object->NamePtr();
-            }
-        }
-        UObject* Get() const
-        {
-            if (!IsLiveObject(ptr) || ptr->Index() != index) return nullptr;
-            FName current = *ptr->NamePtr();
-            return current.ComparisonIndex == name.ComparisonIndex && current.Number == name.Number ? ptr : nullptr;
-        }
-    };
     ObjectRef nora;
     ObjectRef noraWorld;
     ULONGLONG noraSpawnMs = 0;
@@ -75,69 +56,6 @@ namespace
     std::atomic<UObject*> stageReceiver{ nullptr };
     std::atomic<UFunction*> shippingQuery{ nullptr };
     std::atomic<int> shippingReturnOffset{ -1 };
-
-    template<typename T> bool ReadAt(const void* object, int offset, T& out)
-    {
-        if (!object || offset < 0) return false;
-        const auto* field = static_cast<const uint8_t*>(object) + offset;
-        if (!Mem::IsReadable(field, sizeof(T))) return false;
-        std::memcpy(&out, field, sizeof(T));
-        return true;
-    }
-
-    UFunction* Function(UObject* receiver, const char* name)
-    {
-        if (!IsLiveObject(receiver)) return nullptr;
-        UObject* cls = receiver->Class();
-        for (int depth = 0; depth < 64 && IsLiveObject(cls); ++depth)
-        {
-            if (auto* fn = FindFunctionInClass(cls, name))
-                return IsLiveObject(fn) ? fn : nullptr;
-            UObject* parent = nullptr;
-            if (!ReadAt(cls, Offsets::O_UStruct_SuperStruct, parent)) break;
-            cls = parent;
-        }
-        return nullptr;
-    }
-
-    // Allocate the runtime reflected frame, including Blueprint local storage.
-    // Parameters are resolved by name, so a shifted member is not a guessed write.
-    struct Call
-    {
-        UObject* receiver;
-        UFunction* fn;
-        std::vector<uint8_t> data;
-        bool valid = false;
-        Call(UObject* object, const char* name) : receiver(object), fn(Function(object, name))
-        {
-            int size = 0;
-            if (!fn || !ReadAt(fn, Offsets::O_UStruct_PropertiesSize, size) || size < 0 || size > 65536) return;
-            data.resize((std::max)(size, 1));
-            valid = true;
-        }
-        template<typename T> bool Set(const char* name, const T& value)
-        {
-            int off = -1, size = 0, dim = 0;
-            if (!valid || !Reflect::PropertyLayoutInStruct(fn, name, off, size, dim) ||
-                dim != 1 || size != sizeof(T) || size_t(off) + sizeof(T) > data.size())
-            { valid = false; return false; }
-            std::memcpy(data.data() + off, &value, sizeof(T));
-            return true;
-        }
-        template<typename T> bool Get(const char* name, T& value) const
-        {
-            int off = -1, size = 0, dim = 0;
-            if (!valid || !Reflect::PropertyLayoutInStruct(fn, name, off, size, dim) ||
-                dim != 1 || size != sizeof(T) || size_t(off) + sizeof(T) > data.size()) return false;
-            std::memcpy(&value, data.data() + off, sizeof(T));
-            return true;
-        }
-        bool Run()
-        {
-            if (!valid) LOG("Workbench call unavailable: receiver=%p function=%p", receiver, fn);
-            return valid && IsLiveObject(receiver) && IsLiveObject(fn) && receiver->ProcessEvent(fn, data.data());
-        }
-    };
 
     bool BoolResult(UObject* object, const char* method, bool& result)
     {
