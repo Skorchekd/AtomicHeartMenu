@@ -19,6 +19,7 @@
 #include "../features/features.h"
 #include "../features/workbench.h"
 #include "../features/bodyguards.h"
+#include "../features/possession.h"
 #include "../hooks/native_hooks.h"
 #include "../hooks/ai_movement_hooks.h"
 #include "../sdk/ue4.h"
@@ -454,6 +455,92 @@ namespace
             if (ImGui::Button("Snapshot enemies")) Features::AiSnapshotZone();
             ImGui::SameLine();
             if (ImGui::Button("Respawn snapshot as companions")) Features::AiRespawnZone();
+        }
+    }
+
+    // ===================================================================
+    //  PLAY AS -- take control of another character and its abilities.
+    // ===================================================================
+    void DrawPlayAsTab()
+    {
+        Possession::Settings& cfg = Possession::Config();
+        const Possession::Status st = Possession::GetStatus();
+        ImGui::TextWrapped("Take control of a robot, a boss or one of your companions and play as it: its body, "
+                           "its movement and its own attacks and abilities. Your character waits where you left "
+                           "it, invulnerable, and the game does not save until you return.");
+        ImGui::TextColored(ImVec4(1, .65f, .2f, 1), "Experimental: some characters' abilities only work while their own AI is in charge.");
+        ImGui::Spacing();
+
+        if (st.active)
+        {
+            ImGui::TextColored(kAccent, "Playing as %s", st.character.c_str());
+            if (st.healthFrac >= 0.0f)
+            {
+                char percent[16];
+                snprintf(percent, sizeof(percent), "%.0f%%", st.healthFrac * 100.0f);
+                ImGui::ProgressBar(st.healthFrac, ImVec2(-FLT_MIN, 0), percent);
+            }
+            ImGui::BeginDisabled(st.busy);
+            if (AccentButton("Return to your character   (Num .)", 34.0f)) { LOG("UI: play-as return"); Possession::End(); }
+            ImGui::EndDisabled();
+        }
+        else
+        {
+            ImGui::BeginDisabled(st.busy || !G::sdkReady.load());
+            if (AccentButton("Play as the character under your crosshair   (Num .)", 34.0f)) { LOG("UI: play-as crosshair"); Possession::BeginAimed(); }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Close the menu, aim at a character, and press Num . to take it over directly.");
+        }
+        ImGui::TextWrapped("%s", st.message.c_str());
+
+        ImGui::SeparatorText("Controls while playing");
+        ImGui::TextWrapped("WASD moves, the mouse looks, Space jumps (or climbs), Ctrl descends and Shift sprints. "
+                           "The left and right mouse buttons fire abilities 1 and 2, and keys 1-9 fire abilities 1-9. "
+                           "An ability aims at whatever is under the crosshair.");
+
+        if (st.active)
+        {
+            ImGui::SeparatorText("Abilities");
+            if (st.abilities.empty())
+                ImGui::TextDisabled("No abilities were found on this character's ability system.");
+            for (int i = 0; i < static_cast<int>(st.abilities.size()); ++i)
+            {
+                ImGui::PushID(i);
+                if (ImGui::SmallButton("Use")) Possession::UseAbility(i);
+                ImGui::SameLine();
+                ImGui::Text("%d   %s", i + 1, st.abilities[i].c_str());
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::SeparatorText("Camera and handling");
+        ImGui::Checkbox("Third-person camera", &cfg.thirdPerson);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: look through the character's own eyes.");
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderFloat("Camera distance", &cfg.cameraDistanceM, 1.5f, 12.0f, "%.1f m");
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderFloat("Camera height", &cfg.cameraHeightM, 0.0f, 4.0f, "%.1f m");
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderFloat("Look sensitivity", &cfg.lookSensitivity, 0.2f, 3.0f, "%.2fx");
+        ImGui::Checkbox("Invert look", &cfg.invertY);
+        ImGui::Checkbox("Invulnerable while played", &cfg.invulnerable);
+
+        if (!st.active)
+        {
+            ImGui::SeparatorText("Nearby characters");
+            ImGui::BeginChild("playAsNearby", ImVec2(0, 220), ImGuiChildFlags_Borders);
+            for (const auto& row : Features::AiNearbyList(48))
+            {
+                ImGui::PushID(reinterpret_cast<void*>(row.id));
+                ImGui::BeginDisabled(st.busy);
+                if (ImGui::SmallButton("Play as")) { LOG("UI: play-as %s", row.name.c_str()); Possession::BeginListed(row.id); }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::Text("%s   %.0f m%s", row.name.c_str(), row.distanceM, row.inSquad ? "  [companion]" : "");
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
         }
     }
 
@@ -1046,13 +1133,13 @@ void Menu::Render()
     ImGui::Separator();
 
     static int page = 0;
-    static const char* pages[] = { "Player", "Weapons", "AI / Squad", "Horde Rounds", "Nora", "World",
+    static const char* pages[] = { "Player", "Weapons", "AI / Squad", "Play as", "Horde Rounds", "Nora", "World",
         "Visuals", "Rendering", "Tools", "Agent tests", "Diagnostics", "Hook diagnostics" };
     const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
     ImGui::BeginChild("navigation", ImVec2(174 * uiScale, -footer), true);
     for (int i = 0; i < IM_ARRAYSIZE(pages); ++i)
     {
-        if (i == 9) { ImGui::Spacing(); ImGui::SeparatorText("Development"); }
+        if (i == 10) { ImGui::Spacing(); ImGui::SeparatorText("Development"); }
         if (ImGui::Selectable(pages[i], page == i, 0, ImVec2(0, 25 * uiScale))) page = i;
     }
     ImGui::EndChild();
@@ -1163,10 +1250,15 @@ void Menu::Render()
 
         if (page == 3)
         {
-            DrawHordeTab(f);
+            DrawPlayAsTab();
         }
 
         if (page == 4)
+        {
+            DrawHordeTab(f);
+        }
+
+        if (page == 5)
         {
             auto state = Workbench::GetStatus();
             ImGui::SeparatorText("Portable Nora");
@@ -1221,7 +1313,7 @@ void Menu::Render()
             ImGui::TextWrapped("%s", state.message.c_str());
         }
 
-        if (page == 5)
+        if (page == 6)
         {
             ImGui::SeparatorText("Stages and free roam");
             const auto worldStatus = Workbench::GetStatus();
@@ -1257,7 +1349,7 @@ void Menu::Render()
             ImGui::SliderFloat("World speed", &f.bulletTimeScale, 0.05f, 1.0f, "%.2f");
         }
 
-        if (page == 6)
+        if (page == 7)
         {
             ImGui::SeparatorText("Camera");
             LogCheckbox("Custom FOV", &f.customFov, "customFov");
@@ -1312,7 +1404,7 @@ void Menu::Render()
                 ImGui::ColorEdit3("Gun color", f.weaponRgbColor, ImGuiColorEditFlags_NoInputs);
         }
 
-        if (page == 7)
+        if (page == 8)
         {
             ImGui::SeparatorText("World / sky color");
             LogCheckbox("Tint world lights (RGB sky)", &f.worldTint, "worldTint");
@@ -1381,7 +1473,7 @@ void Menu::Render()
             ImGui::TextDisabled("Most 'show'/'viewmode' commands toggle -- press again to revert.");
         }
 
-        if (page == 8)
+        if (page == 9)
         {
             ImGui::SeparatorText("Readability");
             float textScale = ImGui::GetStyle().FontScaleMain;
@@ -1463,12 +1555,12 @@ void Menu::Render()
             ImGui::TextDisabled("Drives the game's own quest debug -- skips objective gates / blockers.");
         }
 
-        if (page == 9)
+        if (page == 10)
         {
             TestHarness::Draw();
         }
 
-        if (page == 10)
+        if (page == 11)
         {
             ImGui::TextWrapped("Confirm the SDK is wired, then find classes/functions to cheat on.");
             ImGui::Spacing();
@@ -1572,7 +1664,7 @@ void Menu::Render()
             }
         }
 
-        if (page == 11)
+        if (page == 12)
         {
             RenderHookTestingTab();
         }

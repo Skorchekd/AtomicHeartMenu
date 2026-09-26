@@ -14,6 +14,7 @@
 #include "features.h"
 #include "bodyguards.h"
 #include "workbench.h"
+#include "possession.h"
 #include "test_harness.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
@@ -2104,7 +2105,8 @@ namespace
     // kill the player's own companions along with everything else.
     bool IsProtectedUnit(UObject* ai)
     {
-        return ai && (IsSquadMember(ai) || IsHookBodyguard(ai) || Bodyguards::Contains(ai));
+        return ai && (IsSquadMember(ai) || IsHookBodyguard(ai) || Bodyguards::Contains(ai) ||
+                      Possession::IsControlled(ai));
     }
 
     void HookBodyguardAdd(UObject* ai)
@@ -13991,8 +13993,10 @@ bool Features::PrepareUnload()
             bool ok = false;
             try { ok = Workbench::CleanupGameThread(); } catch (...) {}
             // Only once eject is certain: a deferred eject keeps the squad as it is.
+            // Back into the player's own character first, then the AI.
             if (ok)
             {
+                Possession::CleanupGameThread();
                 try { AiCleanupForUnload(); } catch (...) { LOG("Eject: AI cleanup faulted (ignored)"); }
             }
             result->store(ok ? 2 : 3);
@@ -14935,6 +14939,22 @@ void Features::SetSaveBlock(unsigned owner, bool on)
 
 bool Features::SavesBlocked() { return g_blockSaves.load() || g_saveBlockOwners.load() != 0; }
 
+// ---- helpers for the play-as module ------------------------------------------
+bool Features::IsAiCharacter(UE::UObject* actor) { return AiUsable(actor); }
+
+bool Features::CharacterHealth(UE::UObject* character, float& current, float& maximum)
+{
+    return ReadCharacterHealth(character, current, maximum) && maximum > 0.001f && std::isfinite(current);
+}
+
+UE::UObject* Features::AiFromListId(unsigned long long id)
+{
+    UObject* ai = reinterpret_cast<UObject*>((uintptr_t)id);
+    if (IsSquadMember(ai))
+        return AiUsable(ai) ? ai : nullptr;
+    return ResolveAiId(id); // validated against the worker's AI cache
+}
+
 void Features::AiToggleSelect(unsigned long long id)
 {
     UObject* ai = ResolveAiId(id);
@@ -15045,10 +15065,11 @@ static std::vector<UObject*> DispatchTargets()
 
 namespace
 {
-    // The cached enemy closest to the centre of the screen: within a 12 degree cone
-    // of the camera and 150 m, never one of the player's own units, never a corpse.
-    // Raw reads only (camera POV + the worker's cache), so the menu may call it.
-    UObject* AimedEnemy()
+    // The cached character closest to the centre of the screen: within a 12 degree
+    // cone of the camera and 150 m, never `ignore`, never a corpse, and never one of
+    // the player's own units unless `includeOwn`. Raw reads only (camera POV + the
+    // worker's cache), so the menu may call it.
+    UObject* AimedCharacterImpl(UObject* ignore, bool includeOwn)
     {
         FVector camLoc{};
         FRotator camRot{};
@@ -15063,7 +15084,8 @@ namespace
         float bestCos = cosf(12.0f * kDegToRad);
         for (const AiCachedActor& e : CopyAiSnapshot())
         {
-            if (e.healthFrac == 0.0f || !IsLiveObject(e.actor) || IsProtectedUnit(e.actor))
+            if (e.actor == ignore || e.healthFrac == 0.0f || !IsLiveObject(e.actor) ||
+                (!includeOwn && IsProtectedUnit(e.actor)))
                 continue;
             FVector d{ e.location.X - camLoc.X, e.location.Y - camLoc.Y, e.location.Z - camLoc.Z };
             float length = sqrtf(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
@@ -15073,6 +15095,12 @@ namespace
             if (c > bestCos) { bestCos = c; best = e.actor; }
         }
         return best;
+    }
+
+    // The enemy under the crosshair (companions and corpses excluded).
+    UObject* AimedEnemy()
+    {
+        return AimedCharacterImpl(nullptr, false);
     }
 
     // Companions only: an order must never convert a selected enemy robot (the
@@ -15113,6 +15141,11 @@ namespace
         p.DestRotation = { 0.0f, rot.Yaw, 0.0f };
         return actor->ProcessEvent(fn, &p) && p.ReturnValue;
     }
+}
+
+UE::UObject* Features::AimedCharacter(UE::UObject* ignore, bool includeOwn)
+{
+    return G::sdkReady.load() ? AimedCharacterImpl(ignore, includeOwn) : nullptr;
 }
 
 void Features::AiDispatchAttack()
@@ -17552,6 +17585,7 @@ namespace
         { VK_NUMPAD8, "Num 8", "One-hit kill on/off" },
         { VK_NUMPAD9, "Num 9", "Heal to full + refill ammo" },
         { VK_NUMPAD0, "Num 0", "Enemy ESP on/off" },
+        { VK_DECIMAL, "Num .", "Play as the character under the crosshair / return" },
     };
     constexpr int kHotkeyCount = (int)(sizeof(kHotkeys) / sizeof(kHotkeys[0]));
     std::atomic<uint32_t> g_hotkeyPending{ 0 };
@@ -17583,6 +17617,7 @@ namespace
             case VK_NUMPAD8: toggle(st.oneHitKill, "One-hit kill"); break;
             case VK_NUMPAD9: Features::FullHeal(); Features::RefillAmmoNow(); Features::Notify("Healed, ammo refilled"); break;
             case VK_NUMPAD0: toggle(st.espEnabled, "Enemy ESP"); break;
+            case VK_DECIMAL: Possession::Toggle(); break;
             default: break;
             }
         }
@@ -17695,7 +17730,11 @@ namespace
     nlohmann::json SettingsToJson(const Features::State& s)
     {
         auto rgb = [](const float c[3]) { return nlohmann::json::array({ c[0], c[1], c[2] }); };
+        const Possession::Settings& play = Possession::Config();
         return nlohmann::json{
+            { "playAsThirdPerson", play.thirdPerson }, { "playAsCameraDistance", play.cameraDistanceM },
+            { "playAsCameraHeight", play.cameraHeightM }, { "playAsLookSensitivity", play.lookSensitivity },
+            { "playAsInvertY", play.invertY }, { "playAsInvulnerable", play.invulnerable },
             { "version", 1 },
             { "speedMult", s.speedMult }, { "playerScale", s.playerScale },
             { "flyStreamingAssist", s.flyStreamingAssist }, { "bulletTimeScale", s.bulletTimeScale },
@@ -17791,6 +17830,13 @@ namespace
         float textScale = s.menuTextScale;
         num("menuTextScale", textScale, 0.0f, 1.75f);
         s.menuTextScale = textScale <= 0.0f ? 0.0f : (std::max)(0.9f, textScale);
+        Possession::Settings& play = Possession::Config();
+        flag("playAsThirdPerson", play.thirdPerson);
+        num("playAsCameraDistance", play.cameraDistanceM, 1.5f, 12.0f);
+        num("playAsCameraHeight", play.cameraHeightM, 0.0f, 4.0f);
+        num("playAsLookSensitivity", play.lookSensitivity, 0.2f, 3.0f);
+        flag("playAsInvertY", play.invertY);
+        flag("playAsInvulnerable", play.invulnerable);
     }
 }
 
@@ -17870,6 +17916,7 @@ static void TickImpl()
     UpdateDebugDiagnostics();
     UpdateHookTwinForensics();
     ProcessHotkeys();
+    Possession::Tick(); // input and camera for a character being played
     // Puzzle completions, the instant-puzzle flag, time dilation, player scale and
     // infinite ammo all dispatch gameplay UFunctions: marshal them to the game
     // thread (they used to run right here, inside Present).

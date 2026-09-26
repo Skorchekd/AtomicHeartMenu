@@ -15,6 +15,7 @@
 #include "../core/globals.h"
 #include "../core/log.h"
 #include "../features/features.h"
+#include "../features/possession.h"
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include <exception>
@@ -167,6 +168,16 @@ namespace
         // swallowed, so the game still receives every key.
         if (msg == WM_KEYDOWN && (lParam & 0x40000000) == 0)
             Features::NoteHotkey(static_cast<int>(wParam));
+        // Mouse look for a character being played: AI characters bind no player
+        // input, so the raw motion is read here (reading does not consume it).
+        if (msg == WM_INPUT && Possession::IsActive() && !G::menuOpen.load())
+        {
+            RAWINPUT raw{};
+            UINT size = sizeof(raw);
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+                raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+                Possession::NoteMouseDelta(raw.data.mouse.lLastX, raw.data.mouse.lLastY);
+        }
         // Eject on the dedicated End key only. With NumLock off, numpad 1 (one of the
         // hotkeys above) also arrives as VK_END, but without the extended-key bit.
         if (msg == WM_KEYDOWN && wParam == VK_END && (lParam & 0x01000000) != 0 && (lParam & 0x40000000) == 0 &&

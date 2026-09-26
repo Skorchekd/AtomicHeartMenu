@@ -345,6 +345,12 @@ namespace Features
     void SetSaveBlock(unsigned owner, bool on);
     bool SavesBlocked();
 
+    // ---- helpers for the play-as module ------------------------------------
+    bool IsAiCharacter(UE::UObject* actor);                              // live AHAICharacter
+    bool CharacterHealth(UE::UObject* character, float& current, float& maximum);
+    UE::UObject* AiFromListId(unsigned long long id);                    // an AiListEntry / Summary id, validated
+    UE::UObject* AimedCharacter(UE::UObject* ignore, bool includeOwn);   // character under the crosshair
+
     // Zone respawn: snapshot the current enemies, respawn that set later.
     void AiSnapshotZone();
     void AiRespawnZone();

@@ -31,6 +31,7 @@ add_library(AtomicHeartMenu SHARED
     src/features/features.cpp
     src/features/bodyguards.cpp
     src/features/workbench.cpp
+    src/features/possession.cpp
     src/features/test_harness.cpp
     # --- Dear ImGui ---
     ${IMGUI}/imgui.cpp
