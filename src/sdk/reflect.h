@@ -13,6 +13,8 @@
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
 #pragma once
 #include <ostream>
+#include <string>
+#include <vector>
 #include "ue4.h"
 
 // ===========================================================================
@@ -67,4 +69,88 @@ namespace Reflect
     // parameter will be cast to. Returns nullptr if the property is absent, is not
     // object-typed, or unreadable.
     UE::UObject* ObjectPropertyClassInStruct(UE::UObject* structOrClass, const char* propName);
+
+    // ---- Signature description (declarations, not values) -------------------
+    // The above answer "where is this field"; the two below answer "what fields
+    // exist at all", which is what you need before you can call a UFunction you
+    // have not seen: a params block is only safe to build once every parameter's
+    // type, offset and size came from the game itself.
+
+    // One reflected field: a class member, or one parameter of a UFunction.
+    struct FieldInfo
+    {
+        std::string name;
+        std::string type;    // FFieldClass name, e.g. "EnumProperty", "ObjectProperty"
+        std::string detail;  // resolved enum/struct/class the type points at ("" if none)
+        int32_t     offset = -1;   // byte offset within the container / params block
+        int32_t     size   = 0;    // ElementSize * ArrayDim
+        uint64_t    flags  = 0;    // EPropertyFlags
+
+        bool IsParm()   const { return (flags & Offsets::Reflect::CPF_Parm) != 0; }
+        bool IsReturn() const { return (flags & Offsets::Reflect::CPF_ReturnParm) != 0; }
+        bool IsOut()    const { return (flags & Offsets::Reflect::CPF_OutParm) != 0; }
+    };
+
+    // Describe a UStruct's OWN ChildProperties in declaration order. No SuperStruct
+    // walk: a UFunction's parameter list is exactly its own fields, and mixing in
+    // inherited members would misdescribe the params block. Pass a UClass to list
+    // the members that class itself declares.
+    std::vector<FieldInfo> DescribeStructFields(UE::UObject* structOrClass, int maxFields = 128);
+
+    // One entry of a UEnum.
+    struct EnumValue
+    {
+        std::string name;   // as the engine stores it, fully qualified ("EAchievements::KillTwins")
+        int64_t     value = 0;
+    };
+
+    // The UScriptStruct a named StructProperty member is declared as, so a nested
+    // struct's own field list can be walked without a GObjects scan to find its
+    // type by name. Pair it with FindPropertyOffset to get at the live bytes.
+    UE::UObject* GetStructPropertyType(UE::UObject* container, const char* propName);
+
+    // ---- TMap reading -------------------------------------------------------
+    // A TMap is a TSet of key/value pairs and a TSet is a sparse array plus a hash,
+    // so reading one means walking the sparse array and skipping the holes its bit
+    // array marks. A view never copies: it hands out pointers INTO the live map, so
+    // it is only valid while the owning object is alive and untouched -- read it and
+    // be done, do not store it across frames.
+    struct MapView
+    {
+        bool     valid       = false;
+        uint8_t* elements    = nullptr; // first stored element
+        int32_t  count       = 0;       // slots INCLUDING holes -- iterate with IsValidIndex
+        int32_t  stride      = 0;
+        int32_t  keyOffset   = 0;
+        int32_t  valueOffset = 0;
+        int32_t  keySize     = 0;
+        int32_t  valueSize   = 0;
+        std::string keyType;            // FFieldClass name, e.g. "EnumProperty"
+        std::string valueType;
+        const uint32_t* allocFlags = nullptr;
+        int32_t  allocBits   = 0;
+        std::string error;              // why valid == false
+
+        bool     IsValidIndex(int index) const;
+        uint8_t* KeyAt(int index) const;
+        uint8_t* ValueAt(int index) const;
+    };
+
+    // Open a named TMap member of `container` for reading. Fails closed: the map's
+    // own FScriptMapLayout is read rather than derived from type sizes, then every
+    // part of it is range-checked before a byte of map data is trusted, so a layout
+    // a patch has moved reports an error instead of handing back plausible garbage.
+    MapView OpenMapProperty(UE::UObject* container, const char* propName);
+
+    // Same, for a TMap that lives inside a nested struct rather than directly on a
+    // class -- `structType` is the UScriptStruct (from GetStructPropertyType) and
+    // `instance` points at that struct's bytes inside the owning object.
+    MapView OpenMapPropertyInStruct(UE::UObject* structType, uint8_t* instance, const char* propName);
+
+    // Read a UEnum's name->value table by probing for UEnum::Names and validating
+    // the hit against the enum's own name (see Offsets::Reflect::UEnum_NamesProbe*).
+    // Returns empty if no candidate validated. `outNamesOffset` receives the offset
+    // that won, so a caller can log it for promotion into offsets.h.
+    std::vector<EnumValue> DescribeEnumValues(UE::UObject* uenum, int* outNamesOffset = nullptr,
+                                              int maxValues = 512);
 }

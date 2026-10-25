@@ -120,7 +120,7 @@ src/
                        + ImGui DX12 backend, RTV/SRV heaps, command-queue capture
     wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggles menu
   menu/
-    menu.{h,cpp}       The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Debug tabs)
+    menu.{h,cpp}       The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Achievements / Debug tabs)
   features/
     features.{h,cpp}   Per-frame cheat application (godmode, fly, speed, teleport...)
   sdk/
@@ -294,6 +294,66 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
     that aren't verified yet.)
 - **Visuals → RGB gun** - rainbow/recolor your equipped weapon via its mesh material
   parameters (same engine path as chams; no GPU pipeline hook).
+- **Achievements tab** - fires the game's **own** achievement event
+  (`GameplayEventUtils.SendAchievementUnlockEvent`), so `UAHAchievementSubsystem`
+  does its normal bookkeeping and tells Steam itself, exactly as a real unlock
+  would. Filterable list, per-row **Unlock**, **Unlock ALL** (streamed one every
+  150 ms, because each unlock is an event the game answers with a popup and a
+  Steam write), and **Set progress** for the counting achievements via
+  `UpdateAchievementProgress(current, max)`. Names and values are read from the
+  live `EAchievements` enum rather than hardcoded, so a patch that adds or
+  reorders entries needs no code change.
+
+  The list **refreshes itself** every few seconds while the tab is open, so
+  states and bars follow the game without anyone pressing anything; a read is
+  ~1ms of game thread once the display names are cached, and it is single-flight
+  so a slow read can never have another queued behind it. **Refresh now** forces
+  one and additionally re-runs the engine's async achievement query, which is what
+  to press if names look stale right after injecting. Each row shows Steam's own
+  display name - "Gold Rush", not the internal `GoldenFever` - with the internal
+  name, id, unlock date and counter in the tooltip.
+
+  The state comes from **`steam_api64.dll` directly**, not from the engine's
+  cached achievement layer. That is a deliberate correction: the engine's
+  `GetCachedAchievementProgress` only ever answers 0 or 100 on this build, and it
+  answers **100 for counting achievements that are merely part-done** - it
+  reported "Gold Rush" (0/76) and "Apple Pie 3826" (859/3826) as earned. Every
+  counter sitting at exactly zero read correctly, so it is the derived value that
+  is wrong, not the read of it. `SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime`
+  is the same source the engine reads and answers correctly, with a timestamp.
+  Verified end to end: 52 of 83, matching the Steam profile exactly, with six
+  spot-checked unlock times matching Steam's own UI to the minute.
+
+  Getting there needs each achievement's platform id, read out of the subsystem's
+  `AchievementsMap` (`TMap<EAchievements, FString>`) off the live game.
+
+  Row states are kept deliberately distinct, because "we could not ask" must never
+  look like "you do not have it": **unlocked** / **locked** are what Steam
+  answered, **?** means not read yet, and **no answer** means nothing answered for
+  that id. **sent** is separate again - it means this menu fired it this session,
+  which is what you see while Steam catches up.
+
+  **Progress counts** are shown only for achievements the game has actually
+  reported progress for. The target comes from the subsystem's
+  `AchievementsMaxValues` ("collect 76 gold coins" -> 76.0) and the 0..1 fraction
+  from `UploadedAchievements` inside the nested `PlayerGameStatistics` struct -
+  which is what the game has told Steam, so a count here agrees with Steam's own
+  UI rather than contradicting it.
+
+  **An absent count means "nothing tracked", not "zero"**, and that distinction is
+  load-bearing: on the tested save `UploadedAchievements` holds `0.0` for Gold Rush
+  against 17 coins actually collected, because the game never uploaded that
+  counter. That is why Steam shows 0/76 there, and it is a real game bug the menu
+  can only report, not fix.
+
+  Do not confuse that map with `PlayerGameStatistics::AchievementProgress`, which
+  has the same key type and the same 29 entries as `AchievementsMaxValues` and
+  whose values *are* those targets (29 identical, 0 differing when compared live).
+  Matching entry counts made it look like the running count; reading it put
+  "3826/3826" on an achievement Steam had at 859.
+
+  This is **not** a bypass - see the note under "Dump achievement API" below. It
+  fires triggers that cheating made you skip.
 - **Debug → Dump nearby volumes** - stand where the game teleports you (e.g. the
   lighthouse edge) and press it; it logs nearby volume/trigger classes to the log so
   the out-of-bounds teleporter can be identified and disabled precisely.
@@ -302,6 +362,31 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
 - **Debug → Verify member offsets** - diffs every reflected member offset in
   `offsets.h` against the running game and names the ones a patch has moved; see
   "After a game patch" below
+- **Debug → Dump achievement API** - logs the game's own achievement path off the
+  running game: every `UFunction`/class/struct/enum whose name contains `Achiev`,
+  with full paths, params-block sizes and per-parameter type + offset, the
+  `EAchievements` name→value table, and then the **complete** API of each class
+  that declares one of those functions (which is how the two subsystems involved
+  are reached - their own names never say "Achiev"). A class only earns that full
+  dump when it is *about* achievements - its own name says so, or it declares more
+  than one matched function - so one incidental match no longer drags a whole
+  engine library into the log; skipped owners are still named with their match
+  count. Read-only reflection on a worker thread: it never calls `ProcessEvent`,
+  so it cannot freeze the game and **unlocks nothing**. Results go to
+  `AtomicHeartMenu.log`. Re-run it after a game patch to re-check the signatures
+  the Achievements tab calls.
+
+  **Nothing in the menu blocks achievements.** `UAHAchievementSubsystem` (38
+  fields, 18 functions) and `UGameplayEventSubsystem` (21 functions) were dumped
+  in full off the running game and neither holds a cheats-used gate or any
+  persisted "cheated" flag; there is no anti-tamper either, and Atomic Heart is
+  single-player, so Steam never sees a modified session as anything but a normal
+  one. What cheats *do* cost you is the trigger: achievements fire from gameplay
+  events (`UnlockBossAchievement`, `UnlockDialogAchievement`,
+  `IncrementAppleAchievement`, ...), so flying past a boss simply means the event
+  never happens. Instant puzzle resolve is the case to watch, since it completes
+  minigames and locks by a path the normal solve callback does not run through.
+  The Achievements tab is the fix for exactly that.
 
 Runtime function names include `/Script/...`; keep the function constants in
 `offsets.h` in that format or `FindFunction()` will miss them.
