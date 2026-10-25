@@ -57,14 +57,7 @@ namespace
     //  gate; this exists because cheating past content means the game's
     //  trigger never fires in the first place.
     // =====================================================================
-    struct AchievementCatalogEntry
-    {
-        int         enumValue = 0;
-        std::string name;
-    };
-
     std::mutex                          g_achMutex;
-    std::vector<AchievementCatalogEntry> g_achCatalog;  // stable storage for the names RowAt hands out
     std::unordered_set<int>             g_achSent;      // fired by US this session
     std::string                         g_achStatus = "No achievement action yet.";
     volatile LONG                       g_achResolveRunning = 0;
@@ -81,6 +74,10 @@ namespace
     // Same idea for the game-thread pump: before a world exists installing it
     // fails and logs, and the tab's callers run every frame.
     std::atomic<ULONGLONG>              g_achPumpFailedMs{ 0 };
+
+    // The cache prime skips when there is no world yet, and its caller runs every
+    // frame: without a back-off a skipped prime re-queues (and logs) per frame.
+    std::atomic<ULONGLONG>              g_achPrimeFailedMs{ 0 };
 
     // What the engine and Steam say about one achievement. `engineProgress` is
     // UE's 0..100 percentage, so a plain (non-counting) achievement reads 0 or
@@ -109,10 +106,28 @@ namespace
         bool        steamResolved   = false;
         bool        steamAchieved   = false;
         uint32_t    steamUnlockTime = 0; // unix seconds; 0 when never unlocked
+        // The row's "Unlocked: ..." hover line, worked out when the read stores
+        // the state rather than on every frame.
+        std::string unlockText = "not read";
     };
-    std::vector<AchievementReadState> g_achStates;   // parallel to g_achCatalog
+
+    // One achievement: its catalog identity and what the last read said about it.
+    // The names stay put once the list is up (RowAt hands out name.c_str()); only
+    // `read` changes after that.
+    struct AchievementSlot
+    {
+        int                  enumValue = 0;
+        std::string          name;   // "EAchievements::" stripped
+        AchievementReadState read;
+    };
+    std::vector<AchievementSlot> g_achSlots;
     std::string g_achSteamReadSummary = "Not read yet.";
-    std::atomic<bool> g_achSteamUnavailable{ false };    // the last read ran without steam_api64
+
+    // A failure that would otherwise repeat on every read is logged once, and
+    // again only after the thing has worked in between (the latch is cleared).
+    std::atomic<bool> g_achReadSkipLogged{ false };
+    std::atomic<bool> g_achIdMapLogged{ false };
+    std::atomic<bool> g_achResolveLogged{ false };
     std::atomic<int>  g_achSteamSim{ (int)SteamSimulation::Off };
     bool        g_achCachePrimed      = false;
 
@@ -123,8 +138,8 @@ namespace
     // (the first pass is dearer because it fetches 83 of them), so a slow cadence
     // costs nothing worth measuring. The completion stamp is also what the tab
     // shows as "Updated N s ago".
-    volatile LONG          g_achRefreshInFlight = 0;
-    volatile LONG          g_achReadWanted      = 0;
+    std::atomic<int>       g_achRefreshInFlight{ 0 };
+    std::atomic<int>       g_achReadWanted{ 0 };
     std::atomic<ULONGLONG> g_achLastReadDoneMs{ 0 };
     constexpr ULONGLONG kAchAutoRefreshMs    = 3000;
     constexpr ULONGLONG kAchMaxAutoRefreshMs = 10000;   // AC8 asks for a read at least this often
@@ -209,6 +224,63 @@ namespace
         return s_seen.insert(key).second;
     }
 
+    // True for the first failure since the latch was last cleared.
+    bool ShouldLogFailure(std::atomic<bool>& latch)
+    {
+        return !latch.exchange(true);
+    }
+
+    // The engine read that produced this state ran without steam_api64, so the
+    // row's answer is the cache's. One predicate for the labels and the header.
+    bool FromEngineCache(const AchievementReadState& st)
+    {
+        return st.queried && !st.steamReachable;
+    }
+
+    // ---- One engine call ----------------------------------------------------
+    struct EngineFn
+    {
+        UObject*   object = nullptr;
+        UFunction* fn     = nullptr;
+        explicit operator bool() const { return object && fn; }
+    };
+
+    EngineFn ResolveEngineFn(const char* objectPath, const char* fnPath)
+    {
+        EngineFn target;
+        try
+        {
+            target.object = CachedObject(objectPath);
+            target.fn     = CachedFn(fnPath);
+        }
+        catch (...) { target = EngineFn{}; }
+        return target;
+    }
+
+    // ProcessEvent on a resolved function. False when it was not resolved, the
+    // engine refused it, or it faulted; the params are then not to be read.
+    bool CallEngine(const EngineFn& target, void* params, const char* what)
+    {
+        if (!target) return false;
+        try { return Dispatch(target.object, target.fn, params, what); }
+        catch (...) { return false; }
+    }
+
+    // Resolve, null-check and call. A call that could not be made says why, once
+    // per `what` (these run per id, per read). `what` must be a string literal.
+    bool CallEngine(const char* objectPath, const char* fnPath, void* params, const char* what)
+    {
+        const EngineFn target = ResolveEngineFn(objectPath, fnPath);
+        if (!target)
+        {
+            if (FirstTime(std::string("skip:") + what))
+                LOG("Achievements: %s skipped (object=%p fn=%p)", what,
+                    (void*)target.object, (void*)target.fn);
+            return false;
+        }
+        return CallEngine(target, params, what);
+    }
+
     bool IsSentinelName(const std::string& name)
     {
         static const std::string kMaxSuffix = "_MAX";
@@ -217,7 +289,7 @@ namespace
                 name.compare(name.size() - kMaxSuffix.size(), kMaxSuffix.size(), kMaxSuffix) == 0);
     }
 
-    // Reads the live EAchievements enum into g_achCatalog. False leaves the list
+    // Reads the live EAchievements enum into g_achSlots. False leaves the list
     // empty.
     bool ResolveCatalog()
     {
@@ -236,16 +308,18 @@ namespace
 
         if (values.empty())
         {
-            LOG_SDK("Achievements: EAchievements not readable (%s). The menu list stays "
-                    "empty rather than guessing values; run Debug -> Dump achievement API "
-                    "to see why.", enumObject ? "enum found, values unreadable" : "enum not found");
+            // Retried every few seconds while the tab is open; say so once.
+            if (ShouldLogFailure(g_achResolveLogged))
+                LOG_SDK("Achievements: EAchievements not readable (%s). The menu list stays "
+                        "empty rather than guessing values; run Debug -> Dump achievement API "
+                        "to see why.", enumObject ? "enum found, values unreadable" : "enum not found");
             SetAchievementStatus("Achievement list unavailable -- see the log.");
             return false;
         }
 
         const std::string prefix = AH::EAchievementsPrefix;
-        std::vector<AchievementCatalogEntry> catalog;
-        catalog.reserve(values.size());
+        std::vector<AchievementSlot> slots;
+        slots.reserve(values.size());
         for (const Reflect::EnumValue& v : values)
         {
             std::string name = v.name;
@@ -256,18 +330,18 @@ namespace
                 continue;
             if (v.value < 0 || v.value > kMaxAchievementValue)   // the params block holds one byte
                 continue;
-            AchievementCatalogEntry e;
-            e.enumValue = (int)v.value;
-            e.name      = std::move(name);
-            catalog.push_back(std::move(e));
+            AchievementSlot slot;
+            slot.enumValue = (int)v.value;
+            slot.name      = std::move(name);
+            slots.push_back(std::move(slot));
         }
 
         int listed = 0;
         {
             std::lock_guard<std::mutex> lk(g_achMutex);
-            g_achCatalog = std::move(catalog);
-            g_achStatus  = "Achievement list ready.";
-            listed       = (int)g_achCatalog.size();
+            g_achSlots  = std::move(slots);
+            g_achStatus = "Achievement list ready.";
+            listed      = (int)g_achSlots.size();
         }
         LOG_SDK("Achievements: %d entries read from the live EAchievements enum "
                 "(UEnum::Names at +0x%X)", listed, namesOffset);
@@ -284,6 +358,7 @@ namespace
         {
             g_achResolveFailed.store(false);
             g_achMapTypeLogged.store(false);   // the next id read logs the map's types again
+            g_achResolveLogged.store(false);
         }
         else
         {
@@ -297,25 +372,13 @@ namespace
     // instance is needed and there is nothing to go stale between frames.
     bool SendAchievementUnlockGameThread(int enumValue)
     {
-        try
-        {
-            UObject*   lib = CachedObject(AH::Obj_GameplayEventUtils);
-            UFunction* fn  = CachedFn(AH::Fn_SendAchievementUnlockEvent);
-            if (!lib || !fn)
-            {
-                LOG("Achievements: unlock %d skipped (lib=%p fn=%p)", enumValue, (void*)lib, (void*)fn);
-                return false;
-            }
-            P_SendAchievementUnlock p{};
-            p.Achievement = (uint8_t)enumValue;
-            if (!lib->ProcessEvent(fn, &p))
-            {
-                LOG("Achievements: unlock %d refused (SendAchievementUnlockEvent target not live)", enumValue);
-                return false;
-            }
+        P_SendAchievementUnlock p{};
+        p.Achievement = (uint8_t)enumValue;
+        if (CallEngine(AH::Obj_GameplayEventUtils, AH::Fn_SendAchievementUnlockEvent, &p,
+                       "SendAchievementUnlockEvent"))
             return true;
-        }
-        catch (...) { LOG("Achievements: unlock %d exception (ignored)", enumValue); return false; }
+        LOG("Achievements: unlock %d not sent (SendAchievementUnlockEvent unavailable or refused)", enumValue);
+        return false;
     }
 
     // GAME THREAD ONLY. Unlike the unlock, this one is an instance method, and the
@@ -323,16 +386,14 @@ namespace
     // rather than cached across level loads.
     UObject* GetAchievementSubsystemGameThread()
     {
+        P_GetAchievementSubsystem p{};
+        if (!CallEngine(AH::Obj_SubsystemUtils, AH::Fn_GetAchievementSubsystem, &p,
+                        "GetAchievementSubsystem"))
+            return nullptr;
         try
         {
-            UObject*   lib = CachedObject(AH::Obj_SubsystemUtils);
-            UFunction* fn  = CachedFn(AH::Fn_GetAchievementSubsystem);
-            if (!lib || !fn) return nullptr;
-            P_GetAchievementSubsystem p{};
-            if (!Dispatch(lib, fn, &p, "GetAchievementSubsystem"))
-                return nullptr;
-            UObject* subsystem = static_cast<UObject*>(p.ReturnValue);
             // The game handed this back; it has had no validation until now.
+            UObject* subsystem = static_cast<UObject*>(p.ReturnValue);
             return IsLiveObject(subsystem) ? subsystem : nullptr;
         }
         catch (...) { return nullptr; }
@@ -345,20 +406,18 @@ namespace
     {
         try
         {
-            UObject*   proxy = CachedObject(AH::Obj_AchievementQueryProxy);
-            UFunction* fn    = CachedFn(AH::Fn_CacheAchievements);
-            UObject*   pc    = GetPlayerController();
-            UObject*   world = GetWorld();
-            if (!proxy || !fn || !pc || !world)
+            UObject* pc    = GetPlayerController();
+            UObject* world = GetWorld();
+            if (!pc || !world)
             {
-                LOG("Achievements: cache prime skipped (proxy=%p fn=%p pc=%p world=%p)",
-                    (void*)proxy, (void*)fn, (void*)pc, (void*)world);
+                if (FirstTime("cache prime: no world or player controller"))
+                    LOG("Achievements: cache prime skipped (pc=%p world=%p)", (void*)pc, (void*)world);
                 return false;
             }
             P_CacheAchievements p{};
             p.WorldContextObject = world;
             p.PlayerController   = pc;
-            if (!Dispatch(proxy, fn, &p, "CacheAchievements"))
+            if (!CallEngine(AH::Obj_AchievementQueryProxy, AH::Fn_CacheAchievements, &p, "CacheAchievements"))
                 return false;
             LOG("Achievements: engine cache prime requested (async)");
             return true;
@@ -378,10 +437,6 @@ namespace
             return out;
 
         out = FName{};
-        UObject*   lib = CachedObject(AH::Obj_KismetStringLibrary);
-        UFunction* fn  = CachedFn(AH::Fn_ConvStringToName);
-        if (!lib || !fn) return out;
-
         try
         {
             // Ids are ASCII, so a straight widen is correct. The wstring stays
@@ -392,7 +447,7 @@ namespace
             p.InString.Data  = wide.data();
             p.InString.Count = (int32_t)wide.size() + 1; // include the null terminator
             p.InString.Max   = p.InString.Count;
-            if (Dispatch(lib, fn, &p, "Conv_StringToName"))
+            if (CallEngine(AH::Obj_KismetStringLibrary, AH::Fn_ConvStringToName, &p, "Conv_StringToName"))
                 out = p.ReturnValue;
         }
         catch (...) { out = FName{}; }
@@ -409,26 +464,16 @@ namespace
         try { return str->ToString(); } catch (...) { return {}; }
     }
 
-    // GAME THREAD ONLY. Read the EAchievements -> platform-id map off the live
-    // subsystem. The ids are FNames taken straight out of the map, so nothing has
-    // to build one from a string -- which could not work anyway, since the name
-    // pool holds "EAchievements::KillTwins" as a single name and a standalone
-    // "KillTwins" need not exist in it.
-    int BuildAchievementIdTableGameThread(UObject* subsystem, bool forced)
-    {
-        Reflect::MapView map = Reflect::OpenMapProperty(subsystem, AH::Prop_AchievementsMap);
-        if (!map.valid)
-        {
-            LOG("Achievements: %s unreadable -- %s. Unlocking still works; only the "
-                "Steam-state read needs the ids.", AH::Prop_AchievementsMap, map.error.c_str());
-            return 0;
-        }
+    // The platform id sits in the map's value as an FName, which the engine's
+    // achievement API takes directly, or as an FString, which has to be looked up
+    // in the name pool first.
+    enum class IdValueKind { Name, Text };
 
-        // Only trusted once it IS what we expect. The key must be a 1-byte enum.
-        // The value carries the platform id in one of two shapes: an FName, which
-        // the engine's achievement API takes directly, or an FString, which has to
-        // be looked up in the name pool first. Anything else and we would be
-        // reinterpreting real data as something it is not.
+    // Only trusted once the map IS what we expect: a 1-byte enum key and one of
+    // those two value shapes. Anything else and we would be reinterpreting real
+    // data as something it is not.
+    bool ValidateIdMapShape(const Reflect::MapView& map, IdValueKind& kind)
+    {
         const bool keyOk = (map.keyType == "EnumProperty" || map.keyType == "ByteProperty") &&
                            map.keySize == 1;
         const bool valueIsName = map.valueType == "NameProperty" &&
@@ -437,22 +482,30 @@ namespace
                                  map.valueSize == (int)sizeof(FString);
         if (!keyOk || (!valueIsName && !valueIsText))
         {
-            LOG("Achievements: %s is TMap<%s(%d), %s(%d)> -- not a shape this knows how "
-                "to read (want a 1-byte enum key and an FName or FString value).",
-                AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
-                map.valueType.c_str(), map.valueSize);
-            return 0;
+            if (ShouldLogFailure(g_achIdMapLogged))
+                LOG("Achievements: %s is TMap<%s(%d), %s(%d)> -- not a shape this knows how "
+                    "to read (want a 1-byte enum key and an FName or FString value).",
+                    AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
+                    map.valueType.c_str(), map.valueSize);
+            return false;
         }
+        kind = valueIsName ? IdValueKind::Name : IdValueKind::Text;
+
         // Once per resolve: the ids are re-read on every state read, and the value
         // property type (NameProperty vs StrProperty) is what this line is for.
         if (!g_achMapTypeLogged.exchange(true))
             LOG("Achievements: %s is TMap<%s(%d), %s(%d)>, %d slot(s) -- value property type %s",
                 AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
                 map.valueType.c_str(), map.valueSize, map.count, map.valueType.c_str());
+        return true;
+    }
 
-        // Read the whole map out FIRST -- no lock held and no call into game code
-        // while a MapView is pointing into live memory.
-        struct RawId { int enumValue; std::string text; };
+    struct RawId { int enumValue; std::string text; };
+
+    // Read the whole map out FIRST -- no lock held and no call into game code
+    // while a MapView is pointing into live memory.
+    std::vector<RawId> ReadMapRows(const Reflect::MapView& map, IdValueKind kind)
+    {
         std::vector<RawId> raw;
         raw.reserve((size_t)map.count);
         for (int i = 0; i < map.count; ++i)
@@ -463,16 +516,22 @@ namespace
 
             RawId entry;
             entry.enumValue = (int)*keyPtr;
-            if (valueIsName)
+            if (kind == IdValueKind::Name)
                 entry.text = SafeFNameToString(*reinterpret_cast<FName*>(valuePtr));
             else
                 entry.text = ReadIdString(reinterpret_cast<const FString*>(valuePtr));
             if (!entry.text.empty())
                 raw.push_back(std::move(entry));
         }
+        return raw;
+    }
 
-        int matched = 0, unmapped = 0, unresolved = 0;
-        struct ResolvedId { int enumValue; FName id; std::string text; };
+    struct ResolvedId { int enumValue; FName id; std::string text; };
+
+    // The ids are made into FNames the engine's achievement API takes; ones that
+    // could not be are counted, not kept.
+    std::vector<ResolvedId> MintIds(const std::vector<RawId>& raw, int& unresolved)
+    {
         std::vector<ResolvedId> resolved;
         resolved.reserve(raw.size());
         for (const RawId& entry : raw)
@@ -481,56 +540,95 @@ namespace
             if (id.ComparisonIndex != 0) resolved.push_back({ entry.enumValue, id, entry.text });
             else                         ++unresolved;
         }
+        return resolved;
+    }
 
-        int listed = 0;
+    struct IdTableCounts
+    {
+        int matched  = 0;   // slots that now carry an id
+        int listed   = 0;   // slots in the menu list
+        int unmapped = 0;   // map rows with no slot (INVALID, _MAX)
+    };
+
+    // Merges the ids into the slots under the lock. The last answer and the title
+    // survive while a slot's id is unchanged: a title costs an FText reference we
+    // cannot release, so it is fetched once, and a kept answer is what lets a read
+    // tell whether anything moved. A different id starts clean.
+    IdTableCounts ApplyIdTable(const std::vector<ResolvedId>& resolved)
+    {
+        IdTableCounts counts;
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        counts.listed = (int)g_achSlots.size();
+
+        std::unordered_map<int, size_t> slotByValue;
+        slotByValue.reserve(g_achSlots.size());
+        for (size_t slot = 0; slot < g_achSlots.size(); ++slot)
+            slotByValue[g_achSlots[slot].enumValue] = slot;
+
+        std::vector<AchievementReadState> previous;
+        previous.reserve(g_achSlots.size());
+        for (AchievementSlot& slot : g_achSlots)
         {
-            std::lock_guard<std::mutex> lk(g_achMutex);
-            listed = (int)g_achCatalog.size();
-
-            std::unordered_map<int, size_t> slotByValue;
-            slotByValue.reserve(g_achCatalog.size());
-            for (size_t slot = 0; slot < g_achCatalog.size(); ++slot)
-                slotByValue[g_achCatalog[slot].enumValue] = slot;
-
-            std::vector<AchievementReadState> previous;
-            previous.swap(g_achStates);
-            g_achStates.assign(g_achCatalog.size(), AchievementReadState{});
-
-            for (const ResolvedId& entry : resolved)
-            {
-                const auto it = slotByValue.find(entry.enumValue);
-                // INVALID and _MAX are in the map but filtered out of the menu list.
-                if (it == slotByValue.end()) { ++unmapped; continue; }
-
-                const size_t slot = it->second;
-                AchievementReadState state;
-                // The last answer and the title survive a refresh while the slot's
-                // id is unchanged: a title costs an FText reference we cannot
-                // release, so it is fetched once, and a kept answer is what lets a
-                // read tell whether anything moved. A different id starts clean.
-                if (slot < previous.size() && previous[slot].idText == entry.text)
-                    state = std::move(previous[slot]);
-                state.idKnown = true;
-                state.id      = entry.id;
-                state.idText  = entry.text;
-                g_achStates[slot] = std::move(state);
-                ++matched;
-            }
+            previous.push_back(std::move(slot.read));
+            slot.read = AchievementReadState{};
         }
+
+        for (const ResolvedId& entry : resolved)
+        {
+            const auto it = slotByValue.find(entry.enumValue);
+            if (it == slotByValue.end()) { ++counts.unmapped; continue; }
+
+            const size_t slot = it->second;
+            AchievementReadState state;
+            if (previous[slot].idText == entry.text)
+                state = std::move(previous[slot]);
+            state.idKnown = true;
+            state.id      = entry.id;
+            state.idText  = entry.text;
+            g_achSlots[slot].read = std::move(state);
+            ++counts.matched;
+        }
+        return counts;
+    }
+
+    // GAME THREAD ONLY. Read the EAchievements -> platform-id map off the live
+    // subsystem. The ids are FNames taken straight out of the map, so nothing has
+    // to build one from a string -- which could not work anyway, since the name
+    // pool holds "EAchievements::KillTwins" as a single name and a standalone
+    // "KillTwins" need not exist in it.
+    int BuildAchievementIdTableGameThread(UObject* subsystem, bool forced)
+    {
+        const Reflect::MapView map = Reflect::OpenMapProperty(subsystem, AH::Prop_AchievementsMap);
+        if (!map.valid)
+        {
+            if (ShouldLogFailure(g_achIdMapLogged))
+                LOG("Achievements: %s unreadable -- %s. Unlocking still works; only the "
+                    "Steam-state read needs the ids.", AH::Prop_AchievementsMap, map.error.c_str());
+            return 0;
+        }
+        IdValueKind kind = IdValueKind::Name;
+        if (!ValidateIdMapShape(map, kind))
+            return 0;
+        g_achIdMapLogged.store(false);
+
+        const std::vector<RawId> raw = ReadMapRows(map, kind);
+        int unresolved = 0;
+        const std::vector<ResolvedId> resolved = MintIds(raw, unresolved);
+        const IdTableCounts counts = ApplyIdTable(resolved);
 
         // The table is rebuilt on every read; say so only when it came out different.
         static int s_loggedMatched = -1, s_loggedUnmapped = -1, s_loggedUnresolved = -1;
-        if (forced || matched != s_loggedMatched || unmapped != s_loggedUnmapped ||
+        if (forced || counts.matched != s_loggedMatched || counts.unmapped != s_loggedUnmapped ||
             unresolved != s_loggedUnresolved)
         {
-            s_loggedMatched    = matched;
-            s_loggedUnmapped   = unmapped;
+            s_loggedMatched    = counts.matched;
+            s_loggedUnmapped   = counts.unmapped;
             s_loggedUnresolved = unresolved;
             LOG("Achievements: id table built -- %d of %d entries matched (%d map rows not in the "
                 "menu list, %d ids that could not be made into an FName)",
-                matched, listed, unmapped, unresolved);
+                counts.matched, counts.listed, counts.unmapped, unresolved);
         }
-        return matched;
+        return counts.matched;
     }
 
     // =====================================================================
@@ -673,33 +771,26 @@ namespace
     // GAME THREAD ONLY. The achievement's display name for an id, as the engine
     // cache holds it (Steam's own title).
     //
-    // Called once per id and cached, not once per refresh: the FText out-params
-    // arrive holding a reference we have no way to release, so repeating this
-    // every refresh would leak a text object per achievement per press.
+    // Called once per id and cached (a forced refresh retries the ones still
+    // empty), not once per refresh: the FText out-params arrive holding a reference
+    // we have no way to release, so repeating this every refresh would leak a text
+    // object per achievement per press.
     std::string FetchAchievementTitleGameThread(UObject* world, UObject* pc, const FName& id)
     {
-        try
-        {
-            UObject*   lib    = CachedObject(AH::Obj_AchievementBPLibrary);
-            UFunction* descFn = CachedFn(AH::Fn_GetCachedAchievementDescription);
-            if (!lib || !descFn) return {};
+        P_GetCachedAchievementDescription descParams{};
+        descParams.WorldContextObject = world;
+        descParams.PlayerController   = pc;
+        descParams.AchievementID      = id;
+        if (!CallEngine(AH::Obj_AchievementBPLibrary, AH::Fn_GetCachedAchievementDescription,
+                        &descParams, "GetCachedAchievementDescription"))
+            return {};
+        if (!descParams.bFoundID) return {};
 
-            P_GetCachedAchievementDescription descParams{};
-            descParams.WorldContextObject = world;
-            descParams.PlayerController   = pc;
-            descParams.AchievementID      = id;
-            if (!Dispatch(lib, descFn, &descParams, "GetCachedAchievementDescription")) return {};
-            if (!descParams.bFoundID) return {};
-
-            UObject*   textLib = CachedObject(AH::Obj_KismetTextLibrary);
-            UFunction* convFn  = CachedFn(AH::Fn_ConvTextToString);
-            if (!textLib || !convFn) return {};
-
-            P_ConvTextToString convParams{};
-            std::memcpy(convParams.InText, descParams.Title, sizeof(convParams.InText));
-            if (!Dispatch(textLib, convFn, &convParams, "Conv_TextToString")) return {};
-            return convParams.ReturnValue.ToString();
-        }
+        P_ConvTextToString convParams{};
+        std::memcpy(convParams.InText, descParams.Title, sizeof(convParams.InText));
+        if (!CallEngine(AH::Obj_KismetTextLibrary, AH::Fn_ConvTextToString, &convParams, "Conv_TextToString"))
+            return {};
+        try { return convParams.ReturnValue.ToString(); }
         catch (...) { return {}; }
     }
 
@@ -716,13 +807,12 @@ namespace
     // regardless.
     struct ReadContext
     {
-        UObject*   world = nullptr;
-        UObject*   pc    = nullptr;
-        UObject*   lib   = nullptr;
-        UFunction* progressFn = nullptr;
-        SteamApi   steam;
+        UObject*  world = nullptr;
+        UObject*  pc    = nullptr;
+        EngineFn  progress;
+        SteamApi  steam;
 
-        bool EngineReadable() const { return lib && progressFn; }
+        bool EngineReadable() const { return (bool)progress; }
     };
 
     // Whether a read moved anything the log table or the row would show.
@@ -736,6 +826,14 @@ namespace
             || IsUnlocked(before) != IsUnlocked(after);
     }
 
+    // The hover line "Unlocked: ..." for a state that has just been read.
+    std::string UnlockTextOf(const AchievementReadState& st)
+    {
+        if (!st.steamReachable) return "Steam unavailable";
+        if (st.steamResolved)   return FormatUnlockTime(st.steamUnlockTime);
+        return "no Steam answer";
+    }
+
     // GAME THREAD ONLY. Ask Steam and the engine cache about one slot and store
     // the answers. True when the answer differs from the previous read.
     bool ReadOneAchievement(int slot, const ReadContext& ctx, ReadTotals& totals)
@@ -746,7 +844,7 @@ namespace
         AchievementReadState before;
         {
             std::lock_guard<std::mutex> lk(g_achMutex);
-            const AchievementReadState& st = g_achStates[slot];
+            const AchievementReadState& st = g_achSlots[slot].read;
             if (!st.idKnown) return false;
             id        = st.id;
             idText    = st.idText;
@@ -762,7 +860,7 @@ namespace
             p.WorldContextObject = ctx.world;
             p.PlayerController   = ctx.pc;
             p.AchievementID      = id;
-            if (Dispatch(ctx.lib, ctx.progressFn, &p, "GetCachedAchievementProgress"))
+            if (CallEngine(ctx.progress, &p, "GetCachedAchievementProgress"))
             {
                 engineFound    = p.bFoundID;
                 engineProgress = p.Progress;
@@ -780,7 +878,7 @@ namespace
         const bool steamAnswered = ReadSteamAchievementState(ctx.steam, idText.c_str(), steamAchieved, steamWhen);
 
         std::lock_guard<std::mutex> lk(g_achMutex);
-        AchievementReadState& st = g_achStates[slot];
+        AchievementReadState& st = g_achSlots[slot].read;
         st.queried         = true;
         st.engineFound     = engineFound;
         st.engineProgress  = engineProgress;
@@ -788,6 +886,7 @@ namespace
         st.steamResolved   = steamAnswered;
         st.steamAchieved   = steamAchieved;
         st.steamUnlockTime = steamWhen;
+        st.unlockText      = UnlockTextOf(st);
         if (fetchTitle)
         {
             st.titleAttempted = true;
@@ -799,6 +898,17 @@ namespace
         if (engineFound)    ++totals.engineFound;
         if (IsUnlocked(st)) ++totals.unlocked;
         return AnswerChanged(before, st);
+    }
+
+    // A manual refresh gives every title that is still empty one more try, so a
+    // title the cache had not filled in yet is picked up without waiting for a
+    // restart. Automatic reads leave them alone (see FetchAchievementTitleGameThread).
+    void ClearEmptyTitleAttempts()
+    {
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        for (AchievementSlot& slot : g_achSlots)
+            if (slot.read.title.empty())
+                slot.read.titleAttempted = false;
     }
 
     struct StateLogLine
@@ -821,13 +931,14 @@ namespace
         lines.reserve(slots.size());
         {
             std::lock_guard<std::mutex> lk(g_achMutex);
-            for (int slot : slots)
+            for (int index : slots)
             {
-                if (slot < 0 || slot >= (int)g_achStates.size() || slot >= (int)g_achCatalog.size())
+                if (index < 0 || index >= (int)g_achSlots.size())
                     continue;
-                const AchievementReadState& st = g_achStates[slot];
+                const AchievementSlot&      slot = g_achSlots[index];
+                const AchievementReadState& st   = slot.read;
                 StateLogLine line;
-                line.name   = g_achCatalog[slot].name;
+                line.name   = slot.name;
                 line.title  = st.title;
                 line.engine = !st.idKnown ? "NO ID"
                             : !st.engineFound ? "no answer"
@@ -874,6 +985,23 @@ namespace
                           totals.unlocked, total, totals.steamAnswered, totals.queried);
     }
 
+    // Stores the summary for the tab and the status line; it reaches the log on a
+    // forced read and when its text changed since the last one.
+    void PublishReadSummary(const ReadContext& ctx, const ReadTotals& totals, int total, bool forced)
+    {
+        char summary[256];
+        FormatReadSummary(summary, sizeof(summary), ctx, totals, total);
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(g_achMutex);
+            changed = g_achSteamReadSummary != summary;
+            g_achSteamReadSummary = summary;
+        }
+        if (forced || changed)
+            LOG("Achievements: %s", summary);
+        SetAchievementStatus(summary);
+    }
+
     // GAME THREAD ONLY. One read of everything the engine cache and Steam know.
     // The per-id table, the id-table line and the summary go to the log on a
     // forced read (the Refresh button) and when they changed since the last read,
@@ -888,26 +1016,29 @@ namespace
             ctx.pc    = GetPlayerController();
             if (!subsystem || !ctx.world || !ctx.pc)
             {
-                LOG("Achievements: state read skipped (subsystem=%p world=%p pc=%p)",
-                    (void*)subsystem, (void*)ctx.world, (void*)ctx.pc);
+                // On the main menu this is every read; say it once.
+                if (ShouldLogFailure(g_achReadSkipLogged))
+                    LOG("Achievements: state read skipped (subsystem=%p world=%p pc=%p)",
+                        (void*)subsystem, (void*)ctx.world, (void*)ctx.pc);
                 SetAchievementStatus("Achievement subsystem not available: not in a live game yet.");
                 return;
             }
+            g_achReadSkipLogged.store(false);
 
-            // The id table (re)creates g_achStates, so the per-id reads below run after it.
+            // The id table (re)creates the slots' read state, so the per-id reads below run after it.
             if (BuildAchievementIdTableGameThread(subsystem, forced) <= 0)
             {
                 SetAchievementStatus("Achievement ids unavailable: the subsystem's id map could not be read -- see the log.");
                 return;
             }
+            if (forced)
+                ClearEmptyTitleAttempts();
 
-            ctx.steam      = ResolveSteamApi();
-            ctx.lib        = CachedObject(AH::Obj_AchievementBPLibrary);
-            ctx.progressFn = CachedFn(AH::Fn_GetCachedAchievementProgress);
+            ctx.steam    = ResolveSteamApi();
+            ctx.progress = ResolveEngineFn(AH::Obj_AchievementBPLibrary, AH::Fn_GetCachedAchievementProgress);
             if (!ctx.EngineReadable() && FirstTime("engine-progress-library"))
                 LOG("Achievements: engine progress read unavailable (lib=%p fn=%p) -- no cache fallback",
-                    (void*)ctx.lib, (void*)ctx.progressFn);
-            g_achSteamUnavailable.store(!ctx.steam.Reachable());
+                    (void*)ctx.progress.object, (void*)ctx.progress.fn);
             if (!ctx.steam.Reachable() && !ctx.EngineReadable())
             {
                 SetAchievementStatus("Neither Steam nor the engine cache can be read -- see the log.");
@@ -917,7 +1048,7 @@ namespace
             int total = 0;
             {
                 std::lock_guard<std::mutex> lk(g_achMutex);
-                total = (int)g_achStates.size();
+                total = (int)g_achSlots.size();
             }
             ReadTotals       totals;
             std::vector<int> toLog;
@@ -928,18 +1059,7 @@ namespace
                     toLog.push_back(i);
             }
             LogStateTable(toLog);
-
-            char summary[256];
-            FormatReadSummary(summary, sizeof(summary), ctx, totals, total);
-            bool summaryChanged = false;
-            {
-                std::lock_guard<std::mutex> lk(g_achMutex);
-                summaryChanged = g_achSteamReadSummary != summary;
-                g_achSteamReadSummary = summary;
-            }
-            if (forced || summaryChanged)
-                LOG("Achievements: %s", summary);
-            SetAchievementStatus(summary);
+            PublishReadSummary(ctx, totals, total, forced);
         }
         catch (...)
         {
@@ -959,6 +1079,10 @@ namespace
             std::lock_guard<std::mutex> lk(g_achMutex);
             if (g_achCachePrimed) return;
         }
+        // A prime the game thread had to skip backs off like the other retries.
+        const ULONGLONG failedAt = g_achPrimeFailedMs.load();
+        if (failedAt && GetTickCount64() - failedAt < kAchResolveRetryMs)
+            return;
         if (!EnsurePump(false))
             return;
         {
@@ -970,6 +1094,7 @@ namespace
         {
             if (PrimeAchievementCacheGameThread())
                 return;
+            g_achPrimeFailedMs.store(GetTickCount64());
             std::lock_guard<std::mutex> lk(g_achMutex);
             g_achCachePrimed = false;
         });
@@ -983,10 +1108,11 @@ namespace
     {
         if (!EnsurePump(forced))
             return QueueResult::NoPump;
-        if (InterlockedCompareExchange(&g_achRefreshInFlight, 1, 0) != 0)
+        int idle = 0;
+        if (!g_achRefreshInFlight.compare_exchange_strong(idle, 1))
             return QueueResult::InFlight;
 
-        InterlockedExchange(&g_achReadWanted, 0);
+        g_achReadWanted.store(0);
         const ULONGLONG queuedMs = GetTickCount64();
         LOG("achievements: state read start");
         QueueGameThread([forced, queuedMs]()
@@ -996,26 +1122,22 @@ namespace
             const ULONGLONG doneMs = GetTickCount64();
             g_achLastReadDoneMs.store(doneMs);
             LOG("achievements: state read done (%llu ms)", (unsigned long long)(doneMs - queuedMs));
-            InterlockedExchange(&g_achRefreshInFlight, 0);
+            g_achRefreshInFlight.store(0);
         });
         return QueueResult::Queued;
     }
 
-    // Confirmed unlocked by Steam beats Sent (the unlock landed), Sent beats
-    // everything else (it is what this menu did). Past that a reachable Steam is
-    // the only authority; the engine cache speaks only while Steam is unreachable.
-    Row::State RowStateOf(const AchievementReadState* st, bool sentByUs)
+    // Unlocked (by the one IsUnlocked rule: Steam's word while it is reachable,
+    // the cache's while it is not) beats Sent, which is what this menu did. Past
+    // that a reachable Steam is the only authority; the cache speaks only while
+    // Steam is unreachable.
+    Row::State RowStateOf(const AchievementReadState& st, bool sentByUs)
     {
-        if (st && st->steamReachable && st->steamResolved && st->steamAchieved)
-            return Row::State::Unlocked;
-        if (sentByUs)              return Row::State::Sent;
-        if (!st || !st->queried)   return Row::State::Unknown;
-
-        if (st->steamReachable)
-            return st->steamResolved ? Row::State::Locked : Row::State::NoAnswer;
-        if (!st->engineFound)
-            return Row::State::NoAnswer;
-        return EngineSaysUnlocked(*st) ? Row::State::Unlocked : Row::State::Locked;
+        if (IsUnlocked(st))      return Row::State::Unlocked;
+        if (sentByUs)            return Row::State::Sent;
+        if (!st.queried)         return Row::State::Unknown;
+        if (st.steamReachable)   return st.steamResolved ? Row::State::Locked : Row::State::NoAnswer;
+        return st.engineFound ? Row::State::Locked : Row::State::NoAnswer;
     }
 
     const char* BaseStateLabel(Row::State state)
@@ -1054,26 +1176,15 @@ namespace
         return "Not read yet.";
     }
 
-    // Unlocked only disables the button when Steam said so; a cache "unlocked" is
-    // not trusted.
+    // A Steam-confirmed unlock disables the button; a cache "unlocked" is not
+    // trusted and does not. A row this menu already fired stays disabled either way.
     void ApplyUnlockEnablement(Row& row)
     {
         const bool steamUnlocked = row.state == Row::State::Unlocked && row.source == Row::Source::Steam;
-        if (steamUnlocked)
-        {
-            row.canUnlock      = false;
-            row.disabledReason = "Already unlocked";
-        }
-        else if (row.state == Row::State::Sent)
-        {
-            row.canUnlock      = false;
-            row.disabledReason = "Sent, waiting for Steam";
-        }
-        else
-        {
-            row.canUnlock      = true;
-            row.disabledReason = "";
-        }
+        row.canUnlock      = !steamUnlocked && !row.sent;
+        row.disabledReason = steamUnlocked ? "Already unlocked"
+                           : row.sent      ? "Sent, waiting for Steam"
+                                           : "";
     }
 
     // =====================================================================
@@ -1355,7 +1466,7 @@ namespace
 int Achievements::Count()
 {
     std::lock_guard<std::mutex> lk(g_achMutex);
-    return (int)g_achCatalog.size();
+    return (int)g_achSlots.size();
 }
 
 void Achievements::ResolveList()
@@ -1365,7 +1476,7 @@ void Achievements::ResolveList()
     bool listUp = false;
     {
         std::lock_guard<std::mutex> lk(g_achMutex);
-        listUp = !g_achCatalog.empty();
+        listUp = !g_achSlots.empty();
     }
     if (listUp)
     {
@@ -1406,7 +1517,7 @@ void Achievements::RetryResolve()
 
 bool Achievements::ReadInFlight()
 {
-    return g_achRefreshInFlight != 0;
+    return g_achRefreshInFlight.load() != 0;
 }
 
 void Achievements::RefreshState()
@@ -1427,7 +1538,7 @@ void Achievements::AutoRefresh()
 
     if (ReadInFlight()) return;
     const ULONGLONG lastDoneMs = g_achLastReadDoneMs.load();
-    const bool      soon       = g_achReadWanted != 0;
+    const bool      soon       = g_achReadWanted.load() != 0;
     if (!soon && lastDoneMs && GetTickCount64() - lastDoneMs < kAchAutoRefreshMs)
         return;
     QueueAchievementStateRead(false);
@@ -1448,31 +1559,21 @@ unsigned int Achievements::SecondsSinceRefresh()
 bool Achievements::RowAt(int index, Row& out)
 {
     std::lock_guard<std::mutex> lk(g_achMutex);
-    if (index < 0 || index >= (int)g_achCatalog.size())
+    if (index < 0 || index >= (int)g_achSlots.size())
         return false;
 
-    const AchievementCatalogEntry& entry = g_achCatalog[index];
-    // The state vector only exists once the first id table has been built.
-    const AchievementReadState* st = index < (int)g_achStates.size() ? &g_achStates[index] : nullptr;
-    const bool fromEngineCache = st && st->queried && !st->steamReachable;
+    const AchievementSlot&      slot = g_achSlots[index];
+    const AchievementReadState& st   = slot.read;
+    const bool fromEngineCache = FromEngineCache(st);
 
     out = Row{};
-    out.enumValue = entry.enumValue;
-    out.name      = entry.name.c_str();
-    std::snprintf(out.unlockText, sizeof(out.unlockText), "not read");
-    if (st)
-    {
-        std::snprintf(out.title, sizeof(out.title), "%s", st->title.c_str());
-        if (fromEngineCache)
-            std::snprintf(out.unlockText, sizeof(out.unlockText), "Steam unavailable");
-        else if (st->steamResolved)
-            std::snprintf(out.unlockText, sizeof(out.unlockText), "%s",
-                          FormatUnlockTime(st->steamUnlockTime).c_str());
-        else if (st->queried)
-            std::snprintf(out.unlockText, sizeof(out.unlockText), "no Steam answer");
-    }
-    out.titlePending = !st || !st->titleAttempted;
-    out.state        = RowStateOf(st, g_achSent.find(entry.enumValue) != g_achSent.end());
+    out.enumValue = slot.enumValue;
+    out.name      = slot.name.c_str();
+    std::snprintf(out.title, sizeof(out.title), "%s", st.title.c_str());
+    std::snprintf(out.unlockText, sizeof(out.unlockText), "%s", st.unlockText.c_str());
+    out.titlePending = st.title.empty();
+    out.sent         = g_achSent.find(slot.enumValue) != g_achSent.end();
+    out.state        = RowStateOf(st, out.sent);
 
     // A sent row is this menu's own word, not a cache reading, so only the states
     // that came from the cache carry the mark.
@@ -1489,17 +1590,13 @@ Achievements::Tally Achievements::GetTally()
 {
     Tally tally;
     std::lock_guard<std::mutex> lk(g_achMutex);
-    tally.total           = (int)g_achCatalog.size();
-    tally.fromEngineCache = g_achSteamUnavailable.load();
-    for (const AchievementReadState& st : g_achStates)
-        if (st.queried && IsUnlocked(st))
-            ++tally.unlocked;
+    tally.total = (int)g_achSlots.size();
+    for (const AchievementSlot& slot : g_achSlots)
+    {
+        if (IsUnlocked(slot.read))      ++tally.unlocked;
+        if (FromEngineCache(slot.read)) tally.fromEngineCache = true;
+    }
     return tally;
-}
-
-bool Achievements::SteamUnavailable()
-{
-    return g_achSteamUnavailable.load();
 }
 
 void Achievements::SetSteamSimulation(SteamSimulation mode)
@@ -1538,8 +1635,8 @@ void Achievements::Unlock(int enumValue)
     std::string label = std::to_string(enumValue);
     {
         std::lock_guard<std::mutex> lk(g_achMutex);
-        for (const AchievementCatalogEntry& e : g_achCatalog)
-            if (e.enumValue == enumValue) { label = e.name; break; }
+        for (const AchievementSlot& s : g_achSlots)
+            if (s.enumValue == enumValue) { label = s.name; break; }
     }
 
     LOG("Achievements: unlock requested -- %s (%d)", label.c_str(), enumValue);
@@ -1554,7 +1651,7 @@ void Achievements::Unlock(int enumValue)
     // Let the next auto tick pick it up rather than making the user press refresh.
     // Steam may not have committed it that fast, but the recurring cadence will
     // catch it either way.
-    InterlockedExchange(&g_achReadWanted, 1);
+    g_achReadWanted.store(1);
 }
 
 const char* Achievements::LastActionStatus()

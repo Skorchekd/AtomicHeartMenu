@@ -115,11 +115,12 @@ namespace Achievements
         int          enumValue = 0;           // EAchievements numeric value
         const char*  name  = "";              // short name, "EAchievements::" stripped
         char         title[96] = {};          // Steam's display name; empty until fetched
-        bool         titlePending = true;     // title not attempted yet (an attempted-but-empty title is not pending)
+        bool         titlePending = true;     // no title yet: not fetched, or fetched and empty
         State        state  = State::Unknown;
         Source       source = Source::Steam;
         char         stateLabel[24] = {};     // "unlocked", "locked (cache)", ...
         const char*  stateTooltip = "";       // what the label means
+        bool         sent = false;            // this menu fired its unlock this session
         char         unlockText[32] = {};     // when Steam says it was unlocked, or why that is unknown
         bool         canUnlock = false;
         const char*  disabledReason = "";     // why canUnlock is false; "" when enabled
@@ -134,7 +135,6 @@ namespace Achievements
         bool fromEngineCache = false;
     };
     Tally GetTally();
-    bool  SteamUnavailable();                   // the last read could not use steam_api64
 
     // Debug toggle: make the Steam resolver report a failure (and log that piece)
     // without touching the real handles.
