@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <vector>
 #include <string>
+#include <functional>
 
 // Central feature state + per-frame application. The render hook calls
 // Features::Tick() once per presented frame (after the SDK is ready).
@@ -290,14 +291,6 @@ namespace Features
     // Diagnostics: diff every reflected member offset against offsets.h, naming
     // any a patch has moved. Worker thread; results go to the log.
     void DebugVerifyMemberOffsets();
-    // Discovery: log the game's whole achievement API off the running game --
-    // every UFunction / class / struct / enum whose name contains "Achiev", with
-    // full paths, params-block sizes and per-parameter type+offset, plus the
-    // EAchievements name->value table and the full API of the two subsystems that
-    // own the path. This is what a ProcessEvent achievement call has to be built
-    // from; nothing here writes, calls or unlocks anything. Worker thread; results
-    // go to the log.
-    void DebugDumpAchievementApi();
     // Discovery: full named-field reflection dump of every loaded actor whose
     // class/name/path contains nameSubstr (e.g. "Larisa"), incl. its controller +
     // movement component. Runs on a worker thread (never freezes the game).
@@ -391,87 +384,25 @@ namespace Features
     const WeaponEntry* WeaponList();
     int WeaponCount();
 
-    // ---- Achievements -------------------------------------------------------
-    // Fires the game's OWN achievement event
-    // (GameplayEventUtils.SendAchievementUnlockEvent), so UAHAchievementSubsystem
-    // does its normal bookkeeping and tells Steam itself. Nothing here writes to
-    // Steam directly, and nothing here is a workaround for a block: the game has
-    // no cheats-used gate. It exists because cheats make you SKIP the triggers --
-    // fly past a boss and UnlockBossAchievement simply never fires.
-    //
-    // Every call is marshalled to the game thread. An unlock broadcasts a
-    // gameplay event that runs game logic (UI popup, the Steam write), which is
-    // exactly the kind of work the render thread must not start.
-    struct AchievementEntry
-    {
-        int         value;  // EAchievements numeric value
-        const char* name;   // short name, "EAchievements::" stripped
-    };
+    // ---- Engine helpers shared with achievements.cpp -----------------------
+    // Defined in features.cpp; the achievements module needs them and must not
+    // grow its own copies.
 
-    // The list is read from the live EAchievements UEnum, never hardcoded, so a
-    // patch that adds or reorders entries needs no code change. Resolving it needs
-    // a GObjects scan, so it happens on a worker thread: Ready() is false until it
-    // lands, and the menu says so rather than showing an empty list.
-    const AchievementEntry* AchievementList();
-    int  AchievementCount();
-    bool AchievementsReady();
-    void AchievementResolveList();          // idempotent; safe to call every frame
+    // Run `fn` on the game thread, from the ProcessEvent hook's drain. Nothing
+    // drains the queue until InstallProcessEventHook() has succeeded.
+    void QueueGameThread(std::function<void()> fn);
+    bool InstallProcessEventHook();
 
-    void AchievementUnlock(int value);      // one, on the game thread
-    void AchievementUnlockAll();            // all, streamed one per tick
-    void AchievementCancelUnlockAll();
-    int  AchievementUnlockAllRemaining();   // 0 when idle
-    // Progress-type achievements (AHAchievementSubsystem.UpdateAchievementProgress).
-    void AchievementSetProgress(int value, float current, float maxValue);
-    bool AchievementWasSent(int value);     // did WE fire it this session?
-    const char* AchievementStatus();        // one line for the UI
+    // Resolve and cache a UFunction by full name / a UObject by name.
+    UE::UFunction* CachedFn(const char* fullName);
+    UE::UObject*   CachedObject(const char* name);
 
-    // What Steam actually holds, read back through the engine's own cache
-    // (AchievementBlueprintLibrary.GetCachedAchievementProgress). `progress` is
-    // UE's 0..100 percentage, so a plain achievement reads 0 or 100.
-    //
-    // The three flags are deliberately separate, because "we could not ask" and
-    // "Steam says locked" must not look the same in the UI: idKnown is false when
-    // the game's own EAchievements->id map could not be read, and found is false
-    // when Steam's cache has no answer yet -- which on a first read usually means
-    // the async cache is still filling, not that the achievement is locked.
-    struct AchievementStateView
-    {
-        bool  idKnown  = false;
-        bool  queried  = false;
-        bool  found    = false;   // the ENGINE's cached layer answered
-        float progress = 0.0f;    // ...with 0 or 100; it has no middle on this build
-        // Steam itself, read from steam_api64.dll. Authoritative: the engine's
-        // cached value reports UNLOCKED for counting achievements that are only
-        // part-done, which is how Gold Rush and Apple Pie 3826 read as earned.
-        bool         steamResolved   = false;
-        bool         steamAchieved   = false;
-        unsigned int steamUnlockTime = 0;   // unix seconds; 0 when never unlocked
-        // The GAME's own counters, not Steam's -- Steam reports no partial counts
-        // at all. Only the ~29 counting achievements have a target; for the rest
-        // hasTarget is false and there is nothing to draw.
-        bool  hasTarget = false;
-        float current   = 0.0f;
-        float target    = 0.0f;
-        // Steam's own display name ("Gold Rush"), which is NOT the internal
-        // EAchievements spelling ("GoldenFever"). Empty until fetched. Copied by
-        // value rather than pointed at, so it cannot dangle behind the lock.
-        char  title[96] = {};
-
-        bool Unlocked() const
-        {
-            return steamResolved ? steamAchieved : (found && progress >= 100.0f);
-        }
-        bool Known() const { return steamResolved || (queried && found); }
-    };
-    bool AchievementStateAt(int index, AchievementStateView& out);
-    void AchievementRefreshState();         // prime + read, forced, on the game thread
-    // Called every frame the tab is open. Throttled and single-flight, so it is a
-    // no-op on most frames; re-reads state on a slow cadence so bars and unlock
-    // states follow the game without anyone pressing anything. Does NOT re-prime
-    // the engine's achievement cache -- that is an async online query and firing
-    // one every few seconds would be rude to the subsystem for no benefit.
-    void AchievementAutoRefresh();
-    unsigned int AchievementSecondsSinceRefresh(); // UINT_MAX if never
-    const char* AchievementStateSummary();
+    // Name and reflection helpers that never fault: empty / false on an
+    // unreadable object.
+    std::string LowerCopy(std::string s);
+    std::string SafeFNameToString(const UE::FName& name);
+    std::string SafeObjectName(UE::UObject* o);
+    std::string SafeObjectFullName(UE::UObject* o);
+    std::string SafeClassName(UE::UObject* o);
+    bool        IsStructLike(UE::UObject* object);
 }

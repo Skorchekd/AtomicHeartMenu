@@ -15,6 +15,7 @@
 #include "../core/exception_guard.h"
 #include "../core/globals.h"
 #include "../core/log.h"
+#include "../features/achievements.h"
 #include "../features/features.h"
 #include "../hooks/native_hooks.h"
 #include "../hooks/ai_movement_hooks.h"
@@ -24,8 +25,6 @@
 #include <cfloat>
 #include <cctype>
 #include <cstdio>
-#include <climits>
-#include <ctime>
 #include <vector>
 #include <string>
 
@@ -940,6 +939,143 @@ static void RenderHookTestingTab()
     ImGui::Text("Hook roster: %d    Global squad: %d", Features::HookAiCount(), Features::AiSquadCount());
 }
 
+// ---- Achievements tab ------------------------------------------------------------
+static void RenderAchievementRow(const Achievements::Row& row)
+{
+    using State = Achievements::Row::State;
+
+    ImGui::PushID(7000 + row.enumValue);
+    ImGui::BeginDisabled(!row.canUnlock);
+    if (ImGui::Button("Unlock", ImVec2(64, 0)))
+    {
+        LOG("UI: unlock achievement %s (%d)", row.name, row.enumValue);
+        Achievements::Unlock(row.enumValue);
+    }
+    ImGui::EndDisabled();
+    if (!row.canUnlock && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", row.disabledReason);
+    ImGui::SameLine();
+
+    // One state per row, in a fixed-width column so every row's name starts at
+    // the same x.
+    switch (row.state)
+    {
+    case State::Unlocked:
+        ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.45f, 1.0f), "%-9s", "unlocked");
+        break;
+    case State::Sent:
+        ImGui::TextColored(ImVec4(0.45f, 0.65f, 0.95f, 1.0f), "%-9s", "sent");
+        break;
+    case State::Locked:
+        ImGui::TextDisabled("%-9s", "locked");
+        break;
+    case State::NoAnswer:
+        ImGui::TextColored(ImVec4(0.80f, 0.45f, 0.35f, 1.0f), "%-9s", "no answer");
+        break;
+    case State::Unknown:
+        ImGui::TextDisabled("%-9s", "?");
+        break;
+    }
+    ImGui::SameLine();
+
+    ImGui::Text("%3d  %s", row.enumValue, row.title[0] ? row.title : row.name);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("EAchievements::%s  (value %d)\nSteam: %s\nUnlocked: %s",
+                          row.name, row.enumValue,
+                          row.title[0] ? row.title : "(name not read)", row.unlockText);
+    ImGui::PopID();
+}
+
+static void RenderAchievementsTab()
+{
+    // Both idempotent and cheap on most frames: the first resolves the live
+    // EAchievements enum on a worker thread, the second re-reads Steam on a slow
+    // cadence so the list stays current without anyone pressing anything.
+    Achievements::ResolveList();
+    Achievements::AutoRefresh();
+
+    ImGui::TextWrapped("Fires the game's OWN achievement event, so Atomic Heart tells Steam "
+                       "itself and its bookkeeping stays consistent -- the same path a real "
+                       "unlock takes.");
+    ImGui::TextDisabled("Nothing here is a bypass: the game has no cheats-used gate and "
+                        "never blocks achievements. What cheats cost you is the TRIGGER -- "
+                        "fly past a boss and the game's own unlock simply never fires.");
+    ImGui::Spacing();
+
+    const int count = Achievements::Count();
+    if (count <= 0)
+    {
+        ImGui::TextDisabled(G::sdkReady.load()
+                                ? "Reading EAchievements off the running game..."
+                                : "SDK not resolved -- achievements need the engine globals.");
+    }
+    else
+    {
+        static char achFilter[64] = "";
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##achfilter", "type to filter: kill, playthrough, craft...",
+                                 achFilter, sizeof(achFilter));
+
+        // --- Steam state ---------------------------------------------------
+        ImGui::Spacing();
+        if (ImGui::Button("Refresh now", ImVec2(-FLT_MIN, 0)))
+        {
+            LOG("UI: refresh achievement state");
+            Achievements::RefreshState();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("This refreshes itself every few seconds while the tab is\n"
+                              "open; the button also re-runs the engine's achievement\n"
+                              "query, which is what to press if names or states look\n"
+                              "stale after a fresh injection.");
+        const unsigned int age = Achievements::SecondsSinceRefresh();
+        if (age == Achievements::kNeverRefreshed)
+            ImGui::TextDisabled("Reading...");
+        else
+            ImGui::TextDisabled("Updated %us ago (auto every %us).  %s",
+                                age, Achievements::AutoRefreshSeconds(),
+                                Achievements::SteamReadSummary());
+
+        // --- the list ------------------------------------------------------
+        ImGui::Spacing();
+        std::string needle = achFilter;
+        for (char& c : needle) c = (char)std::tolower((unsigned char)c);
+
+        ImGui::BeginChild("achlist", ImVec2(0, 300), ImGuiChildFlags_Borders);
+        int shown = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            Achievements::Row row;
+            if (!Achievements::RowAt(i, row))
+                continue;
+
+            if (!needle.empty())
+            {
+                // Match either spelling -- people search for what Steam showed
+                // them, not for the internal enum name.
+                std::string hay = row.name;
+                if (row.title[0]) { hay += ' '; hay += row.title; }
+                for (char& c : hay) c = (char)std::tolower((unsigned char)c);
+                if (hay.find(needle) == std::string::npos)
+                    continue;
+            }
+            ++shown;
+            RenderAchievementRow(row);
+        }
+        if (shown == 0)
+            ImGui::TextDisabled("Nothing matches \"%s\".", achFilter);
+        ImGui::EndChild();
+        ImGui::TextDisabled("%d of %d shown.  unlocked / locked come from Steam itself.  "
+                            "\"?\" = not read yet, \"no answer\" = nothing answered for "
+                            "that id.  \"sent\" = fired by this menu this session.  Hover "
+                            "a row for its id and unlock date.", shown, count);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextWrapped("Status: %s", Achievements::LastActionStatus());
+}
+
 void Menu::Render()
 {
     auto& f = Features::Get();
@@ -1279,247 +1415,7 @@ void Menu::Render()
 
         if (ImGui::BeginTabItem("Achievements"))
         {
-            // Both idempotent and cheap on most frames: the first resolves the live
-            // EAchievements enum on a worker thread, the second re-reads Steam and
-            // the game's counters on a slow cadence so the list stays current
-            // without anyone pressing anything.
-            Features::AchievementResolveList();
-            Features::AchievementAutoRefresh();
-
-            ImGui::TextWrapped("Fires the game's OWN achievement event, so Atomic Heart tells Steam "
-                               "itself and its bookkeeping stays consistent -- the same path a real "
-                               "unlock takes.");
-            ImGui::TextDisabled("Nothing here is a bypass: the game has no cheats-used gate and "
-                                "never blocks achievements. What cheats cost you is the TRIGGER -- "
-                                "fly past a boss and the game's own unlock simply never fires.");
-            ImGui::Spacing();
-
-            const int count = Features::AchievementCount();
-            const Features::AchievementEntry* list = Features::AchievementList();
-            if (!list || count <= 0)
-            {
-                ImGui::TextDisabled(G::sdkReady.load()
-                                        ? "Reading EAchievements off the running game..."
-                                        : "SDK not resolved -- achievements need the engine globals.");
-            }
-            else
-            {
-                static char achFilter[64] = "";
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ImGui::InputTextWithHint("##achfilter", "type to filter: kill, playthrough, craft...",
-                                         achFilter, sizeof(achFilter));
-
-                // --- unlock all (streamed) ---------------------------------
-                const int remaining = Features::AchievementUnlockAllRemaining();
-                if (remaining > 0)
-                {
-                    ImGui::ProgressBar(1.0f - (float)remaining / (float)count, ImVec2(-FLT_MIN, 0));
-                    if (ImGui::Button("Cancel unlock all", ImVec2(-FLT_MIN, 0)))
-                    {
-                        LOG("UI: cancel unlock all");
-                        Features::AchievementCancelUnlockAll();
-                    }
-                }
-                else
-                {
-                    char allLabel[64];
-                    std::snprintf(allLabel, sizeof(allLabel), "Unlock ALL %d (one every 150ms)", count);
-                    if (AccentButton(allLabel))
-                    {
-                        LOG("UI: unlock all achievements (%d)", count);
-                        Features::AchievementUnlockAll();
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Streamed, not looped: each unlock is a gameplay event the\n"
-                                          "game answers with a popup and a Steam write, so they are\n"
-                                          "paced out instead of dumped into one frame.");
-                }
-
-                // --- Steam state -------------------------------------------
-                ImGui::Spacing();
-                if (ImGui::Button("Refresh now", ImVec2(-FLT_MIN, 0)))
-                {
-                    LOG("UI: refresh achievement state");
-                    Features::AchievementRefreshState();
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("This refreshes itself every few seconds while the tab is\n"
-                                      "open; the button also re-runs the engine's achievement\n"
-                                      "query, which is what to press if names or states look\n"
-                                      "stale after a fresh injection.");
-                const unsigned int age = Features::AchievementSecondsSinceRefresh();
-                if (age == UINT_MAX)
-                    ImGui::TextDisabled("Reading...");
-                else
-                    ImGui::TextDisabled("Updated %us ago (auto every 3s).  %s",
-                                        age, Features::AchievementStateSummary());
-
-                // --- the list ----------------------------------------------
-                ImGui::Spacing();
-                std::string needle = achFilter;
-                for (char& c : needle) c = (char)std::tolower((unsigned char)c);
-
-                ImGui::BeginChild("achlist", ImVec2(0, 300), ImGuiChildFlags_Borders);
-                int shown = 0;
-                for (int i = 0; i < count; ++i)
-                {
-                    Features::AchievementStateView st;
-                    const bool haveState = Features::AchievementStateAt(i, st);
-
-                    if (!needle.empty())
-                    {
-                        // Match either spelling -- people search for what Steam
-                        // showed them, not for the internal enum name.
-                        std::string hay = list[i].name ? list[i].name : "";
-                        if (haveState && st.title[0]) { hay += ' '; hay += st.title; }
-                        for (char& c : hay) c = (char)std::tolower((unsigned char)c);
-                        if (hay.find(needle) == std::string::npos)
-                            continue;
-                    }
-                    ++shown;
-                    ImGui::PushID(7000 + list[i].value);
-                    if (ImGui::Button("Unlock", ImVec2(64, 0)))
-                    {
-                        LOG("UI: unlock achievement %s (%d)", list[i].name, list[i].value);
-                        Features::AchievementUnlock(list[i].value);
-                    }
-                    ImGui::SameLine();
-
-                    // Distinct states, kept distinct on purpose: "locked" is only
-                    // shown when something actually answered for this id, so a
-                    // failed read says so instead of masquerading as not-earned.
-                    // A bar is drawn ONLY where the game itself keeps a counter --
-                    // never derived from Steam, which has no partial counts and
-                    // whose derived value is what made Gold Rush read as earned.
-                    // The count goes in the same fixed-width column as the words,
-                    // so every row's name still starts at the same x. The bar that
-                    // follows is decoration -- the NUMBERS are the thing being
-                    // read, and an earlier attempt at drawing them inside the bar
-                    // put light text on a filled amber background at 90px wide,
-                    // which was unreadable at exactly the moment it mattered.
-                    const ImVec4 kAmber(0.95f, 0.75f, 0.25f, 1.0f);
-                    const bool   showBar = haveState && st.Known() && st.hasTarget && !st.Unlocked();
-                    if (haveState && st.Unlocked())
-                        ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.45f, 1.0f), "%-9s", "unlocked");
-                    else if (showBar)
-                    {
-                        char counter[24];
-                        std::snprintf(counter, sizeof(counter), "%.0f/%.0f", st.current, st.target);
-                        ImGui::TextColored(kAmber, "%-9s", counter);
-                    }
-                    else if (haveState && st.Known())
-                        ImGui::TextDisabled("%-9s", "locked");
-                    else if (haveState && st.queried)
-                        ImGui::TextColored(ImVec4(0.80f, 0.45f, 0.35f, 1.0f), "%-9s", "no answer");
-                    else
-                        ImGui::TextDisabled("%-9s", "?");
-                    ImGui::SameLine();
-
-                    // Fixed slot either way, so a row with a bar and a row without
-                    // still line up.
-                    if (showBar)
-                    {
-                        float fraction = st.target > 0.0f ? st.current / st.target : 0.0f;
-                        fraction = fraction < 0.0f ? 0.0f : (fraction > 1.0f ? 1.0f : fraction);
-                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kAmber);
-                        ImGui::ProgressBar(fraction, ImVec2(70.0f, ImGui::GetTextLineHeight() * 0.55f), "");
-                        ImGui::PopStyleColor();
-                    }
-                    else
-                    {
-                        ImGui::Dummy(ImVec2(70.0f, ImGui::GetTextLineHeight() * 0.55f));
-                    }
-                    ImGui::SameLine();
-
-                    // Separate from the Steam state: what THIS menu fired this
-                    // session. The two disagree while Steam catches up.
-                    if (Features::AchievementWasSent(list[i].value))
-                    {
-                        ImGui::TextColored(ImVec4(0.45f, 0.65f, 0.95f, 1.0f), "sent");
-                        ImGui::SameLine();
-                    }
-                    const bool haveTitle = haveState && st.title[0] != '\0';
-                    ImGui::Text("%3d  %s", list[i].value, haveTitle ? st.title : list[i].name);
-                    if (ImGui::IsItemHovered())
-                    {
-                        char when[64] = "not read";
-                        if (haveState && st.steamResolved)
-                        {
-                            if (st.steamUnlockTime == 0)
-                                std::snprintf(when, sizeof(when), "never unlocked");
-                            else
-                            {
-                                std::time_t t = (std::time_t)st.steamUnlockTime;
-                                std::tm     tm{};
-                                if (localtime_s(&tm, &t) == 0)
-                                    std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
-                            }
-                        }
-                        char counter[64] = "";
-                        if (haveState && st.hasTarget)
-                            std::snprintf(counter, sizeof(counter),
-                                          "\nGame counter: %.0f / %.0f", st.current, st.target);
-                        ImGui::SetTooltip("EAchievements::%s  (value %d)\nSteam: %s\nUnlocked: %s%s",
-                                          list[i].name, list[i].value,
-                                          haveTitle ? st.title : "(name not read)", when, counter);
-                    }
-                    ImGui::PopID();
-                }
-                if (shown == 0)
-                    ImGui::TextDisabled("Nothing matches \"%s\".", achFilter);
-                ImGui::EndChild();
-                ImGui::TextDisabled("%d of %d shown.  unlocked / locked come from Steam itself.  "
-                                    "A count is shown only where the game keeps a real running "
-                                    "one -- no count does NOT mean zero.  \"?\" = not read yet, "
-                                    "\"no answer\" = nothing answered for that id.  \"sent\" = "
-                                    "fired by this menu this session.  Hover a row for its id and "
-                                    "unlock date.", shown, count);
-
-                // --- progress-type achievements ----------------------------
-                ImGui::Spacing();
-                ImGui::SeparatorText("Progress achievements");
-                ImGui::TextWrapped("Some achievements count up (apples, jelly, weapons collected). "
-                                   "This drives the subsystem's own "
-                                   "UpdateAchievementProgress(current, max) instead of unlocking "
-                                   "outright, so the counter reads correctly afterwards.");
-                static int   progressIndex = 0;
-                static float progressCur   = 1.0f;
-                static float progressMax   = 1.0f;
-                if (progressIndex < 0 || progressIndex >= count) progressIndex = 0;
-
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::BeginCombo("##achprogress", list[progressIndex].name))
-                {
-                    for (int i = 0; i < count; ++i)
-                    {
-                        const bool selected = progressIndex == i;
-                        ImGui::PushID(8000 + list[i].value);
-                        if (ImGui::Selectable(list[i].name, selected))
-                            progressIndex = i;
-                        if (selected)
-                            ImGui::SetItemDefaultFocus();
-                        ImGui::PopID();
-                    }
-                    ImGui::EndCombo();
-                }
-                float halfw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
-                ImGui::SetNextItemWidth(halfw);
-                ImGui::InputFloat("##achcur", &progressCur);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ImGui::InputFloat("##achmax", &progressMax);
-                ImGui::TextDisabled("current / max");
-                if (ImGui::Button("Set progress", ImVec2(-FLT_MIN, 0)))
-                {
-                    LOG("UI: set achievement progress %s -> %.2f/%.2f",
-                        list[progressIndex].name, progressCur, progressMax);
-                    Features::AchievementSetProgress(list[progressIndex].value, progressCur, progressMax);
-                }
-            }
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::TextWrapped("Status: %s", Features::AchievementStatus());
+            RenderAchievementsTab();
             ImGui::EndTabItem();
         }
 
@@ -1580,7 +1476,7 @@ void Menu::Render()
             if (ImGui::Button("Dump achievement API", ImVec2(-FLT_MIN, 0)))
             {
                 LOG("UI: achievement API dump requested");
-                Features::DebugDumpAchievementApi();
+                Achievements::DebugDumpApi();
             }
 
             ImGui::Spacing();

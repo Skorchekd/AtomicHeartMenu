@@ -29,6 +29,7 @@ add_library(AtomicHeartMenu SHARED
     src/hooks/ai_movement_hooks.cpp
     src/menu/menu.cpp
     src/features/features.cpp
+    src/features/achievements.cpp
     # --- Dear ImGui ---
     ${IMGUI}/imgui.cpp
     ${IMGUI}/imgui_draw.cpp

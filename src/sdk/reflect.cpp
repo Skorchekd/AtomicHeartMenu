@@ -519,19 +519,6 @@ std::vector<Reflect::EnumValue> Reflect::DescribeEnumValues(UObject* uenum, int*
     return out;
 }
 
-UObject* Reflect::GetStructPropertyType(UObject* container, const char* propName)
-{
-    try
-    {
-        uint8_t* prop = FindPropertyField(container, propName, nullptr);
-        if (!prop || PropTypeName(prop) != "StructProperty") return nullptr;
-        if (!Mem::IsReadable(prop + R::FStructProperty_Struct, sizeof(void*))) return nullptr;
-        UObject* scriptStruct = Rd<UObject*>(prop + R::FStructProperty_Struct);
-        return Mem::IsReadable(scriptStruct, 0x30) ? scriptStruct : nullptr;
-    }
-    catch (...) { return nullptr; }
-}
-
 // ---- TMap reading -------------------------------------------------------------
 bool Reflect::MapView::IsValidIndex(int index) const
 {
@@ -624,8 +611,14 @@ namespace
         uint8_t* heap = Mem::IsReadable(mapStorage + R::FScriptMap_AllocFlagsHeap, sizeof(void*))
                           ? Rd<uint8_t*>(mapStorage + R::FScriptMap_AllocFlagsHeap) : nullptr;
         const size_t flagBytes = ((size_t)numBits + 31) / 32 * 4;
-        if (heap && Mem::IsReadable(heap, flagBytes))
+        if (heap)
+        {
+            // A non-null secondary pointer means the heap copy is the live one; if
+            // it cannot be read, the inline bits are stale and must not stand in.
+            if (!Mem::IsReadable(heap, flagBytes))
+            {                                  view.error = "allocation flags unreadable"; return view; }
             flags = reinterpret_cast<const uint32_t*>(heap);
+        }
         else if (numBits <= R::FScriptMap_InlineFlagBits &&
                  Mem::IsReadable(mapStorage + R::FScriptMap_AllocFlagsInline, flagBytes))
             flags = reinterpret_cast<const uint32_t*>(mapStorage + R::FScriptMap_AllocFlagsInline);
@@ -653,23 +646,6 @@ Reflect::MapView Reflect::OpenMapProperty(UObject* container, const char* propNa
         uint8_t* prop      = FindPropertyField(container, propName, &mapOffset);
         if (!prop || mapOffset < 0) { view.error = "property not reflected"; return view; }
         return OpenMapFromField(prop, reinterpret_cast<uint8_t*>(container) + mapOffset);
-    }
-    catch (...) { view.valid = false; view.error = "exception while opening map"; }
-    return view;
-}
-
-Reflect::MapView Reflect::OpenMapPropertyInStruct(UObject* structType, uint8_t* instance,
-                                                  const char* propName)
-{
-    MapView view;
-    try
-    {
-        if (!Mem::IsReadable(structType, 0x30)) { view.error = "struct type unreadable"; return view; }
-        if (!instance)                          { view.error = "struct instance null";  return view; }
-        int32_t  mapOffset = -1;
-        uint8_t* prop      = FindPropertyFieldInStruct(structType, propName, &mapOffset);
-        if (!prop || mapOffset < 0) { view.error = "property not reflected"; return view; }
-        return OpenMapFromField(prop, instance + mapOffset);
     }
     catch (...) { view.valid = false; view.error = "exception while opening map"; }
     return view;

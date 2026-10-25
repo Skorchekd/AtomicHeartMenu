@@ -104,11 +104,6 @@ namespace Reflect
         int64_t     value = 0;
     };
 
-    // The UScriptStruct a named StructProperty member is declared as, so a nested
-    // struct's own field list can be walked without a GObjects scan to find its
-    // type by name. Pair it with FindPropertyOffset to get at the live bytes.
-    UE::UObject* GetStructPropertyType(UE::UObject* container, const char* propName);
-
     // ---- TMap reading -------------------------------------------------------
     // A TMap is a TSet of key/value pairs and a TSet is a sparse array plus a hash,
     // so reading one means walking the sparse array and skipping the holes its bit
@@ -141,11 +136,6 @@ namespace Reflect
     // part of it is range-checked before a byte of map data is trusted, so a layout
     // a patch has moved reports an error instead of handing back plausible garbage.
     MapView OpenMapProperty(UE::UObject* container, const char* propName);
-
-    // Same, for a TMap that lives inside a nested struct rather than directly on a
-    // class -- `structType` is the UScriptStruct (from GetStructPropertyType) and
-    // `instance` points at that struct's bytes inside the owning object.
-    MapView OpenMapPropertyInStruct(UE::UObject* structType, uint8_t* instance, const char* propName);
 
     // Read a UEnum's name->value table by probing for UEnum::Names and validating
     // the hit against the enum's own name (see Offsets::Reflect::UEnum_NamesProbe*).

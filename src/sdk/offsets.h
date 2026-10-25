@@ -426,17 +426,15 @@ namespace Offsets
         //  Steam directly by ID string and desync the two, so it is not used.
         //
         //  SendAchievementUnlockEvent is Static, so it is called on the CDO and
-        //  needs no subsystem instance. UpdateAchievementProgress is not, and is
-        //  called on the instance GetAchievementSubsystem hands back (which is a
-        //  LOCAL PLAYER subsystem -- BP_AchievementSubsystem_C_0 under
-        //  LocalPlayer_0, not a world or game-instance one).
+        //  needs no subsystem instance. GetAchievementSubsystem hands back the
+        //  instance the id map is read from (a LOCAL PLAYER subsystem --
+        //  BP_AchievementSubsystem_C_0 under LocalPlayer_0, not a world or
+        //  game-instance one).
         // ===================================================================
         constexpr const char* Obj_GameplayEventUtils = "GameplayEventUtils /Script/AtomicHeart.Default__GameplayEventUtils";
         constexpr const char* Obj_SubsystemUtils     = "SubsystemUtils /Script/AtomicHeart.Default__SubsystemUtils";
         constexpr const char* Fn_SendAchievementUnlockEvent   = "Function /Script/AtomicHeart.GameplayEventUtils.SendAchievementUnlockEvent";
-        constexpr const char* Fn_SendAchievementProgressEvent = "Function /Script/AtomicHeart.GameplayEventUtils.SendAchievementProgressEvent";
         constexpr const char* Fn_GetAchievementSubsystem      = "Function /Script/AtomicHeart.SubsystemUtils.GetAchievementSubsystem";
-        constexpr const char* Fn_UpdateAchievementProgress    = "Function /Script/AtomicHeart.AHAchievementSubsystem.UpdateAchievementProgress";
         // The achievement NAMES are never hardcoded: they are read from this live
         // UEnum, so a patch that adds or reorders entries is picked up for free and
         // a value can never drift out of step with its name. 85 entries on this
@@ -483,32 +481,6 @@ namespace Offsets
         constexpr const char* Fn_GetCachedAchievementDescription = "Function /Script/OnlineSubsystemUtils.AchievementBlueprintLibrary.GetCachedAchievementDescription";
         constexpr const char* Obj_KismetTextLibrary   = "KismetTextLibrary /Script/Engine.Default__KismetTextLibrary";
         constexpr const char* Fn_ConvTextToString     = "Function /Script/Engine.KismetTextLibrary.Conv_TextToString";
-        // TMap<EAchievements, ...> of the target value for the counting
-        // achievements -- read as a diagnostic for now (see the progress note in
-        // PROJECT_AND_SDK.md); Steam's cached Progress is binary on this build.
-        constexpr const char* Prop_AchievementsMaxValues = "AchievementsMaxValues";
-        // ...and the matching CURRENT counts, which live one level down in the
-        // PlayerGameStatistics struct rather than on the subsystem itself. Both
-        // maps carry 29 entries keyed by EAchievements on build 24534183, so they
-        // pair up directly and no per-counter wiring is needed. This is the game's
-        // own bookkeeping, not Steam's -- Steam's cached layer has no partial
-        // counts at all.
-        constexpr const char* Prop_PlayerGameStatistics = "PlayerGameStatistics";
-        // TMap<EAchievements, float> of how far each counting achievement has got,
-        // as a 0..1 FRACTION, holding only the ones the game has actually reported
-        // to Steam. That last part is the point: it is what Steam is tracking, so
-        // a bar built from it agrees with Steam's own UI instead of contradicting
-        // it. On build 24534183 it holds 0.0 for Gold Rush against 17 coins
-        // collected -- the game never uploaded that counter, which is exactly why
-        // Steam shows 0/76.
-        //
-        // NOT to be confused with PlayerGameStatistics::AchievementProgress, which
-        // has the same key type and the same 29 entries as AchievementsMaxValues
-        // and whose values are byte-for-byte those targets (29 identical, 0
-        // differing when compared on the live game). Matching entry counts made it
-        // look like the running count; it is the targets echoed back, and reading
-        // it put "3826/3826" on an achievement Steam had at 859.
-        constexpr const char* Prop_UploadedAchievements = "UploadedAchievements";
 
         // World / visuals helpers.
         // UGameplayStatics is a static-only class; call its functions on the CDO.

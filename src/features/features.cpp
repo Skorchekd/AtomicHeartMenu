@@ -12,6 +12,7 @@
 // (Skorchekd) and to Dumper-7 (Encryqed), MinHook (Tsuda Kageyu), and Dear ImGui
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
 #include "features.h"
+#include "achievements.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
 #include "../sdk/scanner.h"
@@ -38,11 +39,22 @@
 #include <cstdio>
 #include <cstring>
 #include <cctype>
-#include <climits>
-#include <ctime>
 
 using namespace UE;
 namespace AH = Offsets::AH;
+
+// Defined in namespace Features (declared in features.h) so achievements.cpp can
+// share them; the rest of this file keeps calling them unqualified.
+using Features::CachedFn;
+using Features::CachedObject;
+using Features::InstallProcessEventHook;
+using Features::IsStructLike;
+using Features::LowerCopy;
+using Features::QueueGameThread;
+using Features::SafeClassName;
+using Features::SafeFNameToString;
+using Features::SafeObjectFullName;
+using Features::SafeObjectName;
 
 // Defined at file scope below (after the anonymous namespace), but called from inside
 // it (hkProcessEvent) -- declare it here so the anon-namespace call resolves to this
@@ -368,7 +380,6 @@ namespace
     bool HookTwinDeathPipelineShouldSwallow(void* obj, void* fn, void* params);
     void HookTwinForensicsProcessEvent(void* obj, void* fn, void* params);
     void UpdateHookTwinForensics();
-    std::string SafeObjectFullName(UObject* o);
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params);
 
     bool HookFriendshipShouldForce(void* fn, void* params);
@@ -643,7 +654,10 @@ namespace
         }
         oProcessEvent(obj, fn, params);
     }
+}
 
+namespace Features
+{
     bool InstallProcessEventHook()
     {
         static std::mutex installMutex;
@@ -697,7 +711,10 @@ namespace
         g_gtQueue.push_back(std::move(fn));
         g_gtHasWork = true;
     }
+}
 
+namespace
+{
     constexpr float kNormalDamageMultiplier = 1.0f;
     constexpr float kGodDamageMultiplier = 0.0f;
     constexpr float kOneHitDamageMultiplier = 1000.0f;
@@ -882,7 +899,10 @@ namespace
 
     // Bounds how often one name can cost a full GObjects scan.
     constexpr ULONGLONG kFnRescanThrottleMs = 5000;
+}
 
+namespace Features
+{
     // Cache resolved UFunction* by full name so we only walk GObjects once.
     UFunction* CachedFn(const char* fullName)
     {
@@ -972,7 +992,10 @@ namespace
         }
         return obj;
     }
+}
 
+namespace
+{
     UFunction* CachedClassFn(const char* className, const char* shortName)
     {
         static std::unordered_map<std::string, UFunction*> cache;
@@ -1083,79 +1106,6 @@ namespace
     static_assert(sizeof(P_WorldContext) == 0x08, "world context params must match Dumper-7");
     static_assert(sizeof(P_BoolParam) == 0x01, "single bool params must match Dumper-7");
 
-    // Achievements. Sizes and member offsets read off the running game with
-    // Debug -> Dump achievement API, and re-checked at injection by kParamsChecks
-    // against UFunction::PropertiesSize -- an undersized params block here would
-    // have the game write past the end of a local.
-    struct P_SendAchievementUnlock { uint8_t Achievement; };
-    static_assert(sizeof(P_SendAchievementUnlock) == 0x01, "SendAchievementUnlockEvent params");
-
-    struct P_SendAchievementProgress
-    {
-        uint8_t Achievement;      // @0x00
-        uint8_t _pad0[3];
-        float   Progress;         // @0x04
-    };
-    static_assert(sizeof(P_SendAchievementProgress) == 0x08, "SendAchievementProgressEvent params");
-
-    struct P_UpdateAchievementProgress
-    {
-        uint8_t Achievement;      // @0x00
-        uint8_t _pad0[3];
-        float   CurrentProgress;  // @0x04
-        float   MaxValue;         // @0x08
-        bool    ReturnValue;      // @0x0C
-        uint8_t _pad1[3];
-    };
-    static_assert(sizeof(P_UpdateAchievementProgress) == 0x10, "UpdateAchievementProgress params");
-
-    struct P_CacheAchievements
-    {
-        void* WorldContextObject; // @0x00
-        void* PlayerController;   // @0x08
-        void* ReturnValue;        // @0x10  (the async proxy; we do not subscribe to it)
-    };
-    static_assert(sizeof(P_CacheAchievements) == 0x18, "CacheAchievements params");
-
-    struct P_GetCachedAchievementProgress
-    {
-        void*   WorldContextObject; // @0x00
-        void*   PlayerController;   // @0x08
-        FName   AchievementID;      // @0x10
-        bool    bFoundID;           // @0x18  (out)
-        uint8_t _pad0[3];
-        float   Progress;           // @0x1C  (out, 0..100)
-    };
-    static_assert(sizeof(P_GetCachedAchievementProgress) == 0x20, "GetCachedAchievementProgress params");
-
-    struct P_ConvStringToName
-    {
-        FString InString;    // @0x00
-        FName   ReturnValue; // @0x10
-    };
-    static_assert(sizeof(P_ConvStringToName) == 0x18, "Conv_StringToName params");
-
-    struct P_GetCachedAchievementDescription
-    {
-        void*   WorldContextObject;      // @0x00
-        void*   PlayerController;        // @0x08
-        FName   AchievementID;           // @0x10
-        bool    bFoundID;                // @0x18  (out)
-        uint8_t _pad0[7];
-        uint8_t Title[24];               // @0x20  (out) FText
-        uint8_t LockedDescription[24];   // @0x38  (out) FText
-        uint8_t UnlockedDescription[24]; // @0x50  (out) FText
-        bool    bHidden;                 // @0x68  (out)
-        uint8_t _pad1[7];
-    };
-    static_assert(sizeof(P_GetCachedAchievementDescription) == 0x70, "GetCachedAchievementDescription params");
-
-    struct P_ConvTextToString
-    {
-        uint8_t InText[24];  // @0x00  FText
-        FString ReturnValue; // @0x18
-    };
-    static_assert(sizeof(P_ConvTextToString) == 0x28, "Conv_TextToString params");
     struct P_GetControlRotation { FRotator ReturnValue; };
     struct P_IntReturn { int32_t ReturnValue; };
     struct P_GetCurrentWeapon { void* ReturnValue; };
@@ -10153,13 +10103,6 @@ namespace
         return true;
     }
 
-    std::string LowerCopy(std::string s)
-    {
-        for (char& c : s)
-            c = (char)std::tolower((unsigned char)c);
-        return s;
-    }
-
     bool ContainsAnyTerm(const std::string& text)
     {
         std::string s = LowerCopy(text);
@@ -10172,11 +10115,6 @@ namespace
             if (s.find(t) != std::string::npos)
                 return true;
         return false;
-    }
-
-    std::string SafeFNameToString(const FName& name)
-    {
-        try { return name.ToString(); } catch (...) { return {}; }
     }
 
     bool ReadFNameAt(void* base, int offset, FName& out)
@@ -10193,6 +10131,21 @@ namespace
     {
         void* p = ReadPtrField(base, offset);
         return Mem::IsReadable(p, 0x30) ? static_cast<UObject*>(p) : nullptr;
+    }
+}
+
+namespace Features
+{
+    std::string LowerCopy(std::string s)
+    {
+        for (char& c : s)
+            c = (char)std::tolower((unsigned char)c);
+        return s;
+    }
+
+    std::string SafeFNameToString(const FName& name)
+    {
+        try { return name.ToString(); } catch (...) { return {}; }
     }
 
     std::string SafeObjectName(UObject* o)
@@ -10217,7 +10170,10 @@ namespace
         }
         catch (...) { return {}; }
     }
+}
 
+namespace
+{
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params)
     {
         if (!fn)
@@ -12384,771 +12340,6 @@ namespace
         });
     }
 
-    // =====================================================================
-    //  Achievements.
-    // ---------------------------------------------------------------------
-    //  Unlocks go through the game's own event (see Offsets::AH), so the
-    //  achievement subsystem keeps its own bookkeeping in step with what it
-    //  tells Steam. Nothing here is a bypass -- the game has no cheats-used
-    //  gate; this exists because cheating past content means the game's
-    //  trigger never fires in the first place.
-    // =====================================================================
-    struct AchievementCatalogEntry
-    {
-        int         value = 0;
-        std::string name;
-    };
-
-    std::mutex                          g_achMutex;
-    std::vector<AchievementCatalogEntry> g_achCatalog;  // stable storage for the names
-    std::vector<Features::AchievementEntry> g_achView;  // const char* into g_achCatalog
-    std::unordered_set<int>             g_achSent;      // fired by US this session
-    std::string                         g_achStatus = "No achievement action yet.";
-    volatile LONG                       g_achResolveRunning = 0;
-
-    // active/index/lastStepMs are render-thread only; `ok` is incremented by the
-    // game-thread lambda. Every write to the struct AS A WHOLE therefore takes
-    // g_achMutex, so a reset can never race that increment.
-    // What Steam says about one achievement. `progress` is UE's 0..100 percentage,
-    // so a plain (non-counting) achievement reads 0 or 100 and "unlocked" is just
-    // progress >= 100. `found` is the engine's bFoundID: false means Steam's cache
-    // has no such id -- which on a first read usually means the async cache has
-    // not filled yet, NOT that the achievement is locked. The two are kept apart
-    // so the UI can say "unknown" instead of lying with "0%".
-    struct AchievementSteamState
-    {
-        bool        idKnown  = false;
-        FName       id{};
-        std::string idText;   // the platform id as the game stores it
-        std::string title;    // Steam's own display name, "" until fetched
-        bool        queried  = false;
-        bool        found    = false;
-        float       progress = 0.0f;   // the ENGINE's answer: 0 or 100, nothing between
-        // Steam's own answer, read straight from steam_api64.dll. Authoritative
-        // where they disagree -- see ReadSteamAchievementState.
-        bool        steamResolved   = false;
-        bool        steamAchieved   = false;
-        uint32_t    steamUnlockTime = 0; // unix seconds; 0 when never unlocked
-        // The game's own counters for the counting achievements. Only ~29 of the
-        // 83 have a target at all; the rest are pass/fail and get no bar.
-        bool        hasTarget = false;
-        float       current   = 0.0f;
-        float       target    = 0.0f;
-    };
-    std::vector<AchievementSteamState> g_achStates;   // parallel to g_achCatalog
-    std::string g_achStateSummary = "Steam state not read yet.";
-    bool        g_achCachePrimed  = false;
-
-    // Auto-refresh pacing. One read is ~1ms of game thread once the titles are
-    // cached (the first pass is dearer because it fetches 83 of them), so a slow
-    // cadence costs nothing worth measuring. The in-flight flag matters more than
-    // the interval: without it a queued read that has not drained yet would let
-    // the next tick pile another one behind it.
-    volatile LONG g_achRefreshInFlight = 0;
-    ULONGLONG     g_achLastRefreshMs   = 0;
-    constexpr ULONGLONG kAchAutoRefreshMs = 3000;
-
-    struct AchievementUnlockAllState
-    {
-        bool      active     = false;
-        int       index      = 0;
-        int       ok         = 0;
-        ULONGLONG lastStepMs = 0;
-    };
-    AchievementUnlockAllState g_achUnlockAll;
-
-    // One unlock every 150 ms. Each one broadcasts a gameplay event that can put a
-    // popup on screen and hand Steam a write, so firing 80-odd back to back would
-    // bury the game in UI work in a single frame -- the same reason Give All
-    // streams instead of looping.
-    constexpr ULONGLONG kAchUnlockAllStepMs = 150;
-
-    void SetAchievementStatus(std::string text)
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        g_achStatus = std::move(text);
-    }
-
-    DWORD WINAPI AchievementResolveThread(LPVOID)
-    {
-        try
-        {
-            // CachedObject -> FindObjectFast only starts the background name index
-            // when it MISSES, so without this the first Unlock press would resolve
-            // nothing and no-op. Warming it here means it is ready long before the
-            // user can click anything. VerifyOffsetsThread does the same.
-            UE::StartObjectNameIndex();
-
-            // A GObjects scan, hence the worker thread. The names come from the
-            // live enum so they cannot drift out of step with the values we send.
-            UObject* enumObject = FindObject(AH::Obj_EAchievementsEnum);
-            int namesOffset = -1;
-            std::vector<Reflect::EnumValue> values =
-                Reflect::DescribeEnumValues(enumObject, &namesOffset);
-
-            if (values.empty())
-            {
-                LOG_SDK("Achievements: EAchievements not readable (%s). The menu list stays "
-                        "empty rather than guessing values; run Debug -> Dump achievement API "
-                        "to see why.", enumObject ? "enum found, values unreadable" : "enum not found");
-                SetAchievementStatus("Achievement list unavailable -- see the log.");
-                InterlockedExchange(&g_achResolveRunning, 0);
-                return 0;
-            }
-
-            const std::string prefix = AH::EAchievementsPrefix;
-            std::vector<AchievementCatalogEntry> catalog;
-            catalog.reserve(values.size());
-            for (const Reflect::EnumValue& v : values)
-            {
-                std::string name = v.name;
-                if (name.compare(0, prefix.size(), prefix) == 0)
-                    name.erase(0, prefix.size());
-                // INVALID and the trailing _MAX sentinel are not achievements.
-                if (name == "INVALID" || name.find("_MAX") != std::string::npos)
-                    continue;
-                if (v.value < 0 || v.value > 255)   // the params block holds one byte
-                    continue;
-                AchievementCatalogEntry e;
-                e.value = (int)v.value;
-                e.name  = std::move(name);
-                catalog.push_back(std::move(e));
-            }
-
-            {
-                std::lock_guard<std::mutex> lk(g_achMutex);
-                g_achCatalog = std::move(catalog);
-                g_achView.clear();
-                g_achView.reserve(g_achCatalog.size());
-                for (const AchievementCatalogEntry& e : g_achCatalog)
-                    g_achView.push_back({ e.value, e.name.c_str() });
-                g_achStatus = "Achievement list ready.";
-            }
-            LOG_SDK("Achievements: %d entries read from the live EAchievements enum "
-                    "(UEnum::Names at +0x%X)", (int)g_achCatalog.size(), namesOffset);
-        }
-        catch (...) { LOG_SDK("Achievements: list resolve exception (ignored)"); }
-
-        InterlockedExchange(&g_achResolveRunning, 0);
-        return 0;
-    }
-
-    // GAME THREAD ONLY. Static function -> dispatched on the CDO, so no subsystem
-    // instance is needed and there is nothing to go stale between frames.
-    bool SendAchievementUnlockGameThread(int value)
-    {
-        try
-        {
-            UObject*   lib = CachedObject(AH::Obj_GameplayEventUtils);
-            UFunction* fn  = CachedFn(AH::Fn_SendAchievementUnlockEvent);
-            if (!lib || !fn)
-            {
-                LOG("Achievements: unlock %d skipped (lib=%p fn=%p)", value, (void*)lib, (void*)fn);
-                return false;
-            }
-            P_SendAchievementUnlock p{};
-            p.Achievement = (uint8_t)value;
-            lib->ProcessEvent(fn, &p);
-            return true;
-        }
-        catch (...) { LOG("Achievements: unlock %d exception (ignored)", value); return false; }
-    }
-
-    // GAME THREAD ONLY. Unlike the unlock, this one is an instance method, and the
-    // instance is a LocalPlayer subsystem -- so it is fetched fresh each time
-    // rather than cached across level loads.
-    UObject* GetAchievementSubsystemGameThread()
-    {
-        try
-        {
-            UObject*   lib = CachedObject(AH::Obj_SubsystemUtils);
-            UFunction* fn  = CachedFn(AH::Fn_GetAchievementSubsystem);
-            if (!lib || !fn) return nullptr;
-            P_ObjectReturn p{};
-            lib->ProcessEvent(fn, &p);
-            UObject* subsystem = static_cast<UObject*>(p.ReturnValue);
-            // The game handed this back; it has had no validation until now.
-            return IsLiveObject(subsystem) ? subsystem : nullptr;
-        }
-        catch (...) { return nullptr; }
-    }
-
-    // GAME THREAD ONLY. Prime the engine's achievement cache from the online
-    // subsystem. Async: the results land later, so a read taken straight after
-    // this can legitimately come back empty.
-    void PrimeAchievementCacheGameThread()
-    {
-        try
-        {
-            UObject*   proxy = CachedObject(AH::Obj_AchievementQueryProxy);
-            UFunction* fn    = CachedFn(AH::Fn_CacheAchievements);
-            UObject*   pc    = GetPlayerController();
-            UObject*   world = GetWorld();
-            if (!proxy || !fn || !pc || !world)
-            {
-                LOG("Achievements: cache prime skipped (proxy=%p fn=%p pc=%p world=%p)",
-                    (void*)proxy, (void*)fn, (void*)pc, (void*)world);
-                return;
-            }
-            P_CacheAchievements p{};
-            p.WorldContextObject = world;
-            p.PlayerController   = pc;
-            proxy->ProcessEvent(fn, &p);
-            LOG("Achievements: Steam cache prime requested (async)");
-        }
-        catch (...) { LOG("Achievements: cache prime exception (ignored)"); }
-    }
-
-    // GAME THREAD ONLY. Turn an id string into the FName the engine's achievement
-    // API wants. TryGetFName is tried first because it costs no ProcessEvent, but
-    // it can only FIND a name -- and the game keeps these ids as strings, so most
-    // have never become names. Conv_StringToName creates the missing ones.
-    FName MintFNameGameThread(const std::string& text)
-    {
-        FName out{};
-        if (text.empty()) return out;
-        if (TryGetFName(text.c_str(), out) && out.ComparisonIndex != 0)
-            return out;
-
-        out = FName{};
-        UObject*   lib = CachedObject(AH::Obj_KismetStringLibrary);
-        UFunction* fn  = CachedFn(AH::Fn_ConvStringToName);
-        if (!lib || !fn) return out;
-
-        try
-        {
-            // Ids are ASCII, so a straight widen is correct. The wstring stays
-            // alive across the synchronous call -- same contract as the console
-            // command path, which passes an FString the same way.
-            std::wstring wide(text.begin(), text.end());
-            P_ConvStringToName p{};
-            p.InString.Data  = wide.data();
-            p.InString.Count = (int32_t)wide.size() + 1; // include the null terminator
-            p.InString.Max   = p.InString.Count;
-            lib->ProcessEvent(fn, &p);
-            out = p.ReturnValue;
-        }
-        catch (...) { out = FName{}; }
-        return out;
-    }
-
-    // A TMap<EAchievements, float> -> a plain lookup, with the shape checked
-    // before any of it is believed. Both progress maps have this exact shape.
-    bool ReadEnumFloatMap(const Reflect::MapView& map, const char* label,
-                          std::unordered_map<int, float>& out)
-    {
-        if (!map.valid)
-        {
-            LOG("Achievements: %s unreadable -- %s", label, map.error.c_str());
-            return false;
-        }
-        const bool keyOk = (map.keyType == "EnumProperty" || map.keyType == "ByteProperty") &&
-                           map.keySize == 1;
-        const bool valOk = map.valueType == "FloatProperty" && map.valueSize == 4;
-        if (!keyOk || !valOk)
-        {
-            LOG("Achievements: %s is TMap<%s(%d), %s(%d)>, not the expected "
-                "TMap<EAchievements(1), float(4)> -- not read.",
-                label, map.keyType.c_str(), map.keySize, map.valueType.c_str(), map.valueSize);
-            return false;
-        }
-
-        for (int i = 0; i < map.count; ++i)
-        {
-            uint8_t* keyPtr   = map.KeyAt(i);
-            uint8_t* valuePtr = map.ValueAt(i);
-            if (!keyPtr || !valuePtr) continue;    // a hole in the sparse array
-            out[(int)*keyPtr] = *reinterpret_cast<float*>(valuePtr);
-        }
-        LOG("Achievements: %s read -- %d entries", label, (int)out.size());
-        return true;
-    }
-
-    // GAME THREAD ONLY. Pair the per-achievement targets with the game's own
-    // current counts. The targets sit on the subsystem; the counts sit one level
-    // down inside PlayerGameStatistics, so the nested-struct reader is needed for
-    // the second one.
-    void ReadAchievementProgressGameThread(UObject* subsystem)
-    {
-        std::unordered_map<int, float> targets;
-        ReadEnumFloatMap(Reflect::OpenMapProperty(subsystem, AH::Prop_AchievementsMaxValues),
-                         AH::Prop_AchievementsMaxValues, targets);
-
-        // The fraction lives one level down, inside PlayerGameStatistics.
-        std::unordered_map<int, float> fractions;
-        const int structOffset = Reflect::FindPropertyOffset(subsystem, AH::Prop_PlayerGameStatistics);
-        UObject*  structType   = Reflect::GetStructPropertyType(subsystem, AH::Prop_PlayerGameStatistics);
-        if (structOffset >= 0 && structType)
-        {
-            uint8_t* base = reinterpret_cast<uint8_t*>(subsystem) + structOffset;
-            ReadEnumFloatMap(Reflect::OpenMapPropertyInStruct(structType, base, AH::Prop_UploadedAchievements),
-                             AH::Prop_UploadedAchievements, fractions);
-        }
-        else
-        {
-            LOG("Achievements: %s not reachable (offset=%d type=%p) -- no progress counts",
-                AH::Prop_PlayerGameStatistics, structOffset, (void*)structType);
-        }
-
-        if (targets.empty()) return;
-
-        int withBars = 0;
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        for (size_t slot = 0; slot < g_achStates.size() && slot < g_achCatalog.size(); ++slot)
-        {
-            auto targetIt = targets.find(g_achCatalog[slot].value);
-            if (targetIt == targets.end() || targetIt->second <= 0.0f) continue;
-
-            // Only achievements the game has actually reported progress for get a
-            // count. An absent entry means "nothing tracked", which is NOT the same
-            // as zero and must not be drawn as an empty bar.
-            auto fractionIt = fractions.find(g_achCatalog[slot].value);
-            if (fractionIt == fractions.end()) continue;
-
-            const float fraction = fractionIt->second < 0.0f ? 0.0f
-                                 : (fractionIt->second > 1.0f ? 1.0f : fractionIt->second);
-            g_achStates[slot].hasTarget = true;
-            g_achStates[slot].target    = targetIt->second;
-            g_achStates[slot].current   = fraction * targetIt->second;
-            ++withBars;
-        }
-        LOG("Achievements: %d achievement(s) have progress the game has reported to Steam",
-            withBars);
-    }
-
-    // GAME THREAD ONLY. Read the EAchievements -> platform-id map off the live
-    // subsystem. The ids are FNames taken straight out of the map, so nothing has
-    // to build one from a string -- which could not work anyway, since the name
-    // pool holds "EAchievements::KillTwins" as a single name and a standalone
-    // "KillTwins" need not exist in it.
-    int BuildAchievementIdTableGameThread(UObject* subsystem)
-    {
-        Reflect::MapView map = Reflect::OpenMapProperty(subsystem, AH::Prop_AchievementsMap);
-        if (!map.valid)
-        {
-            LOG("Achievements: %s unreadable -- %s. Unlocking still works; only the "
-                "Steam-state read needs the ids.", AH::Prop_AchievementsMap, map.error.c_str());
-            return 0;
-        }
-
-        // Only trusted once it IS what we expect. The key must be a 1-byte enum.
-        // The value carries the platform id in one of two shapes: an FName, which
-        // the engine's achievement API takes directly, or an FString, which has to
-        // be looked up in the name pool first. Anything else and we would be
-        // reinterpreting real data as something it is not.
-        const bool keyOk = (map.keyType == "EnumProperty" || map.keyType == "ByteProperty") &&
-                           map.keySize == 1;
-        const bool valueIsName = map.valueType == "NameProperty" &&
-                                 map.valueSize == (int)sizeof(FName);
-        const bool valueIsText = map.valueType == "StrProperty" &&
-                                 map.valueSize == (int)sizeof(FString);
-        if (!keyOk || (!valueIsName && !valueIsText))
-        {
-            LOG("Achievements: %s is TMap<%s(%d), %s(%d)> -- not a shape this knows how "
-                "to read (want a 1-byte enum key and an FName or FString value).",
-                AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
-                map.valueType.c_str(), map.valueSize);
-            return 0;
-        }
-        LOG("Achievements: %s is TMap<%s(%d), %s(%d)>, %d slot(s)",
-            AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
-            map.valueType.c_str(), map.valueSize, map.count);
-
-        // Read the whole map out FIRST -- no lock held and no call into game code
-        // while a MapView is pointing into live memory.
-        struct RawId { int key; std::string text; };
-        std::vector<RawId> raw;
-        raw.reserve((size_t)map.count);
-        for (int i = 0; i < map.count; ++i)
-        {
-            uint8_t* keyPtr   = map.KeyAt(i);
-            uint8_t* valuePtr = map.ValueAt(i);
-            if (!keyPtr || !valuePtr) continue;          // a hole in the sparse array
-
-            RawId entry;
-            entry.key = (int)*keyPtr;
-            if (valueIsName)
-                entry.text = SafeFNameToString(*reinterpret_cast<FName*>(valuePtr));
-            else
-                try { entry.text = reinterpret_cast<FString*>(valuePtr)->ToString(); } catch (...) {}
-            if (!entry.text.empty())
-                raw.push_back(std::move(entry));
-        }
-
-        int matched = 0, unmapped = 0, unresolved = 0;
-        struct ResolvedId { int key; FName id; std::string text; };
-        std::vector<ResolvedId> resolved;
-        resolved.reserve(raw.size());
-        for (const RawId& entry : raw)
-        {
-            const FName id = MintFNameGameThread(entry.text);
-            if (id.ComparisonIndex != 0) resolved.push_back({ entry.key, id, entry.text });
-            else                         ++unresolved;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(g_achMutex);
-            // Titles survive a refresh -- they cost an FText reference we cannot
-            // release, so they are fetched once and kept.
-            std::vector<std::string> keptTitles(g_achCatalog.size());
-            for (size_t slot = 0; slot < g_achStates.size() && slot < keptTitles.size(); ++slot)
-                keptTitles[slot] = g_achStates[slot].title;
-
-            g_achStates.assign(g_achCatalog.size(), AchievementSteamState{});
-            for (size_t slot = 0; slot < keptTitles.size(); ++slot)
-                g_achStates[slot].title = keptTitles[slot];
-
-            for (const ResolvedId& entry : resolved)
-            {
-                bool placed = false;
-                for (size_t slot = 0; slot < g_achCatalog.size(); ++slot)
-                {
-                    if (g_achCatalog[slot].value != entry.key) continue;
-                    g_achStates[slot].idKnown = true;
-                    g_achStates[slot].id      = entry.id;
-                    g_achStates[slot].idText  = entry.text;
-                    placed = true;
-                    ++matched;
-                    break;
-                }
-                // INVALID and _MAX are in the map but filtered out of the menu list.
-                if (!placed) ++unmapped;
-            }
-        }
-
-        LOG("Achievements: id table built -- %d of %d entries matched (%d map rows not in the "
-            "menu list, %d ids that could not be made into an FName)",
-            matched, (int)g_achCatalog.size(), unmapped, unresolved);
-        return matched;
-    }
-
-    // =====================================================================
-    //  Steam, read directly.
-    // ---------------------------------------------------------------------
-    //  The engine's cached achievement layer only ever answers 0 or 100, and on
-    //  build 24534183 it reports UNLOCKED for two achievements Steam itself
-    //  shows as locked with partial progress (Apple Pie 3826 at 859/3826 and
-    //  Gold Rush at 0/76). Both are counting achievements with a non-zero
-    //  counter; every counter sitting at exactly zero reads correctly. That is a
-    //  pattern in the derived value, not two coincidences.
-    //
-    //  steam_api64.dll is already loaded in the process and its flat API is the
-    //  same source the engine reads, so ask it directly instead of trusting
-    //  something computed on the way out. It also answers a question the engine
-    //  cannot: WHEN an achievement was unlocked.
-    // =====================================================================
-    void* GetSteamUserStatsInterface()
-    {
-        static void* cached = nullptr;
-        static bool  tried  = false;
-        if (tried) return cached;
-        tried = true;
-
-        HMODULE dll = GetModuleHandleA("steam_api64.dll");
-        if (!dll)
-        {
-            LOG("Steam: steam_api64.dll is not loaded -- direct achievement reads unavailable");
-            return nullptr;
-        }
-        auto accessor = reinterpret_cast<void* (*)()>(
-            GetProcAddress(dll, "SteamAPI_SteamUserStats_v012"));
-        // A bad function pointer that merely READS fine still DEP-faults on the
-        // call, after control has left our code where catch(...) cannot reach it.
-        if (!Mem::IsExecutable(reinterpret_cast<void*>(accessor), 1))
-        {
-            LOG("Steam: SteamAPI_SteamUserStats_v012 not resolvable");
-            return nullptr;
-        }
-        try { cached = accessor(); } catch (...) { cached = nullptr; }
-        LOG("Steam: ISteamUserStats = %p", cached);
-        return cached;
-    }
-
-    bool ReadSteamAchievementState(const char* id, bool& achieved, uint32_t& unlockTime)
-    {
-        achieved   = false;
-        unlockTime = 0;
-        if (!id || !*id) return false;
-
-        void* stats = GetSteamUserStatsInterface();
-        if (!stats) return false;
-
-        static bool resolved = false;
-        static bool (*getAchievement)(void*, const char*, bool*, uint32_t*) = nullptr;
-        if (!resolved)
-        {
-            resolved = true;
-            if (HMODULE dll = GetModuleHandleA("steam_api64.dll"))
-            {
-                auto fn = reinterpret_cast<bool (*)(void*, const char*, bool*, uint32_t*)>(
-                    GetProcAddress(dll, "SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime"));
-                if (Mem::IsExecutable(reinterpret_cast<void*>(fn), 1))
-                    getAchievement = fn;
-                else
-                    LOG("Steam: GetAchievementAndUnlockTime not resolvable");
-            }
-        }
-        if (!getAchievement) return false;
-
-        try
-        {
-            bool     ach  = false;
-            uint32_t when = 0;
-            if (!getAchievement(stats, id, &ach, &when)) return false;
-            achieved   = ach;
-            unlockTime = when;
-            return true;
-        }
-        catch (...) { return false; }
-    }
-
-    // Unix seconds -> something a human can compare against a Steam profile.
-    std::string FormatUnlockTime(uint32_t unixSeconds)
-    {
-        if (unixSeconds == 0) return "never";
-        __time64_t t = (__time64_t)unixSeconds;
-        std::tm     tm{};
-        if (_localtime64_s(&tm, &t) != 0) return "?";
-        char buf[32];
-        if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm) == 0) return "?";
-        return buf;
-    }
-
-    // GAME THREAD ONLY. Steam's own display name for an id.
-    //
-    // Called once per id and cached, not once per refresh: the FText out-params
-    // arrive holding a reference we have no way to release, so repeating this
-    // every refresh would leak a text object per achievement per press.
-    std::string FetchAchievementTitleGameThread(UObject* world, UObject* pc, const FName& id)
-    {
-        try
-        {
-            UObject*   lib    = CachedObject(AH::Obj_AchievementBPLibrary);
-            UFunction* descFn = CachedFn(AH::Fn_GetCachedAchievementDescription);
-            if (!lib || !descFn) return {};
-
-            P_GetCachedAchievementDescription d{};
-            d.WorldContextObject = world;
-            d.PlayerController   = pc;
-            d.AchievementID      = id;
-            lib->ProcessEvent(descFn, &d);
-            if (!d.bFoundID) return {};
-
-            UObject*   textLib = CachedObject(AH::Obj_KismetTextLibrary);
-            UFunction* convFn  = CachedFn(AH::Fn_ConvTextToString);
-            if (!textLib || !convFn) return {};
-
-            P_ConvTextToString c{};
-            std::memcpy(c.InText, d.Title, sizeof(c.InText));
-            textLib->ProcessEvent(convFn, &c);
-            return c.ReturnValue.ToString();
-        }
-        catch (...) { return {}; }
-    }
-
-    // GAME THREAD ONLY. One read of everything Steam knows.
-    void RefreshAchievementStateGameThread()
-    {
-        const ULONGLONG startMs = GetTickCount64();
-        try
-        {
-            UObject* subsystem = GetAchievementSubsystemGameThread();
-            UObject* world     = GetWorld();
-            UObject* pc        = GetPlayerController();
-            if (!subsystem || !world || !pc)
-            {
-                LOG("Achievements: state read skipped (subsystem=%p world=%p pc=%p)",
-                    (void*)subsystem, (void*)world, (void*)pc);
-                SetAchievementStatus("Steam state: not in a live game yet.");
-                return;
-            }
-
-            // Order matters: the id table (re)creates g_achStates, so anything that
-            // fills those entries has to run after it or be wiped by the assign.
-            const int ids = BuildAchievementIdTableGameThread(subsystem);
-            ReadAchievementProgressGameThread(subsystem);
-            if (ids <= 0)
-            {
-                SetAchievementStatus("Steam state unavailable: no achievement ids -- see the log.");
-                return;
-            }
-
-            UObject*   lib = CachedObject(AH::Obj_AchievementBPLibrary);
-            UFunction* fn  = CachedFn(AH::Fn_GetCachedAchievementProgress);
-            if (!lib || !fn)
-            {
-                LOG("Achievements: progress read skipped (lib=%p fn=%p)", (void*)lib, (void*)fn);
-                SetAchievementStatus("Steam state unavailable: the engine's achievement library "
-                                     "did not resolve.");
-                return;
-            }
-
-            int queried = 0, found = 0, unlocked = 0, total = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_achMutex);
-                total = (int)g_achStates.size();
-            }
-            for (int i = 0; i < total; ++i)
-            {
-                FName id{};
-                bool  wantTitle = false;
-                {
-                    std::lock_guard<std::mutex> lk(g_achMutex);
-                    if (!g_achStates[i].idKnown) continue;
-                    id        = g_achStates[i].id;
-                    wantTitle = g_achStates[i].title.empty();
-                }
-
-                P_GetCachedAchievementProgress p{};
-                p.WorldContextObject = world;
-                p.PlayerController   = pc;
-                p.AchievementID      = id;
-                lib->ProcessEvent(fn, &p);
-
-                // Outside the lock: these call into game / Steam code.
-                std::string title;
-                if (wantTitle && p.bFoundID)
-                    title = FetchAchievementTitleGameThread(world, pc, id);
-
-                std::string idText;
-                {
-                    std::lock_guard<std::mutex> lk(g_achMutex);
-                    idText = g_achStates[i].idText;
-                }
-                bool     steamAchieved = false;
-                uint32_t steamWhen     = 0;
-                const bool steamOk = ReadSteamAchievementState(idText.c_str(), steamAchieved, steamWhen);
-
-                std::lock_guard<std::mutex> lk(g_achMutex);
-                g_achStates[i].queried         = true;
-                g_achStates[i].found           = p.bFoundID;
-                g_achStates[i].progress        = p.Progress;
-                g_achStates[i].steamResolved   = steamOk;
-                g_achStates[i].steamAchieved   = steamAchieved;
-                g_achStates[i].steamUnlockTime = steamWhen;
-                if (!title.empty()) g_achStates[i].title = title;
-                ++queried;
-                if (p.bFoundID) ++found;
-                // Steam wins where the two disagree; the engine value is the
-                // fallback for when steam_api64 cannot be reached at all.
-                if (steamOk ? steamAchieved : (p.bFoundID && p.Progress >= 100.0f))
-                    ++unlocked;
-            }
-
-            char summary[256];
-            {
-                // Every entry, with the id actually asked for and the name STEAM
-                // gives it -- the internal spelling and the Steam title are not the
-                // same string ("GoldenFever" vs "Gold Rush"), and checking a read
-                // against a guessed mapping is how a wrong answer passes for right.
-                std::lock_guard<std::mutex> lk(g_achMutex);
-                int disagreements = 0;
-                for (int i = 0; i < (int)g_achStates.size(); ++i)
-                {
-                    const AchievementSteamState& st = g_achStates[i];
-                    const char* engine = !st.idKnown ? "NO ID"
-                                       : !st.found   ? "no answer"
-                                       : st.progress >= 100.0f ? "UNLOCKED" : "locked";
-                    const char* steam  = !st.steamResolved ? "unreachable"
-                                       : st.steamAchieved  ? "UNLOCKED" : "locked";
-                    const bool engineSaysUnlocked = st.found && st.progress >= 100.0f;
-                    const bool differs = st.steamResolved && (st.steamAchieved != engineSaysUnlocked);
-                    if (differs) ++disagreements;
-
-                    char progress[32] = "";
-                    if (st.hasTarget)
-                        std::snprintf(progress, sizeof(progress), "  %.0f/%.0f", st.current, st.target);
-
-                    LOG("Achievements: %-32s \"%s\"  engine=%-9s steam=%-11s unlocked=%s%s%s",
-                        g_achCatalog[i].name.c_str(),
-                        st.title.empty() ? "?" : st.title.c_str(),
-                        engine, steam, FormatUnlockTime(st.steamUnlockTime).c_str(),
-                        progress,
-                        differs ? "   <<< ENGINE AND STEAM DISAGREE" : "");
-                }
-                if (disagreements)
-                    LOG("Achievements: %d achievement(s) where the engine's cached value and Steam "
-                        "itself disagree -- Steam's answer is the one used.", disagreements);
-            }
-            if (found == 0)
-                std::snprintf(summary, sizeof(summary),
-                              "Steam returned nothing for any of %d ids -- the cache fills "
-                              "asynchronously, so press Refresh again in a second.", queried);
-            else
-                std::snprintf(summary, sizeof(summary),
-                              "%d of %d unlocked on Steam (%d ids read, %d answered) in %llums.",
-                              unlocked, total, queried, found,
-                              (unsigned long long)(GetTickCount64() - startMs));
-            LOG("Achievements: %s", summary);
-            {
-                std::lock_guard<std::mutex> lk(g_achMutex);
-                g_achStateSummary = summary;
-            }
-            SetAchievementStatus(summary);
-        }
-        catch (...)
-        {
-            LOG("Achievements: state read exception (ignored)");
-            SetAchievementStatus("Steam state read failed -- see the log.");
-        }
-    }
-
-    // Render thread: pace the streamed unlock-all and marshal each step. The
-    // ProcessEvent itself always happens on the game thread.
-    void ScheduleAchievementGameThreadWork()
-    {
-        if (!g_achUnlockAll.active)
-            return;
-
-        const ULONGLONG nowMs = GetTickCount64();
-        if (g_achUnlockAll.lastStepMs && nowMs - g_achUnlockAll.lastStepMs < kAchUnlockAllStepMs)
-            return;
-
-        // Everything the mutex protects is read into locals first: SetAchievementStatus
-        // takes the same (non-recursive) mutex, so it must never be called under it.
-        int  value = 0;
-        int  remaining = 0;
-        int  total = 0;
-        int  sent = 0;
-        bool finished = false;
-        {
-            std::lock_guard<std::mutex> lk(g_achMutex);
-            total = (int)g_achCatalog.size();
-            sent  = g_achUnlockAll.ok;
-            if (g_achUnlockAll.index >= total)
-                finished = true;
-            else
-            {
-                value = g_achCatalog[g_achUnlockAll.index].value;
-                remaining = total - g_achUnlockAll.index - 1;
-            }
-        }
-
-        if (finished)
-        {
-            LOG("Achievements: unlock all complete -- %d/%d sent", sent, total);
-            { std::lock_guard<std::mutex> lk(g_achMutex); g_achUnlockAll = {}; }
-            SetAchievementStatus("Unlock all finished: " + std::to_string(sent) + "/" +
-                                 std::to_string(total) + " sent. Steam can lag a few seconds behind.");
-            return;
-        }
-
-        ++g_achUnlockAll.index;
-        g_achUnlockAll.lastStepMs = nowMs;
-
-        QueueGameThread([value]()
-        {
-            if (!SendAchievementUnlockGameThread(value))
-                return;
-            std::lock_guard<std::mutex> lk(g_achMutex);
-            g_achSent.insert(value);
-            ++g_achUnlockAll.ok;   // only field of g_achUnlockAll the game thread touches
-        });
-        InstallProcessEventHook();
-
-        SetAchievementStatus("Unlock all: " + std::to_string(remaining) + " to go.");
-    }
-
     // Decides when the next grant is due and hands it over; the grant itself runs
     // on the pump.
     void ProcessGiveAllQueue()
@@ -14770,17 +13961,18 @@ namespace
         { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
         { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
         // Achievements.
-        { AH::Fn_SendAchievementUnlockEvent,   (int)sizeof(P_SendAchievementUnlock),     "P_SendAchievementUnlock" },
-        { AH::Fn_SendAchievementProgressEvent, (int)sizeof(P_SendAchievementProgress),   "P_SendAchievementProgress" },
-        { AH::Fn_UpdateAchievementProgress,    (int)sizeof(P_UpdateAchievementProgress), "P_UpdateAchievementProgress" },
-        { AH::Fn_GetAchievementSubsystem,      (int)sizeof(P_ObjectReturn),              "P_ObjectReturn (achievements)" },
-        { AH::Fn_CacheAchievements,            (int)sizeof(P_CacheAchievements),         "P_CacheAchievements" },
-        { AH::Fn_GetCachedAchievementProgress, (int)sizeof(P_GetCachedAchievementProgress), "P_GetCachedAchievementProgress" },
-        { AH::Fn_ConvStringToName,             (int)sizeof(P_ConvStringToName),          "P_ConvStringToName" },
-        { AH::Fn_GetCachedAchievementDescription, (int)sizeof(P_GetCachedAchievementDescription), "P_GetCachedAchievementDescription" },
-        { AH::Fn_ConvTextToString,             (int)sizeof(P_ConvTextToString),          "P_ConvTextToString" },
+        { AH::Fn_SendAchievementUnlockEvent,   (int)sizeof(Achievements::P_SendAchievementUnlock),        "P_SendAchievementUnlock" },
+        { AH::Fn_GetAchievementSubsystem,      (int)sizeof(Achievements::P_GetAchievementSubsystem),       "P_GetAchievementSubsystem" },
+        { AH::Fn_CacheAchievements,            (int)sizeof(Achievements::P_CacheAchievements),            "P_CacheAchievements" },
+        { AH::Fn_GetCachedAchievementProgress, (int)sizeof(Achievements::P_GetCachedAchievementProgress), "P_GetCachedAchievementProgress" },
+        { AH::Fn_ConvStringToName,             (int)sizeof(Achievements::P_ConvStringToName),             "P_ConvStringToName" },
+        { AH::Fn_GetCachedAchievementDescription, (int)sizeof(Achievements::P_GetCachedAchievementDescription), "P_GetCachedAchievementDescription" },
+        { AH::Fn_ConvTextToString,             (int)sizeof(Achievements::P_ConvTextToString),             "P_ConvTextToString" },
     };
+}
 
+namespace Features
+{
     // The table entries are NEEDLES: FindObjectFast matches them as substrings
     // among the objects sharing the last name token, so "Engine.Level" would also
     // accept any object named Level whose path contains it. Walking UStruct fields
@@ -14801,7 +13993,10 @@ namespace
             return true;
         return meta.size() >= 5 && meta.compare(meta.size() - 5, 5, "Class") == 0;
     }
+}
 
+namespace
+{
     DWORD WINAPI VerifyOffsetsThread(LPVOID)
     {
         int matched = 0, moved = 0, unresolvedProp = 0, unresolvedClass = 0;
@@ -14928,283 +14123,6 @@ namespace
         InterlockedExchange(&g_offsetVerifyRunning, 0);
         return 0;
     }
-
-    // =====================================================================
-    //  Achievement API discovery.
-    // ---------------------------------------------------------------------
-    //  Atomic Heart drives its own achievements through
-    //  GameplayEventSubsystem.SendAchievementUnlockEvent -> the achievement
-    //  subsystem -> WriteAchievementProgress -> Steam. Calling that path from
-    //  here needs three things the exe's strings cannot give us: which class
-    //  owns each function, the exact params-block layout, and the numeric
-    //  EAchievements values. All three are in the running game's reflection
-    //  data, so this reads them straight off it.
-    //
-    //  Strictly read-only -- names, offsets and flags. It never calls
-    //  ProcessEvent, so it can (and does) run on a worker thread, and it
-    //  cannot unlock anything by itself.
-    // =====================================================================
-    volatile LONG g_achievementDumpRunning = 0;
-
-    constexpr int kAchvMaxHits         = 400; // matched objects logged before we stop
-    constexpr int kAchvMaxOwnerClasses = 8;   // distinct owner classes dumped in full
-    constexpr int kAchvMaxFields       = 128; // fields listed per struct/class/function
-    constexpr int kAchvMaxClassFuncs   = 200; // functions listed per class in the pass-2 dump
-
-    // "EnumProperty<EAchievements>" -- the type alone does not say which enum.
-    std::string DescribeFieldType(const Reflect::FieldInfo& field)
-    {
-        std::string type = field.type.empty() ? std::string("?") : field.type;
-        if (!field.detail.empty()) type += "<" + field.detail + ">";
-        return type;
-    }
-
-    // Log a UFunction the way a caller has to see it: the params block it expects,
-    // then every parameter with the offset to write it at.
-    void LogFunctionSignature(UObject* function, const char* indent)
-    {
-        const std::string full = SafeObjectFullName(function);
-        if (full.empty()) return;
-
-        int32_t  parmsSize = -1;
-        uint32_t funcFlags = 0;
-        if (Mem::IsReadable((uint8_t*)function + Offsets::O_UStruct_PropertiesSize, 4))
-            parmsSize = *reinterpret_cast<int32_t*>((uint8_t*)function + Offsets::O_UStruct_PropertiesSize);
-        if (Mem::IsReadable((uint8_t*)function + Offsets::O_UFunction_FunctionFlags, 4))
-            funcFlags = *reinterpret_cast<uint32_t*>((uint8_t*)function + Offsets::O_UFunction_FunctionFlags);
-
-        std::string decoded;
-        if (funcFlags & Offsets::FUNC_Static)            decoded += " Static";
-        if (funcFlags & Offsets::FUNC_Native)            decoded += " Native";
-        if (funcFlags & Offsets::FUNC_BlueprintCallable) decoded += " BlueprintCallable";
-
-        LOG_SDK("AchievementDump: %sFUNC %s  parms=0x%X flags=0x%08X%s",
-                indent, full.c_str(), parmsSize, funcFlags,
-                decoded.empty() ? " (none decoded)" : decoded.c_str());
-
-        const std::vector<Reflect::FieldInfo> fields =
-            Reflect::DescribeStructFields(function, kAchvMaxFields);
-        int parmCount = 0;
-        for (const Reflect::FieldInfo& f : fields)
-        {
-            if (!f.IsParm()) continue;   // locals are not part of the params block
-            ++parmCount;
-            LOG_SDK("AchievementDump: %s    %-6s %-28s %-34s @0x%02X size=%d",
-                    indent,
-                    f.IsReturn() ? "return" : (f.IsOut() ? "out" : "in"),
-                    f.name.c_str(), DescribeFieldType(f).c_str(), f.offset, f.size);
-        }
-        if (parmCount == 0)
-            LOG_SDK("AchievementDump: %s    (no parameters -- a null params block is enough)", indent);
-    }
-
-    // Every UFunction a class declares itself, via its Children (UField) list.
-    // The sweep only sees functions whose own NAME matches; this catches the
-    // siblings on the same class that do not (e.g. a bare Unlock()).
-    void LogClassApi(UObject* cls, const char* why)
-    {
-        const std::string full = SafeObjectFullName(cls);
-        if (full.empty()) return;
-
-        int32_t size = -1;
-        if (Mem::IsReadable((uint8_t*)cls + Offsets::O_UStruct_PropertiesSize, 4))
-            size = *reinterpret_cast<int32_t*>((uint8_t*)cls + Offsets::O_UStruct_PropertiesSize);
-        LOG_SDK("AchievementDump: ---- full API of %s (size=0x%X) -- %s", full.c_str(), size, why);
-
-        int  functions = 0;
-        bool truncated = false;
-        if (Mem::IsReadable((uint8_t*)cls + Offsets::O_UStruct_Children, sizeof(void*)))
-        {
-            UObject* child = *reinterpret_cast<UObject**>((uint8_t*)cls + Offsets::O_UStruct_Children);
-            for (int depth = 0; child && depth < 8192 && G::running.load(); ++depth)
-            {
-                if (!Mem::IsReadable(child, Offsets::O_UField_Next + sizeof(void*))) break;
-                if (SafeClassName(child) == "Function")
-                {
-                    if (functions >= kAchvMaxClassFuncs) { truncated = true; break; }
-                    LogFunctionSignature(child, "  ");
-                    ++functions;
-                }
-                child = *reinterpret_cast<UObject**>((uint8_t*)child + Offsets::O_UField_Next);
-            }
-        }
-        if (truncated)
-            LOG_SDK("AchievementDump:   (stopped at %d functions -- this class declares more, "
-                    "raise kAchvMaxClassFuncs to see the rest)", kAchvMaxClassFuncs);
-
-        const std::vector<Reflect::FieldInfo> fields = Reflect::DescribeStructFields(cls, kAchvMaxFields);
-        for (const Reflect::FieldInfo& f : fields)
-            LOG_SDK("AchievementDump:   field %-34s %-34s @0x%03X size=%d",
-                    f.name.c_str(), DescribeFieldType(f).c_str(), f.offset, f.size);
-        if ((int)fields.size() == kAchvMaxFields)
-            LOG_SDK("AchievementDump:   (field list stopped at the %d-field cap -- there may be more)",
-                    kAchvMaxFields);
-        LOG_SDK("AchievementDump: ---- end of %s: %d function(s), %d field(s)",
-                full.c_str(), functions, (int)fields.size());
-    }
-
-    void LogEnumValues(UObject* uenum)
-    {
-        int namesOffset = -1;
-        const std::vector<Reflect::EnumValue> values = Reflect::DescribeEnumValues(uenum, &namesOffset);
-        const std::string full = SafeObjectFullName(uenum);
-        if (values.empty())
-        {
-            LOG_SDK("AchievementDump: ENUM %s -- values NOT readable: nothing in the "
-                    "UEnum::Names probe window (0x%X..0x%X) validated against the enum's own "
-                    "name. The entry NAMES are still recoverable from the exe; only the numeric "
-                    "values are missing, so widen the window in offsets.h or take them from a dump.",
-                    full.c_str(), Offsets::Reflect::UEnum_NamesProbeFirst,
-                    Offsets::Reflect::UEnum_NamesProbeLast);
-            return;
-        }
-        LOG_SDK("AchievementDump: ENUM %s -- %d values (UEnum::Names validated at +0x%X; "
-                "promote that to offsets.h once a dump agrees)",
-                full.c_str(), (int)values.size(), namesOffset);
-        for (const Reflect::EnumValue& v : values)
-            LOG_SDK("AchievementDump:   %4lld = %s", (long long)v.value, v.name.c_str());
-    }
-
-    // An owner class earns a full dump only if it is actually about achievements.
-    // Otherwise one incidental match drags in a whole engine library: on build
-    // 24534183, KismetSystemLibrary matched once (ShowPlatformSpecificAchievements
-    // Screen) and SubsystemUtils once (GetAchievementSubsystem), and dumping the
-    // two of them cost ~250 lines of log for nothing pass 1 had not already
-    // printed. Pass 2 exists only to reveal SIBLING functions whose own names do
-    // not match, which is worth the lines on an achievement class and never on a
-    // general-purpose library.
-    struct AchievementOwner
-    {
-        UObject* cls     = nullptr;
-        int      matched = 0;   // matched functions this class declares
-    };
-
-    bool OwnerEarnsFullDump(const AchievementOwner& owner)
-    {
-        // Its own name says achievements, or it declares more than one of them.
-        if (owner.matched >= 2) return true;
-        return LowerCopy(SafeObjectName(owner.cls)).find("achiev") != std::string::npos;
-    }
-
-    DWORD WINAPI AchievementApiDumpThread(LPVOID)
-    {
-        const ULONGLONG startMs = GetTickCount64();
-        int functions = 0, enums = 0, types = 0, instances = 0, hits = 0;
-        std::vector<AchievementOwner> ownerClasses;
-
-        try
-        {
-            const int total = NumObjects();
-            LOG_SDK("AchievementDump: sweeping %d objects for \"Achiev\" -- read-only reflection, "
-                    "no ProcessEvent. This unlocks nothing; it reports what the achievement path "
-                    "looks like on this build.", total);
-
-            for (int i = 0; i < total && hits < kAchvMaxHits && G::running.load(); ++i)
-            {
-                UObject* object = GetObjectByIndex(i);
-                if (!Mem::IsReadable(object, 0x30)) continue;
-
-                if (LowerCopy(SafeObjectName(object)).find("achiev") == std::string::npos)
-                    continue;
-
-                const std::string meta = SafeClassName(object);
-                ++hits;
-
-                if (meta == "Function")
-                {
-                    ++functions;
-                    LogFunctionSignature(object, "");
-
-                    // The owner is the class that declares it -- a direct pointer, so
-                    // no name lookup can pick the wrong class. This is how we reach the
-                    // subsystems themselves: their own names do not contain "Achiev".
-                    UObject* owner = nullptr;
-                    try { owner = object->Outer(); } catch (...) {}
-                    if (Mem::IsReadable(owner, 0x30))
-                    {
-                        auto it = std::find_if(ownerClasses.begin(), ownerClasses.end(),
-                                               [owner](const AchievementOwner& o) { return o.cls == owner; });
-                        if (it != ownerClasses.end()) ++it->matched;
-                        else                          ownerClasses.push_back({ owner, 1 });
-                    }
-                }
-                else if (meta == "Enum")
-                {
-                    ++enums;
-                    LogEnumValues(object);
-                }
-                else if (IsStructLike(object))
-                {
-                    ++types;
-                    int32_t size = -1;
-                    if (Mem::IsReadable((uint8_t*)object + Offsets::O_UStruct_PropertiesSize, 4))
-                        size = *reinterpret_cast<int32_t*>((uint8_t*)object + Offsets::O_UStruct_PropertiesSize);
-                    LOG_SDK("AchievementDump: TYPE %s  size=0x%X", SafeObjectFullName(object).c_str(), size);
-                    for (const Reflect::FieldInfo& f : Reflect::DescribeStructFields(object, kAchvMaxFields))
-                        LOG_SDK("AchievementDump:     %-34s %-34s @0x%03X size=%d",
-                                f.name.c_str(), DescribeFieldType(f).c_str(), f.offset, f.size);
-                }
-                else
-                {
-                    // A live instance or a property -- an instance is what a call would
-                    // be dispatched ON, so its pointer is worth having.
-                    ++instances;
-                    LOG_SDK("AchievementDump: OBJ  %s  @%p", SafeObjectFullName(object).c_str(), (void*)object);
-                }
-            }
-
-            if (hits >= kAchvMaxHits)
-                LOG_SDK("AchievementDump: hit the %d-object cap -- the list above is TRUNCATED and "
-                        "later matches were not logged.", kAchvMaxHits);
-
-            // Pass 2: the owning classes in full. Everything the achievement path can
-            // do lives here, including the functions whose names never say "Achiev"
-            // (the Get/Set/Write siblings on the same subsystem).
-            int dumped = 0, skippedAsIncidental = 0, skippedByCap = 0;
-            for (const AchievementOwner& owner : ownerClasses)
-            {
-                if (!G::running.load()) break;
-                if (!OwnerEarnsFullDump(owner))
-                {
-                    // Named, not dumped -- so a class that turns out to matter can
-                    // still be found and the filter can be argued with.
-                    ++skippedAsIncidental;
-                    LOG_SDK("AchievementDump: owner %s declares %d matched function(s) and is "
-                            "not an achievement class -- signature already printed above, full "
-                            "dump skipped as noise.",
-                            SafeObjectFullName(owner.cls).c_str(), owner.matched);
-                    continue;
-                }
-                if (dumped >= kAchvMaxOwnerClasses) { ++skippedByCap; continue; }
-                LogClassApi(owner.cls, "declares a matched achievement function");
-                ++dumped;
-            }
-            if (skippedByCap)
-                LOG_SDK("AchievementDump: %d qualifying owner class(es) NOT dumped (cap is %d) "
-                        "-- raise kAchvMaxOwnerClasses if one of them is the class you need.",
-                        skippedByCap, kAchvMaxOwnerClasses);
-            LOG_SDK("AchievementDump: pass 2 dumped %d of %d owner class(es) (%d incidental, %d capped)",
-                    dumped, (int)ownerClasses.size(), skippedAsIncidental, skippedByCap);
-        }
-        catch (...) { LOG_SDK("AchievementDump: exception (ignored)"); }
-
-        LOG_SDK("AchievementDump: DONE in %llums -- %d function(s), %d enum(s), %d type(s), "
-                "%d live object(s), %d owner class(es) seen.",
-                (unsigned long long)(GetTickCount64() - startMs),
-                functions, enums, types, instances, (int)ownerClasses.size());
-        if (functions == 0)
-            LOG_SDK("AchievementDump: nothing matched. Either the engine globals are stale (check "
-                    "for \"ResolveGlobals: VALID\" above) or the achievement classes are not loaded "
-                    "yet -- get into the game world and run it again.");
-        else
-            LOG_SDK("AchievementDump: the Achievements tab drives this same path "
-                    "(GameplayEventUtils.SendAchievementUnlockEvent). Re-run this after a game "
-                    "patch: if a signature above stops matching the params structs in "
-                    "features.cpp, the injection-time VerifyParams check will have said so too.");
-
-        InterlockedExchange(&g_achievementDumpRunning, 0);
-        return 0;
-    }
 }
 
 void Features::DebugVerifyMemberOffsets()
@@ -15220,24 +14138,6 @@ void Features::DebugVerifyMemberOffsets()
     {
         InterlockedExchange(&g_offsetVerifyRunning, 0);
         LOG("VerifyOffsets: thread spawn failed err=%lu", GetLastError());
-        return;
-    }
-    CloseHandle(t);
-}
-
-void Features::DebugDumpAchievementApi()
-{
-    if (!G::sdkReady.load()) { LOG_SDK("AchievementDump: SDK not ready"); return; }
-    if (InterlockedCompareExchange(&g_achievementDumpRunning, 1, 0) != 0)
-    {
-        LOG_SDK("AchievementDump: already running");
-        return;
-    }
-    HANDLE t = CreateThread(nullptr, 0, AchievementApiDumpThread, nullptr, 0, nullptr);
-    if (!t)
-    {
-        InterlockedExchange(&g_achievementDumpRunning, 0);
-        LOG_SDK("AchievementDump: thread spawn failed err=%lu", GetLastError());
         return;
     }
     CloseHandle(t);
@@ -15742,262 +14642,6 @@ bool Features::GiveWeapon(int index, bool equip)
         catch (...) { LOG("GiveWeapon: exception (ignored)"); }
     });
     return true;
-}
-
-// ---- Achievements -------------------------------------------------------------
-// Every one of these is a thin, guarded entry point: the UI calls them from the
-// render thread, and the actual ProcessEvent always happens on the game thread.
-
-const Features::AchievementEntry* Features::AchievementList()
-{
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    return g_achView.empty() ? nullptr : g_achView.data();
-}
-
-int Features::AchievementCount()
-{
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    return (int)g_achView.size();
-}
-
-bool Features::AchievementsReady()
-{
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    return !g_achView.empty();
-}
-
-void Features::AchievementResolveList()
-{
-    if (!G::sdkReady.load()) return;
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        if (!g_achView.empty())
-        {
-            // List is up. Steam's cache fills asynchronously, so ask for it now
-            // rather than when the user presses Refresh and expects an answer.
-            if (!g_achCachePrimed)
-            {
-                g_achCachePrimed = true;
-                QueueGameThread([]() { PrimeAchievementCacheGameThread(); });
-                InstallProcessEventHook();
-            }
-            return;
-        }
-    }
-    // Called every frame the tab is open, so the single-flight guard matters more
-    // than usual: without it an open tab would spawn a GObjects scan per frame.
-    if (InterlockedCompareExchange(&g_achResolveRunning, 1, 0) != 0)
-        return;
-
-    HANDLE t = CreateThread(nullptr, 0, AchievementResolveThread, nullptr, 0, nullptr);
-    if (!t)
-    {
-        InterlockedExchange(&g_achResolveRunning, 0);
-        LOG_SDK("Achievements: list resolve thread spawn failed err=%lu", GetLastError());
-        return;
-    }
-    CloseHandle(t);
-}
-
-namespace
-{
-    // `prime` re-runs the engine's async achievement query; only the manual button
-    // asks for that. Returns false when a read is already queued and undrained.
-    bool QueueAchievementStateRead(bool prime)
-    {
-        if (InterlockedCompareExchange(&g_achRefreshInFlight, 1, 0) != 0)
-            return false;
-        g_achLastRefreshMs = GetTickCount64();
-        QueueGameThread([prime]()
-        {
-            if (prime) PrimeAchievementCacheGameThread();
-            RefreshAchievementStateGameThread();
-            InterlockedExchange(&g_achRefreshInFlight, 0);
-        });
-        InstallProcessEventHook();
-        return true;
-    }
-}
-
-void Features::AchievementRefreshState()
-{
-    if (!G::sdkReady.load()) { LOG("Achievements: state read skipped, SDK not ready"); return; }
-    if (!QueueAchievementStateRead(true))
-        LOG("Achievements: state read already in flight");
-}
-
-void Features::AchievementAutoRefresh()
-{
-    if (!G::sdkReady.load()) return;
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        if (g_achView.empty()) return;         // list not up yet; nothing to fill
-    }
-    const ULONGLONG now = GetTickCount64();
-    if (g_achLastRefreshMs && now - g_achLastRefreshMs < kAchAutoRefreshMs)
-        return;
-    QueueAchievementStateRead(false);
-}
-
-unsigned int Features::AchievementSecondsSinceRefresh()
-{
-    if (g_achLastRefreshMs == 0) return UINT_MAX;
-    const ULONGLONG now = GetTickCount64();
-    return (unsigned int)((now - g_achLastRefreshMs) / 1000);
-}
-
-bool Features::AchievementStateAt(int index, AchievementStateView& out)
-{
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    if (index < 0 || index >= (int)g_achStates.size())
-        return false;
-    const AchievementSteamState& st = g_achStates[index];
-    out.idKnown         = st.idKnown;
-    out.queried         = st.queried;
-    out.found           = st.found;
-    out.progress        = st.progress;
-    out.steamResolved   = st.steamResolved;
-    out.steamAchieved   = st.steamAchieved;
-    out.steamUnlockTime = st.steamUnlockTime;
-    out.hasTarget       = st.hasTarget;
-    out.current         = st.current;
-    out.target          = st.target;
-    std::snprintf(out.title, sizeof(out.title), "%s", st.title.c_str());
-    return true;
-}
-
-const char* Features::AchievementStateSummary()
-{
-    static std::string summary;
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    summary = g_achStateSummary;
-    return summary.c_str();
-}
-
-void Features::AchievementUnlock(int value)
-{
-    if (!G::sdkReady.load()) { LOG("Achievements: unlock skipped, SDK not ready"); return; }
-    if (value < 0 || value > 255) { LOG("Achievements: unlock %d out of range", value); return; }
-
-    std::string label = std::to_string(value);
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        for (const AchievementCatalogEntry& e : g_achCatalog)
-            if (e.value == value) { label = e.name; break; }
-    }
-
-    LOG("Achievements: unlock requested -- %s (%d)", label.c_str(), value);
-    QueueGameThread([value]()
-    {
-        if (!SendAchievementUnlockGameThread(value))
-            return;
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        g_achSent.insert(value);
-    });
-    InstallProcessEventHook();
-    SetAchievementStatus("Sent unlock: " + label + ".");
-    // Let the next auto tick pick it up rather than making the user press refresh.
-    // Steam may not have committed it that fast, but the recurring cadence will
-    // catch it either way.
-    g_achLastRefreshMs = 0;
-}
-
-void Features::AchievementUnlockAll()
-{
-    if (!G::sdkReady.load()) { LOG("Achievements: unlock all skipped, SDK not ready"); return; }
-
-    int total = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        total = (int)g_achCatalog.size();
-    }
-    if (total <= 0)
-    {
-        SetAchievementStatus("Unlock all: no list yet.");
-        return;
-    }
-    if (g_achUnlockAll.active)
-    {
-        LOG("Achievements: unlock all already running (%d/%d)", g_achUnlockAll.index, total);
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        g_achUnlockAll = {};
-        g_achUnlockAll.active = true;
-    }
-    LOG("Achievements: unlock all queued -- %d entries, one every %llums",
-        total, (unsigned long long)kAchUnlockAllStepMs);
-    SetAchievementStatus("Unlock all: " + std::to_string(total) + " queued.");
-}
-
-void Features::AchievementCancelUnlockAll()
-{
-    if (!g_achUnlockAll.active) return;
-    int done = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        done = g_achUnlockAll.index;
-        g_achUnlockAll = {};
-    }
-    LOG("Achievements: unlock all cancelled after %d", done);
-    SetAchievementStatus("Unlock all cancelled after " + std::to_string(done) + ".");
-}
-
-int Features::AchievementUnlockAllRemaining()
-{
-    if (!g_achUnlockAll.active) return 0;
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    const int remaining = (int)g_achCatalog.size() - g_achUnlockAll.index;
-    return remaining > 0 ? remaining : 0;
-}
-
-void Features::AchievementSetProgress(int value, float current, float maxValue)
-{
-    if (!G::sdkReady.load()) { LOG("Achievements: progress skipped, SDK not ready"); return; }
-    if (value < 0 || value > 255) { LOG("Achievements: progress %d out of range", value); return; }
-
-    LOG("Achievements: progress requested -- value=%d current=%.2f max=%.2f", value, current, maxValue);
-    QueueGameThread([value, current, maxValue]()
-    {
-        try
-        {
-            UObject* subsystem = GetAchievementSubsystemGameThread();
-            UFunction* fn = CachedFn(AH::Fn_UpdateAchievementProgress);
-            if (!subsystem || !fn)
-            {
-                LOG("Achievements: progress skipped (subsystem=%p fn=%p)", (void*)subsystem, (void*)fn);
-                SetAchievementStatus("Set progress failed: subsystem not reachable.");
-                return;
-            }
-            P_UpdateAchievementProgress p{};
-            p.Achievement     = (uint8_t)value;
-            p.CurrentProgress = current;
-            p.MaxValue        = maxValue;
-            subsystem->ProcessEvent(fn, &p);
-            LOG("Achievements: UpdateAchievementProgress(%d, %.2f, %.2f) -> %s",
-                value, current, maxValue, p.ReturnValue ? "true" : "false");
-            SetAchievementStatus(std::string("Set progress -> the game returned ") +
-                                 (p.ReturnValue ? "true." : "false."));
-        }
-        catch (...) { LOG("Achievements: progress exception (ignored)"); }
-    });
-    InstallProcessEventHook();
-}
-
-bool Features::AchievementWasSent(int value)
-{
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    return g_achSent.find(value) != g_achSent.end();
-}
-
-const char* Features::AchievementStatus()
-{
-    static std::string status;
-    std::lock_guard<std::mutex> lk(g_achMutex);
-    status = g_achStatus;
-    return status.c_str();
 }
 
 int Features::GiveAllWeapons(bool equipLast)
@@ -17311,7 +15955,6 @@ static void TickImpl()
     // some unrelated pawn feature was enabled.
     ProcessGiveAllQueue();
     ProcessPendingEquip();
-    ScheduleAchievementGameThreadWork();
 
     if (!HasPawnFeatureWork(st))
         return;
