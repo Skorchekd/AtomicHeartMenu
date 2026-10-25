@@ -101,14 +101,19 @@ namespace
         bool        queried        = false;
         bool        engineFound    = false;
         float       engineProgress = 0.0f;   // the ENGINE's answer: 0 or 100, nothing between
-        // Steam's own answer, read straight from steam_api64.dll. Authoritative
-        // where they disagree -- see ReadSteamAchievementState.
+        // Steam's own answer, read straight from steam_api64.dll. `steamReachable`
+        // is whether steam_api64 could be used at all for the read that produced
+        // this state; `steamResolved` is whether it answered for THIS id. When it
+        // is reachable it is the authority and the engine cache is not consulted.
+        bool        steamReachable  = false;
         bool        steamResolved   = false;
         bool        steamAchieved   = false;
         uint32_t    steamUnlockTime = 0; // unix seconds; 0 when never unlocked
     };
     std::vector<AchievementReadState> g_achStates;   // parallel to g_achCatalog
     std::string g_achSteamReadSummary = "Not read yet.";
+    std::atomic<bool> g_achSteamUnavailable{ false };    // the last read ran without steam_api64
+    std::atomic<int>  g_achSteamSim{ (int)SteamSimulation::Off };
     bool        g_achCachePrimed      = false;
 
     // The one read scheduler. A read is due once the previous one COMPLETED
@@ -183,16 +188,25 @@ namespace
         return Mem::IsReadable(field, sizeof(int32_t)) ? *reinterpret_cast<int32_t*>(field) : -1;
     }
 
-    // Steam wins where it answered; the engine's cached value is the fallback for
-    // when steam_api64 cannot be reached at all.
     bool EngineSaysUnlocked(const AchievementReadState& st)
     {
         return st.engineFound && st.engineProgress >= kProgressComplete;
     }
 
+    // A reachable Steam is the authority, so an id it did not answer for is not
+    // unlocked. The engine cache stands in only while Steam cannot be reached.
     bool IsUnlocked(const AchievementReadState& st)
     {
-        return st.steamResolved ? st.steamAchieved : EngineSaysUnlocked(st);
+        return st.steamReachable ? (st.steamResolved && st.steamAchieved) : EngineSaysUnlocked(st);
+    }
+
+    // Each failing piece is named once per session, however many reads hit it.
+    bool FirstTime(const std::string& key)
+    {
+        static std::mutex                    s_mutex;
+        static std::unordered_set<std::string> s_seen;
+        std::lock_guard<std::mutex> lk(s_mutex);
+        return s_seen.insert(key).second;
     }
 
     bool IsSentinelName(const std::string& name)
@@ -400,7 +414,7 @@ namespace
     // to build one from a string -- which could not work anyway, since the name
     // pool holds "EAchievements::KillTwins" as a single name and a standalone
     // "KillTwins" need not exist in it.
-    int BuildAchievementIdTableGameThread(UObject* subsystem)
+    int BuildAchievementIdTableGameThread(UObject* subsystem, bool forced)
     {
         Reflect::MapView map = Reflect::OpenMapProperty(subsystem, AH::Prop_AchievementsMap);
         if (!map.valid)
@@ -504,9 +518,18 @@ namespace
             }
         }
 
-        LOG("Achievements: id table built -- %d of %d entries matched (%d map rows not in the "
-            "menu list, %d ids that could not be made into an FName)",
-            matched, listed, unmapped, unresolved);
+        // The table is rebuilt on every read; say so only when it came out different.
+        static int s_loggedMatched = -1, s_loggedUnmapped = -1, s_loggedUnresolved = -1;
+        if (forced || matched != s_loggedMatched || unmapped != s_loggedUnmapped ||
+            unresolved != s_loggedUnresolved)
+        {
+            s_loggedMatched    = matched;
+            s_loggedUnmapped   = unmapped;
+            s_loggedUnresolved = unresolved;
+            LOG("Achievements: id table built -- %d of %d entries matched (%d map rows not in the "
+                "menu list, %d ids that could not be made into an FName)",
+                matched, listed, unmapped, unresolved);
+        }
         return matched;
     }
 
@@ -525,64 +548,109 @@ namespace
     //  something computed on the way out. It also answers a question the engine
     //  cannot: WHEN an achievement was unlocked.
     // =====================================================================
-    void* GetSteamUserStatsInterface()
-    {
-        static void* cached = nullptr;
-        static bool  tried  = false;
-        if (tried) return cached;
-        tried = true;
+    constexpr const char* kSteamDll                  = "steam_api64.dll";
+    constexpr const char* kSteamUserStatsExport      = "SteamAPI_SteamUserStats_v012";
+    constexpr const char* kSteamGetAchievementExport = "SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime";
+    constexpr const char* kSteamInterfacePiece       = "ISteamUserStats interface";
 
-        HMODULE dll = GetModuleHandleA("steam_api64.dll");
+    enum class SteamResolve { Ok, DllMissing, EntryPointMissing, InterfaceMissing };
+
+    using SteamGetAchievementFn = bool (*)(void* stats, const char* id, bool* achieved, uint32_t* unlockTime);
+
+    // Everything the tab uses from steam_api64's flat API, resolved together so
+    // "can Steam be asked at all" is one answer, kept apart from "did Steam answer
+    // for this id".
+    struct SteamApi
+    {
+        SteamResolve          result      = SteamResolve::DllMissing;
+        const char*           failedPiece = kSteamDll;   // what to blame when result != Ok
+        void*                 userStats   = nullptr;
+        SteamGetAchievementFn getAchievementAndUnlockTime = nullptr;
+
+        bool Reachable() const { return result == SteamResolve::Ok; }
+    };
+
+    void LoadSteamApi(SteamApi& api)
+    {
+        HMODULE dll = GetModuleHandleA(kSteamDll);
         if (!dll)
         {
-            LOG("Steam: steam_api64.dll is not loaded -- direct achievement reads unavailable");
-            return nullptr;
+            api.result = SteamResolve::DllMissing;
+            api.failedPiece = kSteamDll;
+            return;
         }
-        auto accessor = reinterpret_cast<void* (*)()>(
-            GetProcAddress(dll, "SteamAPI_SteamUserStats_v012"));
+        auto accessor = reinterpret_cast<void* (*)()>(GetProcAddress(dll, kSteamUserStatsExport));
+        auto getFn    = reinterpret_cast<SteamGetAchievementFn>(GetProcAddress(dll, kSteamGetAchievementExport));
         // A bad function pointer that merely READS fine still DEP-faults on the
         // call, after control has left our code where catch(...) cannot reach it.
         if (!Mem::IsExecutable(reinterpret_cast<void*>(accessor), 1))
         {
-            LOG("Steam: SteamAPI_SteamUserStats_v012 not resolvable");
-            return nullptr;
+            api.result = SteamResolve::EntryPointMissing;
+            api.failedPiece = kSteamUserStatsExport;
+            return;
         }
-        try { cached = accessor(); } catch (...) { cached = nullptr; }
-        LOG("Steam: ISteamUserStats = %p", cached);
-        return cached;
+        if (!Mem::IsExecutable(reinterpret_cast<void*>(getFn), 1))
+        {
+            api.result = SteamResolve::EntryPointMissing;
+            api.failedPiece = kSteamGetAchievementExport;
+            return;
+        }
+        void* stats = nullptr;
+        try { stats = accessor(); } catch (...) { stats = nullptr; }
+        if (!stats)
+        {
+            api.result = SteamResolve::InterfaceMissing;
+            api.failedPiece = kSteamInterfacePiece;
+            return;
+        }
+        if (FirstTime("Steam: ISteamUserStats"))
+            LOG("Steam: ISteamUserStats = %p", stats);
+        api.userStats = stats;
+        api.getAchievementAndUnlockTime = getFn;
+        api.result = SteamResolve::Ok;
     }
 
-    bool ReadSteamAchievementState(const char* id, bool& achieved, uint32_t& unlockTime)
+    // Resolved afresh each read (a few GetProcAddress calls), so a Steam that was
+    // not ready on the first read is picked up later. The debug simulation
+    // reports a failure without going near the real handles.
+    SteamApi ResolveSteamApi()
+    {
+        SteamApi api;
+        const SteamSimulation sim = (SteamSimulation)g_achSteamSim.load();
+        if (sim == SteamSimulation::DllMissing)
+        {
+            api.result = SteamResolve::DllMissing;
+            api.failedPiece = kSteamDll;
+        }
+        else if (sim == SteamSimulation::EntryPointMissing)
+        {
+            api.result = SteamResolve::EntryPointMissing;
+            api.failedPiece = kSteamGetAchievementExport;
+        }
+        else
+        {
+            LoadSteamApi(api);
+        }
+
+        if (!api.Reachable() && FirstTime(api.failedPiece))
+            LOG("Steam: %s unavailable%s -- achievement state falls back to the engine cache",
+                api.failedPiece, sim != SteamSimulation::Off ? " (simulated)" : "");
+        return api;
+    }
+
+    // True when Steam answered for this id. False for "no answer" and for an
+    // unreachable Steam alike; the caller knows which from `steam.Reachable()`.
+    bool ReadSteamAchievementState(const SteamApi& steam, const char* id, bool& achieved, uint32_t& unlockTime)
     {
         achieved   = false;
         unlockTime = 0;
-        if (!id || !*id) return false;
-
-        void* stats = GetSteamUserStatsInterface();
-        if (!stats) return false;
-
-        static bool resolved = false;
-        static bool (*getAchievement)(void*, const char*, bool*, uint32_t*) = nullptr;
-        if (!resolved)
-        {
-            resolved = true;
-            if (HMODULE dll = GetModuleHandleA("steam_api64.dll"))
-            {
-                auto fn = reinterpret_cast<bool (*)(void*, const char*, bool*, uint32_t*)>(
-                    GetProcAddress(dll, "SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime"));
-                if (Mem::IsExecutable(reinterpret_cast<void*>(fn), 1))
-                    getAchievement = fn;
-                else
-                    LOG("Steam: GetAchievementAndUnlockTime not resolvable");
-            }
-        }
-        if (!getAchievement) return false;
+        if (!steam.Reachable() || !id || !*id) return false;
 
         try
         {
             bool     ach  = false;
             uint32_t when = 0;
-            if (!getAchievement(stats, id, &ach, &when)) return false;
+            if (!steam.getAchievementAndUnlockTime(steam.userStats, id, &ach, &when)) return false;
             achieved   = ach;
             unlockTime = when;
             return true;
@@ -637,27 +705,40 @@ namespace
 
     struct ReadTotals
     {
-        int queried        = 0;
-        int steamAnswered  = 0;   // steam_api64 answered for the id
-        int engineFound    = 0;   // the engine's cache had an answer for the id
-        int unlockedSteam  = 0;   // unlocked, going by Steam
-        int unlockedEngine = 0;   // unlocked, going by the engine cache (Steam did not answer)
+        int queried       = 0;
+        int steamAnswered = 0;   // steam_api64 answered for the id
+        int engineFound   = 0;   // the engine's cache had an answer for the id
+        int unlocked      = 0;   // by IsUnlocked: Steam's word, or the cache's while Steam is unreachable
+    };
+
+    // What one read talks to. The engine cache needs its library and function;
+    // missing either means "no fallback", not "no state" -- Steam is read
+    // regardless.
+    struct ReadContext
+    {
+        UObject*   world = nullptr;
+        UObject*   pc    = nullptr;
+        UObject*   lib   = nullptr;
+        UFunction* progressFn = nullptr;
+        SteamApi   steam;
+
+        bool EngineReadable() const { return lib && progressFn; }
     };
 
     // Whether a read moved anything the log table or the row would show.
     bool AnswerChanged(const AchievementReadState& before, const AchievementReadState& after)
     {
         return !before.queried
-            || before.engineFound   != after.engineFound
-            || before.steamResolved != after.steamResolved
+            || before.steamReachable != after.steamReachable
+            || before.steamResolved  != after.steamResolved
+            || before.engineFound    != after.engineFound
             || EngineSaysUnlocked(before) != EngineSaysUnlocked(after)
             || IsUnlocked(before) != IsUnlocked(after);
     }
 
-    // GAME THREAD ONLY. Ask the engine and Steam about one slot and store the
-    // answer. True when the answer differs from the previous read.
-    bool ReadOneAchievement(int slot, UObject* lib, UFunction* fn, UObject* world, UObject* pc,
-                            ReadTotals& totals)
+    // GAME THREAD ONLY. Ask Steam and the engine cache about one slot and store
+    // the answers. True when the answer differs from the previous read.
+    bool ReadOneAchievement(int slot, const ReadContext& ctx, ReadTotals& totals)
     {
         FName                id{};
         std::string          idText;
@@ -673,32 +754,38 @@ namespace
             before    = st;
         }
 
-        P_GetCachedAchievementProgress p{};
-        p.WorldContextObject = world;
-        p.PlayerController   = pc;
-        p.AchievementID      = id;
-        if (!Dispatch(lib, fn, &p, "GetCachedAchievementProgress"))
+        bool  engineFound    = false;
+        float engineProgress = 0.0f;
+        if (ctx.EngineReadable())
         {
-            p.bFoundID = false;
-            p.Progress = 0.0f;
+            P_GetCachedAchievementProgress p{};
+            p.WorldContextObject = ctx.world;
+            p.PlayerController   = ctx.pc;
+            p.AchievementID      = id;
+            if (Dispatch(ctx.lib, ctx.progressFn, &p, "GetCachedAchievementProgress"))
+            {
+                engineFound    = p.bFoundID;
+                engineProgress = p.Progress;
+            }
         }
 
         // Outside the lock: these call into game / Steam code.
         std::string title;
-        const bool  fetchTitle = wantTitle && p.bFoundID;
+        const bool  fetchTitle = wantTitle && engineFound;
         if (fetchTitle)
-            title = FetchAchievementTitleGameThread(world, pc, id);
+            title = FetchAchievementTitleGameThread(ctx.world, ctx.pc, id);
 
         bool     steamAchieved = false;
         uint32_t steamWhen     = 0;
-        const bool steamOk = ReadSteamAchievementState(idText.c_str(), steamAchieved, steamWhen);
+        const bool steamAnswered = ReadSteamAchievementState(ctx.steam, idText.c_str(), steamAchieved, steamWhen);
 
         std::lock_guard<std::mutex> lk(g_achMutex);
         AchievementReadState& st = g_achStates[slot];
         st.queried         = true;
-        st.engineFound     = p.bFoundID;
-        st.engineProgress  = p.Progress;
-        st.steamResolved   = steamOk;
+        st.engineFound     = engineFound;
+        st.engineProgress  = engineProgress;
+        st.steamReachable  = ctx.steam.Reachable();
+        st.steamResolved   = steamAnswered;
         st.steamAchieved   = steamAchieved;
         st.steamUnlockTime = steamWhen;
         if (fetchTitle)
@@ -708,10 +795,9 @@ namespace
         }
 
         ++totals.queried;
-        if (st.steamResolved) ++totals.steamAnswered;
-        if (st.engineFound)   ++totals.engineFound;
-        if (IsUnlocked(st))
-            ++(st.steamResolved ? totals.unlockedSteam : totals.unlockedEngine);
+        if (steamAnswered)  ++totals.steamAnswered;
+        if (engineFound)    ++totals.engineFound;
+        if (IsUnlocked(st)) ++totals.unlocked;
         return AnswerChanged(before, st);
     }
 
@@ -746,8 +832,9 @@ namespace
                 line.engine = !st.idKnown ? "NO ID"
                             : !st.engineFound ? "no answer"
                             : EngineSaysUnlocked(st) ? "UNLOCKED" : "locked";
-                line.steam  = !st.steamResolved ? "unreachable"
-                            : st.steamAchieved  ? "UNLOCKED" : "locked";
+                line.steam  = !st.steamReachable ? "unreachable"
+                            : !st.steamResolved  ? "no answer"
+                            : st.steamAchieved   ? "UNLOCKED" : "locked";
                 line.unlockTime = st.steamUnlockTime;
                 line.differs    = st.steamResolved && (st.steamAchieved != EngineSaysUnlocked(st));
                 lines.push_back(std::move(line));
@@ -769,38 +856,61 @@ namespace
                 "itself disagree -- Steam's answer is the one used.", disagreements);
     }
 
-    // GAME THREAD ONLY. One read of everything the engine cache and Steam know. The per-id table goes
-    // to the log on a forced read (the Refresh button) and for ids whose answer
-    // moved since the last read, so the 3 s auto-refresh stays quiet.
+    // One line for the status text and the log. Steam unreachable and Steam
+    // reachable-but-silent read differently: only the first is a cache fallback.
+    void FormatReadSummary(char* out, size_t outSize, const ReadContext& ctx, const ReadTotals& totals, int total)
+    {
+        if (!ctx.steam.Reachable())
+            std::snprintf(out, outSize,
+                          "%d of %d unlocked per engine cache (engine cache answered %d of %d ids).",
+                          totals.unlocked, total, totals.engineFound, totals.queried);
+        else if (totals.steamAnswered == 0)
+            std::snprintf(out, outSize,
+                          "Steam answered for none of %d ids -- rows read \"no answer\"; Steam may "
+                          "still be loading, so press Refresh again in a second.", totals.queried);
+        else
+            std::snprintf(out, outSize,
+                          "%d of %d unlocked per Steam (Steam answered %d of %d ids).",
+                          totals.unlocked, total, totals.steamAnswered, totals.queried);
+    }
+
+    // GAME THREAD ONLY. One read of everything the engine cache and Steam know.
+    // The per-id table, the id-table line and the summary go to the log on a
+    // forced read (the Refresh button) and when they changed since the last read,
+    // so the 3 s auto-refresh stays quiet.
     void RefreshAchievementStateGameThread(bool forced)
     {
-        const ULONGLONG startMs = GetTickCount64();
         try
         {
+            ReadContext ctx;
             UObject* subsystem = GetAchievementSubsystemGameThread();
-            UObject* world     = GetWorld();
-            UObject* pc        = GetPlayerController();
-            if (!subsystem || !world || !pc)
+            ctx.world = GetWorld();
+            ctx.pc    = GetPlayerController();
+            if (!subsystem || !ctx.world || !ctx.pc)
             {
                 LOG("Achievements: state read skipped (subsystem=%p world=%p pc=%p)",
-                    (void*)subsystem, (void*)world, (void*)pc);
+                    (void*)subsystem, (void*)ctx.world, (void*)ctx.pc);
                 SetAchievementStatus("Achievement subsystem not available: not in a live game yet.");
                 return;
             }
 
             // The id table (re)creates g_achStates, so the per-id reads below run after it.
-            if (BuildAchievementIdTableGameThread(subsystem) <= 0)
+            if (BuildAchievementIdTableGameThread(subsystem, forced) <= 0)
             {
                 SetAchievementStatus("Achievement ids unavailable: the subsystem's id map could not be read -- see the log.");
                 return;
             }
 
-            UObject*   lib = CachedObject(AH::Obj_AchievementBPLibrary);
-            UFunction* fn  = CachedFn(AH::Fn_GetCachedAchievementProgress);
-            if (!lib || !fn)
+            ctx.steam      = ResolveSteamApi();
+            ctx.lib        = CachedObject(AH::Obj_AchievementBPLibrary);
+            ctx.progressFn = CachedFn(AH::Fn_GetCachedAchievementProgress);
+            if (!ctx.EngineReadable() && FirstTime("engine-progress-library"))
+                LOG("Achievements: engine progress read unavailable (lib=%p fn=%p) -- no cache fallback",
+                    (void*)ctx.lib, (void*)ctx.progressFn);
+            g_achSteamUnavailable.store(!ctx.steam.Reachable());
+            if (!ctx.steam.Reachable() && !ctx.EngineReadable())
             {
-                LOG("Achievements: progress read skipped (lib=%p fn=%p)", (void*)lib, (void*)fn);
-                SetAchievementStatus("Engine achievement library did not resolve -- see the log.");
+                SetAchievementStatus("Neither Steam nor the engine cache can be read -- see the log.");
                 return;
             }
 
@@ -813,31 +923,22 @@ namespace
             std::vector<int> toLog;
             for (int i = 0; i < total; ++i)
             {
-                const bool changed = ReadOneAchievement(i, lib, fn, world, pc, totals);
+                const bool changed = ReadOneAchievement(i, ctx, totals);
                 if (changed || forced)
                     toLog.push_back(i);
             }
             LogStateTable(toLog);
 
             char summary[256];
-            if (totals.steamAnswered == 0 && totals.engineFound == 0)
-                std::snprintf(summary, sizeof(summary),
-                              "Neither Steam nor the engine cache answered for any of %d ids -- the "
-                              "cache fills asynchronously, so press Refresh again in a second.",
-                              totals.queried);
-            else
-                std::snprintf(summary, sizeof(summary),
-                              "%d of %d unlocked (%d per Steam, %d per engine cache). Answers: "
-                              "Steam %d, engine cache %d, of %d ids read, in %llums.",
-                              totals.unlockedSteam + totals.unlockedEngine, total,
-                              totals.unlockedSteam, totals.unlockedEngine,
-                              totals.steamAnswered, totals.engineFound, totals.queried,
-                              (unsigned long long)(GetTickCount64() - startMs));
-            LOG("Achievements: %s", summary);
+            FormatReadSummary(summary, sizeof(summary), ctx, totals, total);
+            bool summaryChanged = false;
             {
                 std::lock_guard<std::mutex> lk(g_achMutex);
+                summaryChanged = g_achSteamReadSummary != summary;
                 g_achSteamReadSummary = summary;
             }
+            if (forced || summaryChanged)
+                LOG("Achievements: %s", summary);
             SetAchievementStatus(summary);
         }
         catch (...)
@@ -900,34 +1001,78 @@ namespace
         return QueueResult::Queued;
     }
 
+    // Confirmed unlocked by Steam beats Sent (the unlock landed), Sent beats
+    // everything else (it is what this menu did). Past that a reachable Steam is
+    // the only authority; the engine cache speaks only while Steam is unreachable.
     Row::State RowStateOf(const AchievementReadState* st, bool sentByUs)
     {
-        if (st && IsUnlocked(*st)) return Row::State::Unlocked;
+        if (st && st->steamReachable && st->steamResolved && st->steamAchieved)
+            return Row::State::Unlocked;
         if (sentByUs)              return Row::State::Sent;
-        if (!st)                   return Row::State::Unknown;
+        if (!st || !st->queried)   return Row::State::Unknown;
 
-        const bool known = st->steamResolved || (st->queried && st->engineFound);
-        if (known)       return Row::State::Locked;
-        if (st->queried) return Row::State::NoAnswer;
-        return Row::State::Unknown;
+        if (st->steamReachable)
+            return st->steamResolved ? Row::State::Locked : Row::State::NoAnswer;
+        if (!st->engineFound)
+            return Row::State::NoAnswer;
+        return EngineSaysUnlocked(*st) ? Row::State::Unlocked : Row::State::Locked;
     }
 
+    const char* BaseStateLabel(Row::State state)
+    {
+        switch (state)
+        {
+        case Row::State::Unlocked: return "unlocked";
+        case Row::State::Locked:   return "locked";
+        case Row::State::NoAnswer: return "no answer";
+        case Row::State::Sent:     return "sent";
+        case Row::State::Unknown:  break;
+        }
+        return "?";
+    }
+
+    const char* StateTooltip(Row::State state, bool fromEngineCache)
+    {
+        if (fromEngineCache)
+        {
+            if (state == Row::State::NoAnswer)
+                return "Nothing answered for this id: Steam is unavailable and the engine's cache "
+                       "has no entry for it.";
+            return "From the engine's cache, because Steam was unavailable. The cache has reported "
+                   "part-done achievements as unlocked, so it is not trusted: Unlock stays available.";
+        }
+        switch (state)
+        {
+        case Row::State::Unlocked: return "Steam reports this achievement as unlocked.";
+        case Row::State::Locked:   return "Steam reports this achievement as not unlocked yet.";
+        case Row::State::NoAnswer: return "Nothing answered for this id: Steam is reachable but has no "
+                                          "answer for it.";
+        case Row::State::Sent:     return "Fired by this menu this session; waiting for Steam to report it "
+                                          "unlocked.";
+        case Row::State::Unknown:  break;
+        }
+        return "Not read yet.";
+    }
+
+    // Unlocked only disables the button when Steam said so; a cache "unlocked" is
+    // not trusted.
     void ApplyUnlockEnablement(Row& row)
     {
-        switch (row.state)
+        const bool steamUnlocked = row.state == Row::State::Unlocked && row.source == Row::Source::Steam;
+        if (steamUnlocked)
         {
-        case Row::State::Unlocked:
             row.canUnlock      = false;
             row.disabledReason = "Already unlocked";
-            break;
-        case Row::State::Sent:
+        }
+        else if (row.state == Row::State::Sent)
+        {
             row.canUnlock      = false;
             row.disabledReason = "Sent, waiting for Steam";
-            break;
-        default:
+        }
+        else
+        {
             row.canUnlock      = true;
             row.disabledReason = "";
-            break;
         }
     }
 
@@ -1309,6 +1454,7 @@ bool Achievements::RowAt(int index, Row& out)
     const AchievementCatalogEntry& entry = g_achCatalog[index];
     // The state vector only exists once the first id table has been built.
     const AchievementReadState* st = index < (int)g_achStates.size() ? &g_achStates[index] : nullptr;
+    const bool fromEngineCache = st && st->queried && !st->steamReachable;
 
     out = Row{};
     out.enumValue = entry.enumValue;
@@ -1317,15 +1463,53 @@ bool Achievements::RowAt(int index, Row& out)
     if (st)
     {
         std::snprintf(out.title, sizeof(out.title), "%s", st->title.c_str());
-        out.source = st->steamResolved ? Row::Source::Steam : Row::Source::Engine;
-        if (st->steamResolved)
+        if (fromEngineCache)
+            std::snprintf(out.unlockText, sizeof(out.unlockText), "Steam unavailable");
+        else if (st->steamResolved)
             std::snprintf(out.unlockText, sizeof(out.unlockText), "%s",
                           FormatUnlockTime(st->steamUnlockTime).c_str());
+        else if (st->queried)
+            std::snprintf(out.unlockText, sizeof(out.unlockText), "no Steam answer");
     }
     out.titlePending = !st || !st->titleAttempted;
     out.state        = RowStateOf(st, g_achSent.find(entry.enumValue) != g_achSent.end());
+
+    // A sent row is this menu's own word, not a cache reading, so only the states
+    // that came from the cache carry the mark.
+    const bool cacheState = fromEngineCache && out.state != Row::State::Sent && out.state != Row::State::Unknown;
+    out.source = cacheState ? Row::Source::Engine : Row::Source::Steam;
+    std::snprintf(out.stateLabel, sizeof(out.stateLabel), "%s%s", BaseStateLabel(out.state),
+                  cacheState ? " (cache)" : "");
+    out.stateTooltip = StateTooltip(out.state, cacheState);
     ApplyUnlockEnablement(out);
     return true;
+}
+
+Achievements::Tally Achievements::GetTally()
+{
+    Tally tally;
+    std::lock_guard<std::mutex> lk(g_achMutex);
+    tally.total           = (int)g_achCatalog.size();
+    tally.fromEngineCache = g_achSteamUnavailable.load();
+    for (const AchievementReadState& st : g_achStates)
+        if (st.queried && IsUnlocked(st))
+            ++tally.unlocked;
+    return tally;
+}
+
+bool Achievements::SteamUnavailable()
+{
+    return g_achSteamUnavailable.load();
+}
+
+void Achievements::SetSteamSimulation(SteamSimulation mode)
+{
+    g_achSteamSim.store((int)mode);
+}
+
+Achievements::SteamSimulation Achievements::GetSteamSimulation()
+{
+    return (SteamSimulation)g_achSteamSim.load();
 }
 
 const char* Achievements::SteamReadSummary()

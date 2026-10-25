@@ -940,11 +940,18 @@ static void RenderHookTestingTab()
 }
 
 // ---- Achievements tab ------------------------------------------------------------
+// Widest state label, so every row's name starts at the same x.
+static float AchievementLabelColumnWidth()
+{
+    return ImGui::CalcTextSize("no answer (cache)").x;
+}
+
 static void RenderAchievementRow(const Achievements::Row& row)
 {
     using State = Achievements::Row::State;
 
     ImGui::PushID(7000 + row.enumValue);
+    const float rowX = ImGui::GetCursorPosX();
     ImGui::BeginDisabled(!row.canUnlock);
     if (ImGui::Button("Unlock", ImVec2(64, 0)))
     {
@@ -956,33 +963,30 @@ static void RenderAchievementRow(const Achievements::Row& row)
         ImGui::SetTooltip("%s", row.disabledReason);
     ImGui::SameLine();
 
-    // One state per row, in a fixed-width column so every row's name starts at
-    // the same x.
+    ImVec4 labelColor(0.60f, 0.60f, 0.60f, 1.0f);
     switch (row.state)
     {
-    case State::Unlocked:
-        ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.45f, 1.0f), "%-9s", "unlocked");
-        break;
-    case State::Sent:
-        ImGui::TextColored(ImVec4(0.45f, 0.65f, 0.95f, 1.0f), "%-9s", "sent");
-        break;
+    case State::Unlocked: labelColor = ImVec4(0.35f, 0.80f, 0.45f, 1.0f); break;
+    case State::Sent:     labelColor = ImVec4(0.45f, 0.65f, 0.95f, 1.0f); break;
+    case State::NoAnswer: labelColor = ImVec4(0.80f, 0.45f, 0.35f, 1.0f); break;
     case State::Locked:
-        ImGui::TextDisabled("%-9s", "locked");
-        break;
-    case State::NoAnswer:
-        ImGui::TextColored(ImVec4(0.80f, 0.45f, 0.35f, 1.0f), "%-9s", "no answer");
-        break;
-    case State::Unknown:
-        ImGui::TextDisabled("%-9s", "?");
-        break;
+    case State::Unknown:  break;
     }
-    ImGui::SameLine();
+    ImGui::TextColored(labelColor, "%s", row.stateLabel);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", row.stateTooltip);
+    ImGui::SameLine(rowX + 64.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f + AchievementLabelColumnWidth());
 
     ImGui::Text("%3d  %s", row.enumValue, row.title[0] ? row.title : row.name);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("EAchievements::%s  (value %d)\nSteam: %s\nUnlocked: %s",
                           row.name, row.enumValue,
                           row.title[0] ? row.title : "(name not read)", row.unlockText);
+    if (row.titlePending)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("title pending");
+    }
     ImGui::PopID();
 }
 
@@ -1020,10 +1024,19 @@ static void RenderAchievementsTab()
     }
     else
     {
+        const Achievements::Tally tally = Achievements::GetTally();
+        ImGui::Text("%d/%d unlocked%s", tally.unlocked, tally.total,
+                    tally.fromEngineCache ? " (engine cache)" : "");
+        if (Achievements::SteamUnavailable())
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f),
+                               "Steam state unavailable -- showing engine cache");
+
         static char achFilter[64] = "";
+        static bool hideUnlocked  = false;
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::InputTextWithHint("##achfilter", "type to filter: kill, playthrough, craft...",
                                  achFilter, sizeof(achFilter));
+        ImGui::Checkbox("Hide unlocked", &hideUnlocked);
 
         // --- Steam state ---------------------------------------------------
         ImGui::Spacing();
@@ -1060,6 +1073,8 @@ static void RenderAchievementsTab()
             Achievements::Row row;
             if (!Achievements::RowAt(i, row))
                 continue;
+            if (hideUnlocked && row.state == Achievements::Row::State::Unlocked)
+                continue;
 
             if (!needle.empty())
             {
@@ -1075,12 +1090,10 @@ static void RenderAchievementsTab()
             RenderAchievementRow(row);
         }
         if (shown == 0)
-            ImGui::TextDisabled("Nothing matches \"%s\".", achFilter);
+            ImGui::TextDisabled("Nothing matches the filter.");
         ImGui::EndChild();
-        ImGui::TextDisabled("%d of %d shown.  unlocked / locked come from Steam itself.  "
-                            "\"?\" = not read yet, \"no answer\" = nothing answered for "
-                            "that id.  \"sent\" = fired by this menu this session.  Hover "
-                            "a row for its id and unlock date.", shown, count);
+        ImGui::TextDisabled("%d of %d shown.  Hover a state for what it means, or a name for its "
+                            "id and unlock date.", shown, count);
     }
 
     ImGui::Spacing();
@@ -1490,6 +1503,31 @@ void Menu::Render()
                 LOG("UI: achievement API dump requested");
                 Achievements::DebugDumpApi();
             }
+
+            using Sim = Achievements::SteamSimulation;
+            Sim sim = Achievements::GetSteamSimulation();
+            bool simOn = sim != Sim::Off;
+            if (ImGui::Checkbox("Simulate Steam unavailable", &simOn))
+            {
+                sim = simOn ? Sim::DllMissing : Sim::Off;
+                LOG("UI: simulate Steam unavailable -> %s", simOn ? "on" : "off");
+                Achievements::SetSteamSimulation(sim);
+            }
+            ImGui::BeginDisabled(!simOn);
+            if (ImGui::RadioButton("DLL missing", sim == Sim::DllMissing))
+            {
+                LOG("UI: simulate Steam unavailable -> DLL missing");
+                Achievements::SetSteamSimulation(Sim::DllMissing);
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Entry point missing", sim == Sim::EntryPointMissing))
+            {
+                LOG("UI: simulate Steam unavailable -> entry point missing");
+                Achievements::SetSteamSimulation(Sim::EntryPointMissing);
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("The Achievements tab then reads the engine cache, as if steam_api64 "
+                                "were missing that piece. Takes effect on the next read.");
 
             ImGui::Spacing();
             ImGui::SeparatorText("Crash guard");

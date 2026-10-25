@@ -107,20 +107,40 @@ namespace Achievements
         // as not-earned. `Sent` is what THIS menu fired this session while Steam
         // has not yet reported it unlocked.
         enum class State { Unknown, Locked, Unlocked, NoAnswer, Sent };
-        // Who produced `state`. Engine is the engine's own cached layer, and also
-        // the answer for a row nothing has answered yet (state Unknown).
+        // Who produced `state`. Engine is the engine's own cached layer, used only
+        // while Steam cannot be reached at all; a reachable Steam that has no
+        // answer for an id gives NoAnswer, never a cache guess.
         enum class Source { Steam, Engine };
 
         int          enumValue = 0;           // EAchievements numeric value
         const char*  name  = "";              // short name, "EAchievements::" stripped
         char         title[96] = {};          // Steam's display name; empty until fetched
-        bool         titlePending = true;     // title not fetched yet
+        bool         titlePending = true;     // title not attempted yet (an attempted-but-empty title is not pending)
         State        state  = State::Unknown;
-        Source       source = Source::Engine;
+        Source       source = Source::Steam;
+        char         stateLabel[24] = {};     // "unlocked", "locked (cache)", ...
+        const char*  stateTooltip = "";       // what the label means
         char         unlockText[32] = {};     // when Steam says it was unlocked, or why that is unknown
         bool         canUnlock = false;
         const char*  disabledReason = "";     // why canUnlock is false; "" when enabled
     };
+
+    // The header line: how many are unlocked of how many are listed. `fromEngineCache`
+    // is true while Steam is unreachable and the count is the engine cache's.
+    struct Tally
+    {
+        int  total = 0;
+        int  unlocked = 0;
+        bool fromEngineCache = false;
+    };
+    Tally GetTally();
+    bool  SteamUnavailable();                   // the last read could not use steam_api64
+
+    // Debug toggle: make the Steam resolver report a failure (and log that piece)
+    // without touching the real handles.
+    enum class SteamSimulation { Off, DllMissing, EntryPointMissing };
+    void SetSteamSimulation(SteamSimulation mode);
+    SteamSimulation GetSteamSimulation();
 
     // The list is read from the live EAchievements UEnum, never hardcoded, so a
     // patch that adds or reorders entries needs no code change. Resolving it needs
