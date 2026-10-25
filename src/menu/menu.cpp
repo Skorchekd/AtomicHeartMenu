@@ -979,7 +979,7 @@ static void RenderAchievementRow(const Achievements::Row& row, float labelWidth)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("EAchievements::%s  (value %d)\nSteam: %s\nUnlocked: %s",
                           row.name, row.enumValue,
-                          row.title[0] ? row.title : "(name not read)", row.unlockText);
+                          row.title[0] ? row.title : "title pending", row.unlockText);
     if (row.titlePending)
     {
         ImGui::SameLine();
@@ -1070,7 +1070,7 @@ static void RenderAchievementList(int count)
         Achievements::Row row;
         if (!Achievements::RowAt(i, row))
             continue;
-        if (hideUnlocked && row.state == Achievements::Row::State::Unlocked)
+        if (hideUnlocked && row.ConfirmedUnlocked())
             continue;
         if (RowMatchesFilter(row, needle))
             visible.push_back(i);

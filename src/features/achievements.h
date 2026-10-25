@@ -107,10 +107,10 @@ namespace Achievements
         // as not-earned. `Sent` is what THIS menu fired this session while Steam
         // has not yet reported it unlocked.
         enum class State { Unknown, Locked, Unlocked, NoAnswer, Sent };
-        // Who produced `state`. Engine is the engine's own cached layer, used only
-        // while Steam cannot be reached at all; a reachable Steam that has no
+        // Who produced `state`. EngineCache is the engine's own cached layer, used
+        // only while Steam cannot be reached at all; a reachable Steam that has no
         // answer for an id gives NoAnswer, never a cache guess.
-        enum class Source { Steam, Engine };
+        enum class Source { Steam, EngineCache };
 
         int          enumValue = 0;           // EAchievements numeric value
         const char*  name  = "";              // short name, "EAchievements::" stripped
@@ -124,6 +124,9 @@ namespace Achievements
         char         unlockText[32] = {};     // when Steam says it was unlocked, or why that is unknown
         bool         canUnlock = false;
         const char*  disabledReason = "";     // why canUnlock is false; "" when enabled
+
+        // Unlocked on Steam's word. A cache-derived "unlocked" is not confirmed.
+        bool ConfirmedUnlocked() const { return state == State::Unlocked && source == Source::Steam; }
     };
 
     // The header line: how many are unlocked of how many are listed. `fromEngineCache`
