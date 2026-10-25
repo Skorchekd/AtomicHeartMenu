@@ -73,6 +73,8 @@ namespace
     // list every frame it is open, so a failure backs off instead of rescanning
     // each frame. Written by the resolve thread, read by the render thread.
     std::atomic<ULONGLONG>              g_achResolveFailedMs{ 0 };
+    std::atomic<bool>                   g_achResolveFailed{ false };   // until a resolve succeeds
+    std::atomic<bool>                   g_achMapTypeLogged{ false };   // once per resolve
     constexpr ULONGLONG kAchResolveRetryMs = 5000;
     constexpr int       kAchMaxIdChars     = 4096;   // longest platform id read out of the map
 
@@ -109,14 +111,19 @@ namespace
     std::string g_achSteamReadSummary = "Not read yet.";
     bool        g_achCachePrimed      = false;
 
-    // Auto-refresh pacing. One read is ~1ms of game thread once the titles are
-    // cached (the first pass is dearer because it fetches 83 of them), so a slow
-    // cadence costs nothing worth measuring. The in-flight flag matters more than
-    // the interval: without it a queued read that has not drained yet would let
-    // the next tick pile another one behind it.
-    volatile LONG g_achRefreshInFlight = 0;
-    ULONGLONG     g_achLastRefreshMs   = 0;
-    constexpr ULONGLONG kAchAutoRefreshMs = 3000;
+    // The one read scheduler. A read is due once the previous one COMPLETED
+    // kAchAutoRefreshMs ago (or none has), or when something asks for one soon
+    // (an unlock); the in-flight flag keeps a read that has not drained from
+    // being piled on. One read is ~1ms of game thread once the titles are cached
+    // (the first pass is dearer because it fetches 83 of them), so a slow cadence
+    // costs nothing worth measuring. The completion stamp is also what the tab
+    // shows as "Updated N s ago".
+    volatile LONG          g_achRefreshInFlight = 0;
+    volatile LONG          g_achReadWanted      = 0;
+    std::atomic<ULONGLONG> g_achLastReadDoneMs{ 0 };
+    constexpr ULONGLONG kAchAutoRefreshMs    = 3000;
+    constexpr ULONGLONG kAchMaxAutoRefreshMs = 10000;   // AC8 asks for a read at least this often
+    static_assert(kAchAutoRefreshMs <= kAchMaxAutoRefreshMs, "auto-refresh cadence above the 10 s cap");
 
     constexpr const char* kAchNoPumpStatus =
         "No game-thread pump yet (ProcessEvent hook not installed) -- try again in the game world.";
@@ -161,6 +168,12 @@ namespace
         if (first)
             LOG("Achievements: %s refused (target not live); its results are ignored", what);
         return false;
+    }
+
+    void MarkResolveFailed()
+    {
+        g_achResolveFailed.store(true);
+        g_achResolveFailedMs.store(GetTickCount64());
     }
 
     // UStruct::PropertiesSize of a class, struct or function; -1 if unreadable.
@@ -253,8 +266,15 @@ namespace
         try { resolved = ResolveCatalog(); }
         catch (...) { LOG_SDK("Achievements: list resolve exception (ignored)"); }
 
-        if (!resolved)
-            g_achResolveFailedMs.store(GetTickCount64());
+        if (resolved)
+        {
+            g_achResolveFailed.store(false);
+            g_achMapTypeLogged.store(false);   // the next id read logs the map's types again
+        }
+        else
+        {
+            MarkResolveFailed();
+        }
         InterlockedExchange(&g_achResolveRunning, 0);
         return 0;
     }
@@ -409,9 +429,12 @@ namespace
                 map.valueType.c_str(), map.valueSize);
             return 0;
         }
-        LOG("Achievements: %s is TMap<%s(%d), %s(%d)>, %d slot(s)",
-            AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
-            map.valueType.c_str(), map.valueSize, map.count);
+        // Once per resolve: the ids are re-read on every state read, and the value
+        // property type (NameProperty vs StrProperty) is what this line is for.
+        if (!g_achMapTypeLogged.exchange(true))
+            LOG("Achievements: %s is TMap<%s(%d), %s(%d)>, %d slot(s) -- value property type %s",
+                AH::Prop_AchievementsMap, map.keyType.c_str(), map.keySize,
+                map.valueType.c_str(), map.valueSize, map.count, map.valueType.c_str());
 
         // Read the whole map out FIRST -- no lock held and no call into game code
         // while a MapView is pointing into live memory.
@@ -862,11 +885,16 @@ namespace
         if (InterlockedCompareExchange(&g_achRefreshInFlight, 1, 0) != 0)
             return QueueResult::InFlight;
 
-        g_achLastRefreshMs = GetTickCount64();
-        QueueGameThread([forced]()
+        InterlockedExchange(&g_achReadWanted, 0);
+        const ULONGLONG queuedMs = GetTickCount64();
+        LOG("achievements: state read start");
+        QueueGameThread([forced, queuedMs]()
         {
             if (forced) PrimeAchievementCacheGameThread();
             RefreshAchievementStateGameThread(forced);
+            const ULONGLONG doneMs = GetTickCount64();
+            g_achLastReadDoneMs.store(doneMs);
+            LOG("achievements: state read done (%llu ms)", (unsigned long long)(doneMs - queuedMs));
             InterlockedExchange(&g_achRefreshInFlight, 0);
         });
         return QueueResult::Queued;
@@ -1212,12 +1240,28 @@ void Achievements::ResolveList()
     HANDLE t = CreateThread(nullptr, 0, AchievementResolveThread, nullptr, 0, nullptr);
     if (!t)
     {
-        g_achResolveFailedMs.store(GetTickCount64());
+        MarkResolveFailed();
         InterlockedExchange(&g_achResolveRunning, 0);
         LOG_SDK("Achievements: list resolve thread spawn failed err=%lu", GetLastError());
         return;
     }
     CloseHandle(t);
+}
+
+bool Achievements::ListResolveFailed()
+{
+    return g_achResolveFailed.load() && Count() == 0;
+}
+
+void Achievements::RetryResolve()
+{
+    g_achResolveFailedMs.store(0);
+    ResolveList();
+}
+
+bool Achievements::ReadInFlight()
+{
+    return g_achRefreshInFlight != 0;
 }
 
 void Achievements::RefreshState()
@@ -1236,8 +1280,10 @@ void Achievements::AutoRefresh()
     if (!G::sdkReady.load()) return;
     if (Count() == 0) return;                  // list not up yet; nothing to fill
 
-    const ULONGLONG now = GetTickCount64();
-    if (g_achLastRefreshMs && now - g_achLastRefreshMs < kAchAutoRefreshMs)
+    if (ReadInFlight()) return;
+    const ULONGLONG lastDoneMs = g_achLastReadDoneMs.load();
+    const bool      soon       = g_achReadWanted != 0;
+    if (!soon && lastDoneMs && GetTickCount64() - lastDoneMs < kAchAutoRefreshMs)
         return;
     QueueAchievementStateRead(false);
 }
@@ -1249,9 +1295,9 @@ unsigned int Achievements::AutoRefreshSeconds()
 
 unsigned int Achievements::SecondsSinceRefresh()
 {
-    if (g_achLastRefreshMs == 0) return kNeverRefreshed;
-    const ULONGLONG now = GetTickCount64();
-    return (unsigned int)((now - g_achLastRefreshMs) / 1000);
+    const ULONGLONG lastDoneMs = g_achLastReadDoneMs.load();
+    if (lastDoneMs == 0) return kNeverRefreshed;
+    return (unsigned int)((GetTickCount64() - lastDoneMs) / 1000);
 }
 
 bool Achievements::RowAt(int index, Row& out)
@@ -1324,7 +1370,7 @@ void Achievements::Unlock(int enumValue)
     // Let the next auto tick pick it up rather than making the user press refresh.
     // Steam may not have committed it that fast, but the recurring cadence will
     // catch it either way.
-    g_achLastRefreshMs = 0;
+    InterlockedExchange(&g_achReadWanted, 1);
 }
 
 const char* Achievements::LastActionStatus()

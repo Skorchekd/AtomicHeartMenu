@@ -128,6 +128,8 @@ namespace Achievements
     // lands, and the menu says so rather than showing an empty list.
     int  Count();
     void ResolveList();                         // idempotent; safe to call every frame
+    bool ListResolveFailed();                   // no list, and the last resolve attempt failed
+    void RetryResolve();                        // drops the retry back-off and resolves now
     // Fills `out` for list slot `index`. `out.name` points into the list and stays
     // valid for as long as the list does. False only when index is out of range.
     bool RowAt(int index, Row& out);
@@ -136,6 +138,7 @@ namespace Achievements
     const char* LastActionStatus();             // one line for the UI
 
     void RefreshState();                        // prime + read, forced, on the game thread
+    bool ReadInFlight();                        // a state read is queued or running
     // Called every frame the tab is open. Throttled and single-flight, so it is a
     // no-op on most frames; re-reads state on a slow cadence so unlock states
     // follow the game without anyone pressing anything. Does NOT re-prime the
@@ -143,7 +146,7 @@ namespace Achievements
     // every few seconds would be rude to the subsystem for no benefit.
     void AutoRefresh();
     unsigned int AutoRefreshSeconds();          // the cadence AutoRefresh keeps
-    unsigned int SecondsSinceRefresh();         // kNeverRefreshed if never
+    unsigned int SecondsSinceRefresh();         // since the last read completed; kNeverRefreshed if none has
     const char* SteamReadSummary();
 
     // Discovery: log the game's whole achievement API off the running game --

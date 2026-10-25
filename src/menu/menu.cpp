@@ -1003,7 +1003,16 @@ static void RenderAchievementsTab()
     ImGui::Spacing();
 
     const int count = Achievements::Count();
-    if (count <= 0)
+    if (count <= 0 && Achievements::ListResolveFailed())
+    {
+        ImGui::TextColored(ImVec4(0.80f, 0.45f, 0.35f, 1.0f), "Achievement list unavailable, see log");
+        if (ImGui::Button("Retry", ImVec2(96, 0)))
+        {
+            LOG("UI: retry achievement list");
+            Achievements::RetryResolve();
+        }
+    }
+    else if (count <= 0)
     {
         ImGui::TextDisabled(G::sdkReady.load()
                                 ? "Reading EAchievements off the running game..."
@@ -1018,23 +1027,26 @@ static void RenderAchievementsTab()
 
         // --- Steam state ---------------------------------------------------
         ImGui::Spacing();
-        if (ImGui::Button("Refresh now", ImVec2(-FLT_MIN, 0)))
+        ImGui::BeginDisabled(Achievements::ReadInFlight());
+        if (ImGui::Button("Refresh now", ImVec2(110, 0)))
         {
             LOG("UI: refresh achievement state");
             Achievements::RefreshState();
         }
-        if (ImGui::IsItemHovered())
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("This refreshes itself every few seconds while the tab is\n"
                               "open; the button also re-runs the engine's achievement\n"
                               "query, which is what to press if names or states look\n"
                               "stale after a fresh injection.");
+        ImGui::SameLine();
         const unsigned int age = Achievements::SecondsSinceRefresh();
         if (age == Achievements::kNeverRefreshed)
             ImGui::TextDisabled("Reading...");
         else
-            ImGui::TextDisabled("Updated %us ago (auto every %us).  %s",
-                                age, Achievements::AutoRefreshSeconds(),
-                                Achievements::SteamReadSummary());
+            ImGui::TextDisabled("Updated %us ago (auto every %us)",
+                                age, Achievements::AutoRefreshSeconds());
+        ImGui::TextDisabled("%s", Achievements::SteamReadSummary());
 
         // --- the list ------------------------------------------------------
         ImGui::Spacing();
