@@ -192,6 +192,79 @@ namespace
         g_achStatus = std::move(text);
     }
 
+    // ---- Work that must finish before eject ---------------------------------
+    // One count for everything that may still be running this DLL's code: queued
+    // or running game-thread tasks and the resolve and dump threads. Each is
+    // counted when queued or spawned and uncounted as its last statement, so
+    // Shutdown can wait for zero before the DLL is unmapped.
+    std::atomic<bool> g_achShutdown{ false };
+    std::atomic<int>  g_achInFlight{ 0 };
+    const char        g_achTaskTag = 0;   // its address tags our game-thread tasks
+    constexpr ULONGLONG kAchShutdownWaitMs = 2000;
+
+    // Count first, then check: Shutdown sets the flag before it reads the count,
+    // so either this sees the flag or Shutdown's wait sees this count.
+    bool EnterAchievementWork()
+    {
+        g_achInFlight.fetch_add(1);
+        if (!g_achShutdown.load())
+            return true;
+        g_achInFlight.fetch_sub(1);
+        return false;
+    }
+
+    void QueueAchievementTask(std::function<void()> fn)
+    {
+        if (!EnterAchievementWork())
+            return;
+        QueueGameThread([fn = std::move(fn)]()
+        {
+            if (!g_achShutdown.load())
+            {
+                try { fn(); } catch (...) {}
+            }
+            g_achInFlight.fetch_sub(1);
+        }, &g_achTaskTag);
+    }
+
+    // False, with GetLastError set, when the thread was not started. The thread
+    // holds its own reference on this DLL and ends with ExitAchievementThread, so
+    // the code it returns through stays mapped until it is gone.
+    bool StartAchievementThread(LPTHREAD_START_ROUTINE proc)
+    {
+        if (!EnterAchievementWork())
+        {
+            SetLastError(ERROR_OPERATION_ABORTED);
+            return false;
+        }
+        HMODULE self = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                reinterpret_cast<LPCWSTR>(&g_achTaskTag), &self))
+        {
+            const DWORD err = GetLastError();
+            g_achInFlight.fetch_sub(1);
+            SetLastError(err);
+            return false;
+        }
+        HANDLE t = CreateThread(nullptr, 0, proc, self, 0, nullptr);
+        if (!t)
+        {
+            const DWORD err = GetLastError();
+            FreeLibrary(self);
+            g_achInFlight.fetch_sub(1);
+            SetLastError(err);
+            return false;
+        }
+        CloseHandle(t);
+        return true;
+    }
+
+    [[noreturn]] void ExitAchievementThread(LPVOID self)
+    {
+        g_achInFlight.fetch_sub(1);
+        FreeLibraryAndExitThread(static_cast<HMODULE>(self), 0);
+    }
+
     // Installs the game-thread pump, backing off for kAchResolveRetryMs after a
     // failure. A button press passes `bypassBackoff` and tries again at once.
     bool EnsurePump(bool bypassBackoff)
@@ -444,10 +517,11 @@ namespace
         return listed > 0;
     }
 
-    DWORD WINAPI AchievementResolveThread(LPVOID)
+    DWORD WINAPI AchievementResolveThread(LPVOID self)
     {
         bool resolved = false;
-        try { resolved = ResolveCatalog(); }
+        if (!g_achShutdown.load())
+            try { resolved = ResolveCatalog(); }
         catch (...) { LOG_SDK("Achievements: list resolve exception (ignored)"); }
 
         if (resolved)
@@ -461,7 +535,7 @@ namespace
             MarkResolveFailed();
         }
         InterlockedExchange(&g_achResolveRunning, 0);
-        return 0;
+        ExitAchievementThread(self);
     }
 
     // GAME THREAD ONLY. Static function -> dispatched on the CDO, so no subsystem
@@ -1256,7 +1330,7 @@ namespace
             if (g_achCachePrimed) return;
             g_achCachePrimed = true;
         }
-        QueueGameThread([]()
+        QueueAchievementTask([]()
         {
             if (PrimeAchievementCacheGameThread())
                 return;
@@ -1388,7 +1462,7 @@ namespace
         const ULONGLONG queuedMs = GetTickCount64();
         const uint64_t readSeq = StartReadSeq();
         LOG("achievements: state read start");
-        QueueGameThread([forced, queuedMs, readSeq]()
+        QueueAchievementTask([forced, queuedMs, readSeq]()
         {
             if (forced && PrimeAchievementCacheGameThread())
             {
@@ -1636,7 +1710,7 @@ namespace
         return LowerCopy(SafeObjectName(owner.cls)).find("achiev") != std::string::npos;
     }
 
-    DWORD WINAPI AchievementApiDumpThread(LPVOID)
+    DWORD WINAPI AchievementApiDumpThread(LPVOID self)
     {
         const ULONGLONG startMs = GetTickCount64();
         int functions = 0, enums = 0, types = 0, instances = 0, hits = 0;
@@ -1649,7 +1723,7 @@ namespace
                     "no ProcessEvent. This unlocks nothing; it reports what the achievement path "
                     "looks like on this build.", total);
 
-            for (int i = 0; i < total && hits < kAchMaxHits && G::running.load(); ++i)
+            for (int i = 0; i < total && hits < kAchMaxHits && G::running.load() && !g_achShutdown.load(); ++i)
             {
                 UObject* object = GetObjectByIndex(i);
                 if (!Mem::IsReadable(object, 0x30)) continue;
@@ -1751,7 +1825,7 @@ namespace
                     "achievements.h, the injection-time VerifyParams check will have said so too.");
 
         InterlockedExchange(&g_achDumpRunning, 0);
-        return 0;
+        ExitAchievementThread(self);
     }
 }
 
@@ -1789,15 +1863,14 @@ void Achievements::ResolveList()
     if (InterlockedCompareExchange(&g_achResolveRunning, 1, 0) != 0)
         return;
 
-    HANDLE t = CreateThread(nullptr, 0, AchievementResolveThread, nullptr, 0, nullptr);
-    if (!t)
+    if (!StartAchievementThread(AchievementResolveThread))
     {
+        const DWORD err = GetLastError();
         MarkResolveFailed();
         InterlockedExchange(&g_achResolveRunning, 0);
-        LOG_SDK("Achievements: list resolve thread spawn failed err=%lu", GetLastError());
+        LOG_SDK("Achievements: list resolve thread spawn failed err=%lu", err);
         return;
     }
-    CloseHandle(t);
 }
 
 bool Achievements::ListResolveFailed()
@@ -2045,7 +2118,7 @@ void Achievements::Unlock(int enumValue)
         return;
     }
     const bool simulateFailure = g_achSimUnlockFail.load();
-    QueueGameThread([enumValue, label, seq, simulateFailure]()
+    QueueAchievementTask([enumValue, label, seq, simulateFailure]()
     {
         if (!ClaimPendingUnlock(enumValue, seq))
         {
@@ -2088,12 +2161,26 @@ void Achievements::DebugDumpApi()
         LOG_SDK("AchievementDump: already running");
         return;
     }
-    HANDLE t = CreateThread(nullptr, 0, AchievementApiDumpThread, nullptr, 0, nullptr);
-    if (!t)
+    if (!StartAchievementThread(AchievementApiDumpThread))
     {
+        const DWORD err = GetLastError();
         InterlockedExchange(&g_achDumpRunning, 0);
-        LOG_SDK("AchievementDump: thread spawn failed err=%lu", GetLastError());
+        LOG_SDK("AchievementDump: thread spawn failed err=%lu", err);
         return;
     }
-    CloseHandle(t);
+}
+
+bool Achievements::Shutdown()
+{
+    g_achShutdown.store(true);
+    // Queued tasks never run once the hooks are gone, so they are taken back
+    // rather than waited for; only running ones are waited on.
+    const int dropped = (int)Features::RemoveQueuedGameThread(&g_achTaskTag);
+    g_achInFlight.fetch_sub(dropped);
+    const ULONGLONG startMs = GetTickCount64();
+    while (g_achInFlight.load() > 0 && GetTickCount64() - startMs < kAchShutdownWaitMs)
+        Sleep(10);
+    const int outstanding = g_achInFlight.load();
+    LOG("achievements: drained %d pending, %d outstanding", dropped, outstanding);
+    return outstanding == 0;
 }

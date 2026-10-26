@@ -389,8 +389,11 @@ namespace Features
     // grow its own copies.
 
     // Run `fn` on the game thread, from the ProcessEvent hook's drain. Nothing
-    // drains the queue until InstallProcessEventHook() has succeeded.
-    void QueueGameThread(std::function<void()> fn);
+    // drains the queue until InstallProcessEventHook() has succeeded. `owner`
+    // tags the task for RemoveQueuedGameThread, which drops every still-queued
+    // task with that tag and returns how many it dropped.
+    void   QueueGameThread(std::function<void()> fn, const void* owner = nullptr);
+    size_t RemoveQueuedGameThread(const void* owner);
     bool InstallProcessEventHook();
 
     // Resolve and cache a UFunction by full name / a UObject by name.

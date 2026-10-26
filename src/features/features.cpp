@@ -258,7 +258,14 @@ namespace
     std::atomic<unsigned long> g_renderThreadId{ 0 };
     std::atomic<unsigned long> g_gameThreadId{ 0 };
     std::mutex                g_gtQueueMutex;
-    std::vector<std::function<void()>> g_gtQueue;
+    // `owner` tags a task so its module can take back what has not run yet
+    // (RemoveQueuedGameThread); nullptr for untagged work.
+    struct GameThreadTask
+    {
+        std::function<void()> fn;
+        const void*           owner = nullptr;
+    };
+    std::vector<GameThreadTask> g_gtQueue;
     std::atomic<bool>         g_gtHasWork{ false };
     thread_local int          t_peDepth = 0; // ProcessEvent nesting depth on this thread
     // Squad size mirror -- declared up here (not with the rest of the squad state lower
@@ -637,7 +644,7 @@ namespace
                 // stays smooth. Safe callsites occur many times per frame, so anything
                 // left over still runs within the same frame, just spread out.
                 constexpr size_t kMaxTasksPerBorrow = 3;
-                std::vector<std::function<void()>> tasks;
+                std::vector<GameThreadTask> tasks;
                 {
                     std::lock_guard<std::mutex> lk(g_gtQueueMutex);
                     size_t take = (std::min)(g_gtQueue.size(), kMaxTasksPerBorrow);
@@ -648,7 +655,7 @@ namespace
                 }
                 // Tasks call ProcessEvent themselves; those re-enter this hook at
                 // t_peDepth > 0 and are correctly skipped by the outermost check.
-                for (auto& task : tasks) { try { task(); } catch (...) {} }
+                for (auto& task : tasks) { try { task.fn(); } catch (...) {} }
             }
         }
         oProcessEvent(obj, fn, params);
@@ -704,11 +711,25 @@ namespace Features
         return true;
     }
 
-    void QueueGameThread(std::function<void()> fn)
+    void QueueGameThread(std::function<void()> fn, const void* owner)
     {
         std::lock_guard<std::mutex> lk(g_gtQueueMutex);
-        g_gtQueue.push_back(std::move(fn));
+        g_gtQueue.push_back(GameThreadTask{ std::move(fn), owner });
         g_gtHasWork = true;
+    }
+
+    size_t RemoveQueuedGameThread(const void* owner)
+    {
+        std::vector<GameThreadTask> removed;   // destroyed after the lock is released
+        {
+            std::lock_guard<std::mutex> lk(g_gtQueueMutex);
+            auto keep = std::stable_partition(g_gtQueue.begin(), g_gtQueue.end(),
+                [owner](const GameThreadTask& task) { return task.owner != owner; });
+            removed.assign(std::make_move_iterator(keep), std::make_move_iterator(g_gtQueue.end()));
+            g_gtQueue.erase(keep, g_gtQueue.end());
+            g_gtHasWork = !g_gtQueue.empty();
+        }
+        return removed.size();
     }
 }
 

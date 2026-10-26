@@ -203,4 +203,10 @@ namespace Achievements
     // from; nothing here writes, calls or unlocks anything. Worker thread; results
     // go to the log.
     void DebugDumpApi();
+
+    // Eject: stop new achievement work, take back queued game-thread tasks and
+    // wait (bounded) for running ones and the resolve/dump threads. False when
+    // some are still running; the DLL must then stay mapped. Call before any
+    // hook is removed, so the game thread can still finish what it started.
+    bool Shutdown();
 }

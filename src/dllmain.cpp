@@ -21,6 +21,7 @@
 #include "hooks/native_hooks.h"
 #include "hooks/ai_movement_hooks.h"
 #include "features/features.h"
+#include "features/achievements.h"
 #include <exception>
 
 #pragma comment(lib, "Psapi.lib")
@@ -36,14 +37,24 @@ namespace
         G::moduleSize = mi.SizeOfImage;
     }
 
-    void SafeRemoveHooks()
+    // False when achievement work may still be running this DLL's code, so it
+    // must not be unloaded.
+    bool SafeRemoveHooks()
     {
+        bool canUnload = true;
+        try { canUnload = Achievements::Shutdown(); }
+        catch (...) { LOG("Achievements::Shutdown threw during shutdown."); canUnload = false; }
+        // A task still running is inside the ProcessEvent detour and returns
+        // through its trampoline, so on a timeout every hook stays in place.
+        if (!canUnload)
+            return false;
         try { AiMovementHooks::Shutdown(); }
         catch (...) { LOG("AiMovementHooks::Shutdown threw during shutdown."); }
         try { NativeHooks::Shutdown(); }
         catch (...) { LOG("NativeHooks::Shutdown threw during shutdown."); }
         try { DX12Hook::Remove(); }
         catch (...) { LOG("DX12Hook::Remove threw during shutdown."); }
+        return canUnload;
     }
 
     void RunMainThread(LPVOID param)
@@ -149,7 +160,12 @@ namespace
         }
 
         G::running = false;
-        SafeRemoveHooks();
+        if (!SafeRemoveHooks())
+        {
+            LOG("Achievement work still running -- leaving the hooks in place and the DLL mapped.");
+            Log::Shutdown();
+            ExitThread(exitCode);
+        }
         ExceptionGuard::Remove();
         Log::Shutdown();
         Sleep(100);
