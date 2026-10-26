@@ -297,60 +297,47 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
 - **Achievements tab** - fires the game's **own** achievement event
   (`GameplayEventUtils.SendAchievementUnlockEvent`), so `UAHAchievementSubsystem`
   does its normal bookkeeping and tells Steam itself, exactly as a real unlock
-  would. Filterable list, per-row **Unlock**, **Unlock ALL** (streamed one every
-  150 ms, because each unlock is an event the game answers with a popup and a
-  Steam write), and **Set progress** for the counting achievements via
-  `UpdateAchievementProgress(current, max)`. Names and values are read from the
-  live `EAchievements` enum rather than hardcoded, so a patch that adds or
-  reorders entries needs no code change.
+  would. One achievement at a time: a filterable list (by Steam title or internal
+  name, with **Hide unlocked**), an **N/83 unlocked** count, and a per-row
+  **Unlock**. There is no unlock-all and no progress editing. Names and values are
+  read from the live `EAchievements` enum rather than hardcoded, so a patch that
+  adds or reorders entries needs no code change.
 
-  The list **refreshes itself** every few seconds while the tab is open, so
-  states and bars follow the game without anyone pressing anything; a read is
-  ~1ms of game thread once the display names are cached, and it is single-flight
-  so a slow read can never have another queued behind it. **Refresh now** forces
-  one and additionally re-runs the engine's async achievement query, which is what
-  to press if names look stale right after injecting. Each row shows Steam's own
-  display name - "Gold Rush", not the internal `GoldenFever` - with the internal
-  name, id, unlock date and counter in the tooltip.
+  The list **refreshes itself** every 3 s while the tab is open (never while it is
+  closed); a read is ~1ms of game thread once the display names are cached, and it
+  is single-flight. **Refresh now** forces one and also re-runs the engine's async
+  achievement query, which is what to press if names look stale right after
+  injecting. Each row shows Steam's own display name - "Gold Rush", not the
+  internal `GoldenFever` - with the internal name, value and unlock date in the
+  tooltip; a row whose name has not arrived yet says **title pending**.
 
-  The state comes from **`steam_api64.dll` directly**, not from the engine's
-  cached achievement layer. That is a deliberate correction: the engine's
-  `GetCachedAchievementProgress` only ever answers 0 or 100 on this build, and it
-  answers **100 for counting achievements that are merely part-done** - it
-  reported "Gold Rush" (0/76) and "Apple Pie 3826" (859/3826) as earned. Every
-  counter sitting at exactly zero read correctly, so it is the derived value that
-  is wrong, not the read of it. `SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime`
-  is the same source the engine reads and answers correctly, with a timestamp.
-  Verified end to end: 52 of 83, matching the Steam profile exactly, with six
-  spot-checked unlock times matching Steam's own UI to the minute.
-
-  Getting there needs each achievement's platform id, read out of the subsystem's
-  `AchievementsMap` (`TMap<EAchievements, FString>`) off the live game.
+  The state comes from **`steam_api64.dll` directly**
+  (`SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime`), not from the engine's
+  cached layer: the engine's `GetCachedAchievementProgress` answers **100 for
+  counting achievements that are merely part-done** - it reported "Gold Rush"
+  (0/76) and "Apple Pie 3826" (859/3826) as earned. The engine cache is used only
+  when steam_api64 cannot be reached at all; those rows are marked **(cache)**,
+  an amber line says so, and a cache "unlocked" never disables Unlock. Verified
+  end to end: 52 of 83, matching the Steam profile exactly.
 
   Row states are kept deliberately distinct, because "we could not ask" must never
   look like "you do not have it": **unlocked** / **locked** are what Steam
   answered, **?** means not read yet, and **no answer** means nothing answered for
-  that id. **sent** is separate again - it means this menu fired it this session,
-  which is what you see while Steam catches up.
+  that id. After a click the row reads **sent** until Steam reports it unlocked;
+  if 3 reads later Steam still says locked it reads **sent, not confirmed** and
+  Unlock is available again. A click the game thread does not run within 10 s, or
+  a call that fails, shows **Unlock failed, see log**.
 
-  **Progress counts** are shown only for achievements the game has actually
-  reported progress for. The target comes from the subsystem's
-  `AchievementsMaxValues` ("collect 76 gold coins" -> 76.0) and the 0..1 fraction
-  from `UploadedAchievements` inside the nested `PlayerGameStatistics` struct -
-  which is what the game has told Steam, so a count here agrees with Steam's own
-  UI rather than contradicting it.
+  Unlock is disabled with the reason on hover when Steam reports the achievement
+  unlocked, while a click is queued, while a sent row waits for Steam, and on
+  **signature drift**: every achievement call's params block is checked at
+  injection against the game's own `UFunction`, and if a patch changed one, calls
+  to it are refused and a red banner names it.
 
-  **An absent count means "nothing tracked", not "zero"**, and that distinction is
-  load-bearing: on the tested save `UploadedAchievements` holds `0.0` for Gold Rush
-  against 17 coins actually collected, because the game never uploaded that
-  counter. That is why Steam shows 0/76 there, and it is a real game bug the menu
-  can only report, not fix.
-
-  Do not confuse that map with `PlayerGameStatistics::AchievementProgress`, which
-  has the same key type and the same 29 entries as `AchievementsMaxValues` and
-  whose values *are* those targets (29 identical, 0 differing when compared live).
-  Matching entry counts made it look like the running count; reading it put
-  "3826/3826" on an achievement Steam had at 859.
+  Every unlock logs a `queued` line and an `executed (game thread, tid N) result R`
+  line. On eject, queued achievement work is dropped and running work is waited
+  for (up to 2 s) before the DLL unloads: `achievements: drained N pending,
+  0 outstanding`.
 
   This is **not** a bypass - see the note under "Dump achievement API" below. It
   fires triggers that cheating made you skip.
@@ -375,6 +362,16 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   so it cannot freeze the game and **unlocks nothing**. Results go to
   `AtomicHeartMenu.log`. Re-run it after a game patch to re-check the signatures
   the Achievements tab calls.
+- **Debug → achievement simulations** - exercise the Achievements tab's failure
+  paths without a broken game. None of them calls the game:
+  - **Simulate Steam unavailable** (DLL missing / entry point missing) - reads fall
+    back to the engine cache.
+  - **Simulate achievement signature drift** - reports one achievement function's
+    params check as failed.
+  - **Simulate unlock failure** / **Simulate stalled game thread** - the next
+    Unlock clicks fail, or never run and expire after 10 s.
+  - **Simulate send** and **Simulate Steam reports locked** - act on the row
+    picked in the dropdown: mark it sent, or pin Steam's answer for it to locked.
 
   **Nothing in the menu blocks achievements.** `UAHAchievementSubsystem` (38
   fields, 18 functions) and `UGameplayEventSubsystem` (21 functions) were dumped

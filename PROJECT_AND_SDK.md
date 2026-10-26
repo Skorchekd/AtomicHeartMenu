@@ -352,15 +352,17 @@ Three things about that shape drove the implementation:
 
 - **It is Static**, so the unlock is dispatched on the CDO
   (`/Script/AtomicHeart.Default__GameplayEventUtils`) and there is no instance to
-  find or to go stale between frames. `UpdateAchievementProgress` is *not* static,
-  and the instance it needs is a **LocalPlayer** subsystem
-  (`BP_AchievementSubsystem_C_0` under `LocalPlayer_0`), so that one is fetched
-  fresh through `SubsystemUtils.GetAchievementSubsystem` on every call rather than
-  cached.
-- **The params block is one byte** - a single `EAchievements` at `@0x00`. All four
-  achievement signatures are registered in `kParamsChecks`, so injection re-checks
-  them against the live `UFunction::PropertiesSize`, and a patch that changes one
-  says so instead of quietly corrupting a stack local.
+  find or to go stale between frames. Reading state needs the subsystem instance,
+  which is a **LocalPlayer** subsystem (`BP_AchievementSubsystem_C_0` under
+  `LocalPlayer_0`), so it is fetched fresh through
+  `SubsystemUtils.GetAchievementSubsystem` on every read rather than cached.
+- **The params block is one byte** - a single `EAchievements` at `@0x00`. All seven
+  achievement signatures are registered through `Features::RegisterParamsChecks`
+  and checked at injection against the live `UFunction::PropertiesSize`. For
+  achievements any size difference counts as drift, and a non-native
+  `SendAchievementUnlockEvent` does too, since the unlock cannot be taken back.
+  A call whose check failed is refused, every Unlock is disabled, and the tab
+  shows a banner naming the function - instead of a stack local quietly corrupted.
 - **Going in at the front door matters.** The stock UE
   `AchievementWriteCallbackProxy.WriteAchievementProgress` would write to Steam
   directly by ID string, skipping the subsystem's own maps (`AchievementsMap`,
@@ -377,13 +379,16 @@ Unlocking is a write, and needs nothing but the enum. Reading back *what Steam
 holds* is the harder half, because the engine's own
 `AchievementBlueprintLibrary.GetCachedAchievementProgress` is keyed by the
 **platform achievement id** (an `FName`), not by `EAchievements`. The translation
-lives in `UAHAchievementSubsystem::AchievementsMap`, a `TMap<EAchievements, FName>`.
+lives in `UAHAchievementSubsystem::AchievementsMap`, which on build 24534183 is a
+`TMap<EAchievements, FString>` - the live value property is a `StrProperty`.
 
-That is worth spelling out, because it decides the design: the ids are read
-**straight out of the map as `FName`s** and passed through untouched. Building one
-from a string would not work - the name pool holds `"EAchievements::KillTwins"` as
-a *single* name, so a standalone `"KillTwins"` need not exist in it at all, and
-`TryGetFName` can only find names that already exist.
+That decides the design: the ids come out of the map as strings and have to be
+turned into `FName`s. `TryGetFName` is tried first because it costs no
+`ProcessEvent`, but it can only *find* a name - and the game keeps these ids as
+strings, so most have never become names (the name pool holds
+`"EAchievements::KillTwins"` as a single name, not `"KillTwins"`).
+`KismetStringLibrary.Conv_StringToName` mints the missing ones on the game thread.
+Steam's flat API takes the id string as-is.
 
 So `Reflect::OpenMapProperty` reads a `TMap` generically. A `TMap` is a `TSet` of
 pairs and a `TSet` is a sparse array plus a hash, so iterating means walking the
@@ -399,7 +404,7 @@ Two things keep this honest on a build we have no dump for:
   `HashSize` + padding).
 - **It fails closed.** The layout is range-checked before a byte of map data is
   trusted, and the caller then checks the map *is what it expects* - a 1-byte enum
-  key and an `FName` value - before reinterpreting anything. A patch that moves
+  key and an `FString` value - before reinterpreting anything. A patch that moves
   the layout produces a logged error, not plausible-looking garbage.
 
 ### Why the state is read from Steam, not from the engine
@@ -415,10 +420,11 @@ read of it.
 So the state comes from `steam_api64.dll` instead. It is already loaded in the
 process, its flat API is the same source the engine reads, and
 `SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime` answers with both the
-achieved flag and a unix timestamp. Steam wins wherever the two disagree; the
-engine value stays as the fallback for when steam_api64 cannot be reached, and
-any disagreement is logged with the row marked, because a silent correction hides
-exactly the kind of defect that produced this one.
+achieved flag and a unix timestamp. Whenever steam_api64 can be reached it is the
+only authority - an id it has no answer for reads **no answer**, never a cache
+guess. The engine cache is read only when steam_api64 cannot be reached at all,
+and those rows are marked **(cache)**; a cache "unlocked" is not trusted enough to
+disable Unlock.
 
 The interface pointer and every flat-API entry point are resolved with
 `GetProcAddress` and guarded with `Mem::IsExecutable` rather than `IsReadable` -
@@ -429,23 +435,8 @@ Verified end to end against a real profile: 52 of 83 unlocked, matching Steam
 exactly, with six spot-checked unlock timestamps matching Steam's own UI to the
 minute.
 
-Two consequences worth keeping in mind:
+One consequence worth keeping in mind:
 
-- **Progress comes from the game, not from Steam.** Neither achievement layer
-  reports partial counts, so a percentage derived from one would be invented. The
-  real counters are two `TMap<EAchievements, float>`s that pair directly: targets
-  in the subsystem's `AchievementsMaxValues` (`BattleKillByCar -> 20.0` is "Hit 20
-  enemies by a car"), current counts in `AchievementProgress` inside the nested
-  `PlayerGameStatistics` struct. Both hold the same 29 keys. Reading the second
-  one is why `OpenMapPropertyInStruct` exists - a `TMap` inside a nested struct has
-  no `UObject` to walk a class chain from, so the `UScriptStruct` (via
-  `GetStructPropertyType`) plus a base pointer stand in for one.
-
-  Finding those counters was a worked example of the method: rather than guess
-  which of 20 struct fields held them, the field list was dumped **with live
-  values** and matched against quantities known from the save. `AchievementProgress`
-  turned out to hold 29 entries against `AchievementsMaxValues`' 29 - the two
-  agreeing on count is what identified the pairing, no name matching required.
 - **Names are never inferred.** The internal `EAchievements` spelling and the
   Steam title are different strings - `GoldenFever` is "Gold Rush",
   `progress100` is "The Motherland Does Not Forget its Heroes" - so the menu
