@@ -160,12 +160,10 @@ namespace
         }
 
         G::running = false;
-        if (!SafeRemoveHooks())
-        {
-            LOG("Achievement work still running -- leaving the hooks in place and the DLL mapped.");
-            Log::Shutdown();
-            ExitThread(exitCode);
-        }
+        // Running achievement work returns through the ProcessEvent detour, so
+        // the hooks outlast it: keep waiting rather than leave them behind.
+        while (!SafeRemoveHooks())
+            LOG("Achievement work still running -- waiting before removing the hooks.");
         ExceptionGuard::Remove();
         Log::Shutdown();
         Sleep(100);

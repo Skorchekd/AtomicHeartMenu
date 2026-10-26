@@ -1624,13 +1624,13 @@ void Menu::Render()
             // Rows by name, with the state they read now, so the pick is the row
             // the tab shows; -1 until one is picked.
             static int simRow = -1;
+            static int simIndex = -1;   // simRow's list position, so the preview reads one row
             Achievements::ResolveList();   // the list may not be up if the tab was never opened
             char simPreview[160] = "Pick an achievement for Simulate send / Steam pin";
             ImGui::SetNextItemWidth(-FLT_MIN);
-            for (int i = 0, n = Achievements::Count(); i < n; ++i)
             {
                 Achievements::Row row;
-                if (Achievements::RowAt(i, row) && row.enumValue == simRow)
+                if (Achievements::RowAt(simIndex, row) && row.enumValue == simRow)
                     std::snprintf(simPreview, sizeof(simPreview), "%s (%s) -- %s",
                                   row.title[0] ? row.title : row.name, row.name, row.stateLabel);
             }
@@ -1645,7 +1645,10 @@ void Menu::Render()
                     std::snprintf(label, sizeof(label), "%s (%s) -- %s##%d",
                                   row.title[0] ? row.title : row.name, row.name, row.stateLabel, row.enumValue);
                     if (ImGui::Selectable(label, row.enumValue == simRow))
-                        simRow = row.enumValue;
+                    {
+                        simRow   = row.enumValue;
+                        simIndex = i;
+                    }
                 }
                 ImGui::EndCombo();
             }

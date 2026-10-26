@@ -336,7 +336,7 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
 
   Every unlock logs a `queued` line and an `executed (game thread, tid N) result R`
   line. On eject, queued achievement work is dropped and running work is waited
-  for (up to 2 s) before the DLL unloads: `achievements: drained N pending,
+  for before the hooks come out and the DLL unloads: `achievements: drained N pending,
   0 outstanding`.
 
   This is **not** a bypass - see the note under "Dump achievement API" below. It

@@ -67,7 +67,7 @@ namespace
     //   Sent -> Unconfirmed after kAchUnconfirmedReads reads started since the
     //   click without the row reading unlocked.
     // An unlocked read settles Sent or Unconfirmed back to None (the row then
-    // reads unlocked on its own), and any successful read clears Failed.
+    // reads unlocked on its own), and a read started after the failure clears Failed.
     enum class UnlockPhase { None, Pending, Executing, Sent, Unconfirmed, Failed };
     struct UnlockTrack
     {
@@ -75,6 +75,7 @@ namespace
         ULONGLONG   clickedMs   = 0;
         int         readsSince  = 0;   // Steam reads started after the click that completed
         uint64_t    clickRead   = 0;   // g_achReadSeq at the click; later reads count
+        uint64_t    failedRead  = 0;   // g_achReadSeq when it failed; only later reads clear it
         uint64_t    seq         = 0;   // which click a queued call belongs to
     };
     std::unordered_map<int, UnlockTrack> g_achUnlocks;   // by EAchievements value
@@ -747,7 +748,9 @@ namespace
     // Merges the ids into the slots under the lock. The last answer and the title
     // survive while a slot's id is unchanged: a title costs an FText reference we
     // cannot release, so it is fetched once, and a kept answer is what lets a read
-    // tell whether anything moved. A different id starts clean.
+    // tell whether anything moved. A different id starts clean; a slot whose id
+    // did not resolve this read keeps its id text and title, so a transient miss
+    // does not cost another title fetch.
     IdTableCounts ApplyIdTable(const std::vector<ResolvedId>& resolved)
     {
         IdTableCounts counts;
@@ -767,12 +770,14 @@ namespace
             slot.read = AchievementReadState{};
         }
 
+        std::vector<bool> matched(g_achSlots.size(), false);
         for (const ResolvedId& entry : resolved)
         {
             const auto it = slotByValue.find(entry.enumValue);
             if (it == slotByValue.end()) { ++counts.unmapped; continue; }
 
             const size_t slot = it->second;
+            matched[slot] = true;
             AchievementReadState state;
             if (previous[slot].idText == entry.text)
                 state = std::move(previous[slot]);
@@ -782,14 +787,25 @@ namespace
             g_achSlots[slot].read = std::move(state);
             ++counts.matched;
         }
+        for (size_t slot = 0; slot < g_achSlots.size(); ++slot)
+        {
+            if (matched[slot])
+                continue;
+            AchievementReadState& kept = g_achSlots[slot].read;
+            kept.idText         = std::move(previous[slot].idText);
+            kept.title          = std::move(previous[slot].title);
+            kept.titleAttempted = previous[slot].titleAttempted;
+            kept.titleNotFound  = previous[slot].titleNotFound;
+            kept.titleRetries   = previous[slot].titleRetries;
+        }
         return counts;
     }
 
     // GAME THREAD ONLY. Read the EAchievements -> platform-id map off the live
-    // subsystem. The ids are FNames taken straight out of the map, so nothing has
-    // to build one from a string -- which could not work anyway, since the name
-    // pool holds "EAchievements::KillTwins" as a single name and a standalone
-    // "KillTwins" need not exist in it.
+    // subsystem. On build 24534183 the map's values are strings (StrProperty), so
+    // each id is turned into an FName by MintIds: found in the name pool where it
+    // already is, otherwise minted through Conv_StringToName -- most are not in
+    // the pool, which holds "EAchievements::KillTwins" as a single name.
     int BuildAchievementIdTableGameThread(UObject* subsystem, bool forced)
     {
         const Reflect::MapView map = Reflect::OpenMapProperty(subsystem, AH::Prop_AchievementsMap);
@@ -1389,7 +1405,7 @@ namespace
                                              "3 reads -- Unlock is available again");
                     track.phase = UnlockPhase::Unconfirmed;
                 }
-                else if (track.phase == UnlockPhase::Failed)
+                else if (track.phase == UnlockPhase::Failed && readSeq > track.failedRead)
                 {
                     track.phase = UnlockPhase::None;
                 }
@@ -1411,7 +1427,8 @@ namespace
             for (auto& [value, track] : g_achUnlocks)
                 if (track.phase == UnlockPhase::Pending && now - track.clickedMs > kAchPendingExpiryMs)
                 {
-                    track.phase = UnlockPhase::Failed;
+                    track.phase      = UnlockPhase::Failed;
+                    track.failedRead = g_achReadSeq;
                     expired.push_back(value);
                 }
         }
@@ -1432,7 +1449,8 @@ namespace
         // Expiry runs from the tab, which may be closed: the age is checked here too.
         if (GetTickCount64() - it->second.clickedMs > kAchPendingExpiryMs)
         {
-            it->second.phase = UnlockPhase::Failed;
+            it->second.phase      = UnlockPhase::Failed;
+            it->second.failedRead = g_achReadSeq;
             return false;
         }
         it->second.phase = UnlockPhase::Executing;
@@ -1445,7 +1463,8 @@ namespace
         auto it = g_achUnlocks.find(enumValue);
         if (it == g_achUnlocks.end() || it->second.seq != seq)
             return;
-        it->second.phase = sent ? UnlockPhase::Sent : UnlockPhase::Failed;
+        it->second.phase      = sent ? UnlockPhase::Sent : UnlockPhase::Failed;
+        it->second.failedRead = g_achReadSeq;
     }
 
     // `forced` is the manual button: it re-runs the engine's async achievement
@@ -1710,7 +1729,7 @@ namespace
         return LowerCopy(SafeObjectName(owner.cls)).find("achiev") != std::string::npos;
     }
 
-    DWORD WINAPI AchievementApiDumpThread(LPVOID self)
+    void RunAchievementApiDump()
     {
         const ULONGLONG startMs = GetTickCount64();
         int functions = 0, enums = 0, types = 0, instances = 0, hits = 0;
@@ -1825,6 +1844,13 @@ namespace
                     "achievements.h, the injection-time VerifyParams check will have said so too.");
 
         InterlockedExchange(&g_achDumpRunning, 0);
+    }
+
+    // A separate frame, because ExitAchievementThread never returns: the dump's
+    // locals have to be destroyed before it runs.
+    DWORD WINAPI AchievementApiDumpThread(LPVOID self)
+    {
+        RunAchievementApiDump();
         ExitAchievementThread(self);
     }
 }
@@ -1926,9 +1952,26 @@ unsigned int Achievements::SecondsSinceRefresh()
     return (unsigned int)((GetTickCount64() - lastDoneMs) / 1000);
 }
 
+namespace
+{
+    // RowAt runs for every row each frame; the verdicts only change on a check.
+    bool SignatureDriftCached()
+    {
+        static std::atomic<ULONGLONG> s_checkedMs{ 0 };
+        static std::atomic<bool>      s_drift{ false };
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_checkedMs.load() >= 100)
+        {
+            s_drift.store(Achievements::SignatureDrift() != nullptr);
+            s_checkedMs.store(now);
+        }
+        return s_drift.load();
+    }
+}
+
 bool Achievements::RowAt(int index, Row& out)
 {
-    const bool signatureDrift = SignatureDrift() != nullptr;
+    const bool signatureDrift = SignatureDriftCached();
     std::lock_guard<std::mutex> lk(g_achMutex);
     if (index < 0 || index >= (int)g_achSlots.size())
         return false;

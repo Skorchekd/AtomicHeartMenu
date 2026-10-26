@@ -751,6 +751,7 @@ namespace
 
     GiveAllState g_giveAll;
     std::atomic<int> g_giveAllOk{ 0 };
+    std::atomic<int> g_giveAllInFlight{ 0 };   // grants queued but not yet run
 
     // A fault inside game code leaves the engine part-way through an inventory
     // mutation, and a second grant on top of a half-written container is how one
@@ -768,6 +769,7 @@ namespace
         std::string label;
         int         attempts = 0;
         ULONGLONG   nextAttemptMs = 0;
+        bool        inFlight = false;   // an attempt is queued or running on the pump
     };
     std::mutex   g_pendingEquipMutex;
     PendingEquip g_pendingEquip;
@@ -12321,7 +12323,7 @@ namespace
         int attempt = 0;
         {
             std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
-            if (!g_pendingEquip.asset)
+            if (!g_pendingEquip.asset || g_pendingEquip.inFlight)
                 return;
             if (g_giveWeaponFaulted.load())
             {
@@ -12344,7 +12346,7 @@ namespace
             asset = g_pendingEquip.asset;
             label = g_pendingEquip.label;
             attempt = ++g_pendingEquip.attempts;
-            g_pendingEquip.nextAttemptMs = nowMs + kEquipRetryMs;
+            g_pendingEquip.inFlight = true;
         }
 
         QueueGameThread([asset, label, attempt]()
@@ -12356,6 +12358,13 @@ namespace
                 LOG("Equip %s: FAULTED inside the equip call. Game state is not "
                     "trustworthy from here -- expect a freeze; restart the game.", label.c_str());
                 ClearPendingEquip();
+            }
+            // The retry interval runs from when this attempt ran, not when it was queued.
+            std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
+            if (g_pendingEquip.asset == asset && g_pendingEquip.attempts == attempt)
+            {
+                g_pendingEquip.inFlight = false;
+                g_pendingEquip.nextAttemptMs = GetTickCount64() + kEquipRetryMs;
             }
         });
     }
@@ -12382,8 +12391,10 @@ namespace
         int count = Features::WeaponCount();
         if (g_giveAll.index >= count)
         {
-            LOG("GiveAllWeapons complete: %d/%d granted, the rest skipped for lack of "
-                "content in this install", g_giveAllOk.load(), count);
+            if (g_giveAllInFlight.load() > 0)
+                return;   // the last grants are still on the pump
+            LOG("GiveAllWeapons complete: %d/%d granted; the GiveWeapon lines above say "
+                "why any were not", g_giveAllOk.load(), count);
             g_giveAll = {};
             return;
         }
@@ -12393,10 +12404,16 @@ namespace
         // Stamped before the queue, not after the grant, so the 75 ms paces
         // dispatch intervals rather than drifting with the pump's pickup delay.
         g_giveAll.lastStepMs = GetTickCount64();
+        ++g_giveAllInFlight;
         QueueGameThread([i, equip]()
         {
-            if (GiveWeaponInternal(i, equip))
-                ++g_giveAllOk;
+            try
+            {
+                if (GiveWeaponInternal(i, equip))
+                    ++g_giveAllOk;
+            }
+            catch (...) {}
+            --g_giveAllInFlight;
         });
     }
 
@@ -14155,7 +14172,16 @@ Features::ParamsStatus Features::CheckParamsSize(const char* fnName, int ourSize
     if (!vouched)
     {
         // Unregistered, or the caller passes a struct the table does not
-        // describe: nothing vouches for this call.
+        // describe: nothing vouches for this call. A registered function is
+        // marked, so the cached verdict (and the UI reading it) shows the drift.
+        {
+            std::lock_guard<std::mutex> lk(ParamsMutex());
+            if (ParamsEntry* entry = FindParamsEntry(fnName))
+            {
+                entry->status = ParamsStatus::Mismatch;
+                entry->reason = "called with a params block the table does not describe";
+            }
+        }
         if (FirstParamsWarning(fnName))
             LOG("ParamsCheck: %s called with a %d-byte params block the table does not vouch for -- refused",
                 fnName, ourSize);
@@ -14848,7 +14874,7 @@ int Features::GiveAllWeapons(bool equipLast)
 
     try
     {
-        if (g_giveAll.active)
+        if (g_giveAll.active || g_giveAllInFlight.load() > 0)
         {
             LOG("GiveAllWeapons already running: index=%d ok=%d/%d", g_giveAll.index, g_giveAllOk.load(), WeaponCount());
             return g_giveAllOk.load();
