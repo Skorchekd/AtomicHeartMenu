@@ -58,7 +58,7 @@ namespace Scanner
     //
     // Leaf functions with no unwind data have no entry and are refused too.
     // Refusing to hook is recoverable; hooking mid-instruction is not.
-    bool IsFunctionEntry(const void* address);
+    bool IsFunctionEntry(const void* address, bool requireGameImage = true);
     uint8_t* DecodeRel32CallTarget(uint8_t* call);
     uint8_t* DecodeRel32JumpTarget(uint8_t* jump);
 

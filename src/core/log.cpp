@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <mutex>
+#include <share.h>
 
 namespace
 {
@@ -84,7 +85,7 @@ void Log::Init(bool allocConsole)
             {
                 slash[1] = '\0';
                 strcat_s(logPath, "AtomicHeartMenu.log");
-                fopen_s(&g_file, logPath, "w");
+                g_file = _fsopen(logPath, "w", _SH_DENYNO);
             }
         }
 
@@ -95,7 +96,7 @@ void Log::Init(bool allocConsole)
             {
                 strcpy_s(logPath, tempPath);
                 strcat_s(logPath, "AtomicHeartMenu.log");
-                fopen_s(&g_file, logPath, "w");
+                g_file = _fsopen(logPath, "w", _SH_DENYNO);
             }
         }
     }
@@ -119,7 +120,7 @@ void Log::Clear()
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         if (g_file) { fclose(g_file); g_file = nullptr; }
-        if (g_path[0]) fopen_s(&g_file, g_path, "w");
+        if (g_path[0]) g_file = _fsopen(g_path, "w", _SH_DENYNO);
     }
     Write("==== AtomicHeartMenu log cleared from Hook Diagnostics ====");
 }

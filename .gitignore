@@ -52,3 +52,9 @@ plans/
 # CodeGraph / Repowise local indexes
 .codegraph/
 .repowise/
+
+# Local SDK captures, tool builds, and save backups
+/work/
+__pycache__/
+
+AtomicHeartMenu.cache/

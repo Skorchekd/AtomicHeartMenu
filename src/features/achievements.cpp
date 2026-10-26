@@ -214,11 +214,13 @@ namespace
         return false;
     }
 
-    void QueueAchievementTask(std::function<void()> fn)
+    // False when the task was not queued (eject under way, or the game-thread
+    // queue full); it then never runs.
+    bool QueueAchievementTask(std::function<void()> fn)
     {
         if (!EnterAchievementWork())
-            return;
-        QueueGameThread([fn = std::move(fn)]()
+            return false;
+        const bool queued = QueueGameThread([fn = std::move(fn)]()
         {
             if (!g_achShutdown.load())
             {
@@ -226,6 +228,9 @@ namespace
             }
             g_achInFlight.fetch_sub(1);
         }, &g_achTaskTag);
+        if (!queued)
+            g_achInFlight.fetch_sub(1);
+        return queued;
     }
 
     // False, with GetLastError set, when the thread was not started. The thread
@@ -1346,7 +1351,7 @@ namespace
             if (g_achCachePrimed) return;
             g_achCachePrimed = true;
         }
-        QueueAchievementTask([]()
+        const bool queued = QueueAchievementTask([]()
         {
             if (PrimeAchievementCacheGameThread())
                 return;
@@ -1354,9 +1359,15 @@ namespace
             std::lock_guard<std::mutex> lk(g_achMutex);
             g_achCachePrimed = false;
         });
+        if (!queued)
+        {
+            g_achPrimeFailedMs.store(GetTickCount64());
+            std::lock_guard<std::mutex> lk(g_achMutex);
+            g_achCachePrimed = false;
+        }
     }
 
-    enum class QueueResult { Queued, InFlight, NoPump };
+    enum class QueueResult { Queued, InFlight, NoPump, Refused };
 
     // ---- Unlock tracking ----------------------------------------------------
     uint64_t StartReadSeq()
@@ -1481,7 +1492,7 @@ namespace
         const ULONGLONG queuedMs = GetTickCount64();
         const uint64_t readSeq = StartReadSeq();
         LOG("achievements: state read start");
-        QueueAchievementTask([forced, queuedMs, readSeq]()
+        const bool queued = QueueAchievementTask([forced, queuedMs, readSeq]()
         {
             if (forced && PrimeAchievementCacheGameThread())
             {
@@ -1498,6 +1509,11 @@ namespace
             LOG("achievements: state read done (%llu ms)", (unsigned long long)(doneMs - queuedMs));
             g_achRefreshInFlight.store(0);
         });
+        if (!queued)
+        {
+            g_achRefreshInFlight.store(0);
+            return QueueResult::Refused;
+        }
         return QueueResult::Queued;
     }
 
@@ -1922,6 +1938,7 @@ void Achievements::RefreshState()
     {
     case QueueResult::InFlight: LOG("Achievements: state read already in flight"); break;
     case QueueResult::NoPump:   LOG("Achievements: state read skipped, no game-thread pump"); break;
+    case QueueResult::Refused:  LOG("Achievements: state read skipped, game-thread queue full or unloading"); break;
     case QueueResult::Queued:   break;
     }
 }
@@ -2161,7 +2178,7 @@ void Achievements::Unlock(int enumValue)
         return;
     }
     const bool simulateFailure = g_achSimUnlockFail.load();
-    QueueAchievementTask([enumValue, label, seq, simulateFailure]()
+    const bool queued = QueueAchievementTask([enumValue, label, seq, simulateFailure]()
     {
         if (!ClaimPendingUnlock(enumValue, seq))
         {
@@ -2186,6 +2203,13 @@ void Achievements::Unlock(int enumValue)
         // Read again on the next tick, not after the full cadence.
         g_achReadWanted.store(1);
     });
+    if (!queued)
+    {
+        LOG("Achievements: unlock %s not queued -- the game-thread queue is full or the menu is unloading",
+            label.c_str());
+        FinishUnlock(enumValue, seq, false);
+        SetAchievementStatus("Unlock failed, see log.");
+    }
 }
 
 const char* Achievements::LastActionStatus()

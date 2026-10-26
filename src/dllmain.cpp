@@ -59,10 +59,10 @@ namespace
 
     void RunMainThread(LPVOID param)
     {
-        Log::Init(true);
+        Log::Init(false);
         ExceptionGuard::Install();
         LOG("Injected. Module=%p", param);
-        LOG("Live console logging enabled. Use the console text for real-time copy/paste.");
+        LOG("File logging enabled; injection does not steal game focus.");
 
         PopulateModuleInfo();
         LOG("Game module base=%p size=0x%zX", (void*)G::moduleBase, G::moduleSize);
@@ -131,6 +131,7 @@ namespace
             if (GetAsyncKeyState(VK_END) & 1)
             {
                 LOG("Eject key pressed.");
+                if (!Features::PrepareUnload()) continue;
                 G::running = false;
                 break;
             }
@@ -164,6 +165,11 @@ namespace
         // the hooks outlast it: keep waiting rather than leave them behind.
         while (!SafeRemoveHooks())
             LOG("Achievement work still running -- waiting before removing the hooks.");
+        if (!UE::WaitForObjectNameIndex())
+        {
+            LOG("Name-index worker is still exiting; retaining the DLL to avoid unloading running code.");
+            return exitCode;
+        }
         ExceptionGuard::Remove();
         Log::Shutdown();
         Sleep(100);
