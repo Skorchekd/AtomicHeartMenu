@@ -1621,9 +1621,34 @@ void Menu::Render()
                 LOG("UI: simulate stalled game thread -> %s", simStall ? "on" : "off");
                 Achievements::SetSimulateStalledGameThread(simStall);
             }
-            static int simRow = 0;
-            ImGui::SetNextItemWidth(120);
-            ImGui::InputInt("EAchievements value", &simRow);
+            // Rows by name, with the state they read now, so the pick is the row
+            // the tab shows; -1 until one is picked.
+            static int simRow = -1;
+            char simPreview[160] = "Pick an achievement for Simulate send / Steam pin";
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            for (int i = 0, n = Achievements::Count(); i < n; ++i)
+            {
+                Achievements::Row row;
+                if (Achievements::RowAt(i, row) && row.enumValue == simRow)
+                    std::snprintf(simPreview, sizeof(simPreview), "%s (%s) -- %s",
+                                  row.title[0] ? row.title : row.name, row.name, row.stateLabel);
+            }
+            if (ImGui::BeginCombo("##achsimrow", simPreview))
+            {
+                for (int i = 0, n = Achievements::Count(); i < n; ++i)
+                {
+                    Achievements::Row row;
+                    if (!Achievements::RowAt(i, row))
+                        continue;
+                    char label[160];
+                    std::snprintf(label, sizeof(label), "%s (%s) -- %s##%d",
+                                  row.title[0] ? row.title : row.name, row.name, row.stateLabel, row.enumValue);
+                    if (ImGui::Selectable(label, row.enumValue == simRow))
+                        simRow = row.enumValue;
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::BeginDisabled(simRow < 0);
             if (ImGui::Button("Simulate send"))
             {
                 LOG("UI: simulate send -> %d", simRow);
@@ -1636,6 +1661,7 @@ void Menu::Render()
                 LOG("UI: simulate Steam reports locked -> %s (%d)", pinned ? "on" : "off", simRow);
                 Achievements::SetSteamPinnedLocked(pinned ? simRow : -1);
             }
+            ImGui::EndDisabled();
             ImGui::TextDisabled("Unlock clicks while a box is ticked fail or stall without calling the "
                                 "game. Send and the Steam pin act on the row with that value.");
 
