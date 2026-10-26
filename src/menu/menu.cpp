@@ -947,6 +947,7 @@ static ImVec4 StateLabelColor(Achievements::Row::State state)
     {
     case State::Unlocked: return ImVec4(0.35f, 0.80f, 0.45f, 1.0f);
     case State::Sent:     return ImVec4(0.45f, 0.65f, 0.95f, 1.0f);
+    case State::Unconfirmed: return ImVec4(0.95f, 0.75f, 0.25f, 1.0f);
     case State::NoAnswer: return ImVec4(0.80f, 0.45f, 0.35f, 1.0f);
     case State::Locked:
     case State::Unknown:  break;
@@ -966,8 +967,12 @@ static void RenderAchievementRow(const Achievements::Row& row, float labelWidth)
         Achievements::Unlock(row.enumValue);
     }
     ImGui::EndDisabled();
-    if (!row.canUnlock && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", row.disabledReason);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    {
+        const char* who = row.title[0] ? row.title : row.name;
+        if (row.canUnlock) ImGui::SetTooltip("Unlock %s", who);
+        else               ImGui::SetTooltip("%s\n%s", who, row.disabledReason);
+    }
     ImGui::SameLine();
 
     ImGui::TextColored(StateLabelColor(row.state), "%s", row.stateLabel);
@@ -984,6 +989,11 @@ static void RenderAchievementRow(const Achievements::Row& row, float labelWidth)
     {
         ImGui::SameLine();
         ImGui::TextDisabled("title pending");
+    }
+    if (row.unlockFailed)
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Unlock failed, see log");
     }
     ImGui::PopID();
 }
@@ -1092,7 +1102,8 @@ static void RenderAchievementList(int count)
             visible.push_back(i);
     }
 
-    const float labelWidth = ImGui::CalcTextSize("no answer (cache)").x;
+    const float labelWidth = std::max(ImGui::CalcTextSize("no answer (cache)").x,
+                                      ImGui::CalcTextSize("sent, not confirmed").x);
     ImGui::BeginChild("achlist", ImVec2(0, 300), ImGuiChildFlags_Borders);
     ImGuiListClipper clipper;
     clipper.Begin((int)visible.size(), ImGui::GetFrameHeightWithSpacing());
@@ -1596,6 +1607,37 @@ void Menu::Render()
             }
             ImGui::TextDisabled("Reports that function's params check as failed: its calls are refused "
                                 "and every Unlock is disabled, exactly as after a game patch.");
+
+            bool simFail = Achievements::GetSimulateUnlockFailure();
+            if (ImGui::Checkbox("Simulate unlock failure", &simFail))
+            {
+                LOG("UI: simulate unlock failure -> %s", simFail ? "on" : "off");
+                Achievements::SetSimulateUnlockFailure(simFail);
+            }
+            ImGui::SameLine();
+            bool simStall = Achievements::GetSimulateStalledGameThread();
+            if (ImGui::Checkbox("Simulate stalled game thread", &simStall))
+            {
+                LOG("UI: simulate stalled game thread -> %s", simStall ? "on" : "off");
+                Achievements::SetSimulateStalledGameThread(simStall);
+            }
+            static int simRow = 0;
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputInt("EAchievements value", &simRow);
+            if (ImGui::Button("Simulate send"))
+            {
+                LOG("UI: simulate send -> %d", simRow);
+                Achievements::SimulateSend(simRow);
+            }
+            ImGui::SameLine();
+            bool pinned = Achievements::GetSteamPinnedLocked() == simRow;
+            if (ImGui::Checkbox("Simulate Steam reports locked", &pinned))
+            {
+                LOG("UI: simulate Steam reports locked -> %s (%d)", pinned ? "on" : "off", simRow);
+                Achievements::SetSteamPinnedLocked(pinned ? simRow : -1);
+            }
+            ImGui::TextDisabled("Unlock clicks while a box is ticked fail or stall without calling the "
+                                "game. Send and the Steam pin act on the row with that value.");
 
             ImGui::Spacing();
             ImGui::SeparatorText("Crash guard");

@@ -106,7 +106,7 @@ namespace Achievements
         // answered for this id, so a failed read says so instead of masquerading
         // as not-earned. `Sent` is what THIS menu fired this session while Steam
         // has not yet reported it unlocked.
-        enum class State { Unknown, Locked, Unlocked, NoAnswer, Sent };
+        enum class State { Unknown, Locked, Unlocked, NoAnswer, Sent, Unconfirmed };
         // Who produced `state`. EngineCache is the engine's own cached layer, used
         // only while Steam cannot be reached at all; a reachable Steam that has no
         // answer for an id gives NoAnswer, never a cache guess.
@@ -118,9 +118,11 @@ namespace Achievements
         bool         titlePending = true;     // no title yet: not fetched, or fetched and empty
         State        state  = State::Unknown;
         Source       source = Source::Steam;
-        char         stateLabel[24] = {};     // "unlocked", "locked (cache)", ...
+        char         stateLabel[32] = {};     // "unlocked", "locked (cache)", "sent, not confirmed", ...
         const char*  stateTooltip = "";       // what the label means
-        bool         sent = false;            // this menu fired its unlock this session
+        bool         pending = false;         // a click is queued for the game thread
+        bool         sent = false;            // this menu fired it; Steam has not confirmed yet
+        bool         unlockFailed = false;    // the last click did not send; cleared by a click or a read
         char         unlockText[32] = {};     // when Steam says it was unlocked, or why that is unknown
         bool         canUnlock = false;
         const char*  disabledReason = "";     // why canUnlock is false; "" when enabled
@@ -150,6 +152,15 @@ namespace Achievements
     // refused and the tab shows a banner. Cached only; safe every frame.
     const char* SignatureDrift();
 
+    // Debug toggles for the unlock path; none of them calls the game.
+    void SetSimulateUnlockFailure(bool on);      // the queued call reports failure without ProcessEvent
+    bool GetSimulateUnlockFailure();
+    void SetSimulateStalledGameThread(bool on);  // clicks are never queued, so they expire
+    bool GetSimulateStalledGameThread();
+    void SimulateSend(int enumValue);            // mark a row Sent without ProcessEvent
+    void SetSteamPinnedLocked(int enumValue);    // Steam's answer for this row reads locked; -1 = off
+    int  GetSteamPinnedLocked();
+
     // Debug toggle: report one achievement function as drifted (-1 = off) so the
     // refusal path can be exercised without a patched game.
     int         DriftChoiceCount();
@@ -169,7 +180,7 @@ namespace Achievements
     // valid for as long as the list does. False only when index is out of range.
     bool RowAt(int index, Row& out);
 
-    void Unlock(int enumValue);                 // one, on the game thread
+    void Unlock(int enumValue);                 // one, on the game thread; at most one in flight per row
     const char* LastActionStatus();             // one line for the UI
 
     void RefreshState();                        // prime + read, forced, on the game thread

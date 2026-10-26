@@ -61,7 +61,30 @@ namespace
     //  trigger never fires in the first place.
     // =====================================================================
     std::mutex                          g_achMutex;
-    std::unordered_set<int>             g_achSent;      // fired by US this session
+    // One unlock, from the click to Steam's word on it:
+    //   None -> Pending (click) -> Executing (the game thread took it)
+    //        -> Sent (the call went through) | Failed (it did not, or never ran)
+    //   Sent -> Unconfirmed after kAchUnconfirmedReads reads started since the
+    //   click without the row reading unlocked.
+    // An unlocked read settles Sent or Unconfirmed back to None (the row then
+    // reads unlocked on its own), and any successful read clears Failed.
+    enum class UnlockPhase { None, Pending, Executing, Sent, Unconfirmed, Failed };
+    struct UnlockTrack
+    {
+        UnlockPhase phase       = UnlockPhase::None;
+        ULONGLONG   clickedMs   = 0;
+        int         readsSince  = 0;   // reads STARTED after the click
+        uint64_t    seq         = 0;   // which click a queued call belongs to
+    };
+    std::unordered_map<int, UnlockTrack> g_achUnlocks;   // by EAchievements value
+    uint64_t                             g_achUnlockSeq = 0;
+    constexpr ULONGLONG kAchPendingExpiryMs  = 10000;
+    constexpr int       kAchUnconfirmedReads = 3;
+
+    // Debug toggles for the unlock path. None of them calls the game.
+    std::atomic<bool> g_achSimUnlockFail{ false };
+    std::atomic<bool> g_achSimStall{ false };
+    std::atomic<int>  g_achPinnedLocked{ -1 };   // EAchievements value whose Steam answer reads locked
     std::string                         g_achStatus = "No achievement action yet.";
     volatile LONG                       g_achResolveRunning = 0;
 
@@ -994,6 +1017,11 @@ namespace
 
         std::lock_guard<std::mutex> lk(g_achMutex);
         if (slot >= (int)g_achSlots.size()) return false;   // the list was replaced during the read
+        if (steamAnswered && g_achSlots[slot].enumValue == g_achPinnedLocked.load())
+        {
+            steamAchieved = false;   // Debug: Simulate Steam reports locked
+            steamWhen     = 0;
+        }
         AchievementReadState& st = g_achSlots[slot].read;
         st.queried         = true;
         st.engineFound     = engineFound;
@@ -1238,6 +1266,103 @@ namespace
 
     enum class QueueResult { Queued, InFlight, NoPump };
 
+    // ---- Unlock tracking ----------------------------------------------------
+    // Reads only run while the tab is open, so counting read starts pauses the
+    // unconfirmed countdown while it is closed.
+    void CountReadStart()
+    {
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        for (auto& [value, track] : g_achUnlocks)
+            if (track.phase == UnlockPhase::Pending || track.phase == UnlockPhase::Executing ||
+                track.phase == UnlockPhase::Sent)
+                ++track.readsSince;
+    }
+
+    const AchievementSlot* FindSlot(int enumValue)
+    {
+        for (const AchievementSlot& slot : g_achSlots)
+            if (slot.enumValue == enumValue)
+                return &slot;
+        return nullptr;
+    }
+
+    // After a read stored its states: confirm, give up on, or clear each unlock.
+    void SettleUnlocks()
+    {
+        std::vector<std::pair<std::string, const char*>> notes;
+        {
+            std::lock_guard<std::mutex> lk(g_achMutex);
+            for (auto& [value, track] : g_achUnlocks)
+            {
+                const AchievementSlot* slot = FindSlot(value);
+                const bool unlocked = slot && IsUnlocked(slot->read);
+                const std::string name = slot ? slot->name : std::to_string(value);
+                if ((track.phase == UnlockPhase::Sent || track.phase == UnlockPhase::Unconfirmed) && unlocked)
+                {
+                    notes.emplace_back(name, track.phase == UnlockPhase::Sent
+                                                 ? "confirmed unlocked by Steam"
+                                                 : "confirmed unlocked by Steam after it was marked not confirmed");
+                    track.phase = UnlockPhase::None;
+                }
+                else if (track.phase == UnlockPhase::Sent && track.readsSince >= kAchUnconfirmedReads)
+                {
+                    notes.emplace_back(name, "sent, not confirmed: Steam still reports it locked after "
+                                             "3 reads -- Unlock is available again");
+                    track.phase = UnlockPhase::Unconfirmed;
+                }
+                else if (track.phase == UnlockPhase::Failed)
+                {
+                    track.phase = UnlockPhase::None;
+                }
+            }
+        }
+        for (const auto& [name, what] : notes)
+            LOG("Achievements: unlock %s -- %s", name.c_str(), what);
+    }
+
+    // A click the game thread has not picked up within kAchPendingExpiryMs is
+    // failed; its queued call, if it ever runs, sees it is no longer Pending and
+    // does nothing.
+    void ExpirePendingUnlocks()
+    {
+        std::vector<int> expired;
+        {
+            const ULONGLONG now = GetTickCount64();
+            std::lock_guard<std::mutex> lk(g_achMutex);
+            for (auto& [value, track] : g_achUnlocks)
+                if (track.phase == UnlockPhase::Pending && now - track.clickedMs > kAchPendingExpiryMs)
+                {
+                    track.phase = UnlockPhase::Failed;
+                    expired.push_back(value);
+                }
+        }
+        for (int value : expired)
+            LOG("Achievements: unlock %d failed -- the game thread did not run it within %llu s",
+                value, (unsigned long long)(kAchPendingExpiryMs / 1000));
+        if (!expired.empty())
+            SetAchievementStatus("Unlock failed, see log.");
+    }
+
+    // GAME THREAD. Takes this click's call if it is still Pending.
+    bool ClaimPendingUnlock(int enumValue, uint64_t seq)
+    {
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        auto it = g_achUnlocks.find(enumValue);
+        if (it == g_achUnlocks.end() || it->second.seq != seq || it->second.phase != UnlockPhase::Pending)
+            return false;
+        it->second.phase = UnlockPhase::Executing;
+        return true;
+    }
+
+    void FinishUnlock(int enumValue, uint64_t seq, bool sent)
+    {
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        auto it = g_achUnlocks.find(enumValue);
+        if (it == g_achUnlocks.end() || it->second.seq != seq)
+            return;
+        it->second.phase = sent ? UnlockPhase::Sent : UnlockPhase::Failed;
+    }
+
     // `forced` is the manual button: it re-runs the engine's async achievement
     // query, logs the whole per-id table and skips the pump back-off.
     QueueResult QueueAchievementStateRead(bool forced)
@@ -1250,6 +1375,7 @@ namespace
 
         g_achReadWanted.store(0);
         const ULONGLONG queuedMs = GetTickCount64();
+        CountReadStart();
         LOG("achievements: state read start");
         QueueGameThread([forced, queuedMs]()
         {
@@ -1260,6 +1386,8 @@ namespace
                 g_achCachePrimed = true;
             }
             const bool readOk = RefreshAchievementStateGameThread(forced);
+            if (readOk)
+                SettleUnlocks();
             const ULONGLONG doneMs = GetTickCount64();
             g_achLastReadDoneMs.store(doneMs);
             if (readOk) g_achLastReadOkMs.store(doneMs);
@@ -1272,11 +1400,12 @@ namespace
     // Unlocked (by the one IsUnlocked rule: Steam's word while it is reachable,
     // the cache's while it is not) beats Sent, which is what this menu did. Past
     // that a reachable Steam is the only authority; the cache speaks only while
-    // Steam is unreachable.
-    Row::State RowStateOf(const AchievementReadState& st, bool sentByUs)
+    // Steam is unreachable. Pending and Failed show the state from before the click.
+    Row::State RowStateOf(const AchievementReadState& st, UnlockPhase phase)
     {
-        if (IsUnlocked(st))      return Row::State::Unlocked;
-        if (sentByUs)            return Row::State::Sent;
+        if (IsUnlocked(st))                     return Row::State::Unlocked;
+        if (phase == UnlockPhase::Sent)         return Row::State::Sent;
+        if (phase == UnlockPhase::Unconfirmed)  return Row::State::Unconfirmed;
         if (!st.queried)         return Row::State::Unknown;
         if (st.steamReachable)   return st.steamAnswered ? Row::State::Locked : Row::State::NoAnswer;
         return st.engineFound ? Row::State::Locked : Row::State::NoAnswer;
@@ -1290,6 +1419,7 @@ namespace
         case Row::State::Locked:   return "locked";
         case Row::State::NoAnswer: return "no answer";
         case Row::State::Sent:     return "sent";
+        case Row::State::Unconfirmed: return "sent, not confirmed";
         case Row::State::Unknown:  break;
         }
         return "?";
@@ -1319,21 +1449,25 @@ namespace
                                           "answer for it.";
         case Row::State::Sent:     return "Fired by this menu this session; waiting for Steam to report it "
                                           "unlocked.";
+        case Row::State::Unconfirmed: return "Fired by this menu, but Steam still reported it locked 3 reads "
+                                             "later. Unlock is available again.";
         case Row::State::Unknown:  break;
         }
         return "Not read yet.";
     }
 
     // A Steam-confirmed unlock disables the button; a cache "unlocked" is not
-    // trusted and does not. A row this menu already fired stays disabled either way,
-    // and every row is disabled while any achievement function has drifted.
+    // trusted and does not. A row with a click in flight, or one this menu fired
+    // that Steam has not answered yet, stays disabled either way, and every row is
+    // disabled while any achievement function has drifted.
     void ApplyUnlockEnablement(Row& row, bool signatureDrift)
     {
         const bool steamUnlocked = row.ConfirmedUnlocked();
-        row.canUnlock      = !signatureDrift && !steamUnlocked && !row.sent;
+        row.canUnlock      = !signatureDrift && !steamUnlocked && !row.pending && !row.sent;
         row.disabledReason = signatureDrift ? "Refused: the game was updated and an achievement function's "
                                               "signature changed (see the banner)"
                            : steamUnlocked ? "Already unlocked"
+                           : row.pending   ? "Unlock queued"
                            : row.sent      ? "Sent, waiting for Steam"
                                            : "";
     }
@@ -1687,6 +1821,7 @@ void Achievements::AutoRefresh()
     if (!G::sdkReady.load()) return;
     if (Count() == 0) return;                  // list not up yet; nothing to fill
 
+    ExpirePendingUnlocks();
     if (ReadInFlight()) return;
     const ULONGLONG lastDoneMs = g_achLastReadDoneMs.load();
     const bool      soon       = g_achReadWanted.load() != 0;
@@ -1724,12 +1859,17 @@ bool Achievements::RowAt(int index, Row& out)
     std::snprintf(out.title, sizeof(out.title), "%s", st.title.c_str());
     std::snprintf(out.unlockText, sizeof(out.unlockText), "%s", st.unlockText.c_str());
     out.titlePending = st.title.empty();
-    out.sent         = g_achSent.find(slot.enumValue) != g_achSent.end();
-    out.state        = RowStateOf(st, out.sent);
+    const auto        track = g_achUnlocks.find(slot.enumValue);
+    const UnlockPhase phase = track == g_achUnlocks.end() ? UnlockPhase::None : track->second.phase;
+    out.pending      = phase == UnlockPhase::Pending || phase == UnlockPhase::Executing;
+    out.sent         = phase == UnlockPhase::Sent;
+    out.unlockFailed = phase == UnlockPhase::Failed;
+    out.state        = RowStateOf(st, phase);
 
     // A sent row is this menu's own word, not a cache reading, so only the states
     // that came from the cache carry the mark.
-    const bool cacheState = fromEngineCache && out.state != Row::State::Sent && out.state != Row::State::Unknown;
+    const bool cacheState = fromEngineCache && out.state != Row::State::Sent &&
+                            out.state != Row::State::Unconfirmed && out.state != Row::State::Unknown;
     out.source = cacheState ? Row::Source::EngineCache : Row::Source::Steam;
     std::snprintf(out.stateLabel, sizeof(out.stateLabel), "%s%s", BaseStateLabel(out.state),
                   cacheState ? " (cache)" : "");
@@ -1767,6 +1907,31 @@ const char* Achievements::SignatureDrift()
         if (CachedParamsStatus(check.funcName) == ParamsStatus::Mismatch)
             return ShortFnName(check.funcName);
     return nullptr;
+}
+
+void Achievements::SetSimulateUnlockFailure(bool on)  { g_achSimUnlockFail.store(on); }
+bool Achievements::GetSimulateUnlockFailure()         { return g_achSimUnlockFail.load(); }
+void Achievements::SetSimulateStalledGameThread(bool on) { g_achSimStall.store(on); }
+bool Achievements::GetSimulateStalledGameThread()     { return g_achSimStall.load(); }
+void Achievements::SetSteamPinnedLocked(int enumValue) { g_achPinnedLocked.store(enumValue); }
+int  Achievements::GetSteamPinnedLocked()             { return g_achPinnedLocked.load(); }
+
+void Achievements::SimulateSend(int enumValue)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        if (!FindSlot(enumValue))
+        {
+            LOG("Achievements: simulate send %d ignored, no such achievement", enumValue);
+            return;
+        }
+        UnlockTrack& track = g_achUnlocks[enumValue];
+        track.phase      = UnlockPhase::Sent;
+        track.clickedMs  = GetTickCount64();
+        track.readsSince = 0;
+        track.seq        = ++g_achUnlockSeq;
+    }
+    LOG("Achievements: unlock %d marked sent (simulated, no ProcessEvent)", enumValue);
 }
 
 int Achievements::DriftChoiceCount()
@@ -1830,18 +1995,55 @@ void Achievements::Unlock(int enumValue)
             if (s.enumValue == enumValue) { label = s.name; break; }
     }
 
+    // One click per row in flight: a second one while Pending or Sent is dropped.
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_achMutex);
+        UnlockTrack& track = g_achUnlocks[enumValue];
+        if (track.phase == UnlockPhase::Pending || track.phase == UnlockPhase::Executing ||
+            track.phase == UnlockPhase::Sent)
+            seq = 0;
+        else
+        {
+            track.phase      = UnlockPhase::Pending;
+            track.clickedMs  = GetTickCount64();
+            track.readsSince = 0;
+            track.seq        = ++g_achUnlockSeq;
+            seq              = track.seq;
+        }
+    }
+    if (!seq)
+    {
+        LOG("Achievements: unlock %s ignored, one is already in flight", label.c_str());
+        return;
+    }
+
     LOG("Achievements: unlock requested -- %s (%d)", label.c_str(), enumValue);
     SetAchievementStatus("Unlock queued: " + label + ".");
-    QueueGameThread([enumValue, label]()
+    if (g_achSimStall.load())
     {
-        if (!SendAchievementUnlockGameThread(enumValue))
+        // Debug: the call is never queued, so the click expires as a stalled one.
+        LOG("Achievements: unlock %s held (simulated stalled game thread)", label.c_str());
+        return;
+    }
+    const bool simulateFailure = g_achSimUnlockFail.load();
+    QueueGameThread([enumValue, label, seq, simulateFailure]()
+    {
+        if (!ClaimPendingUnlock(enumValue, seq))
         {
-            SetAchievementStatus("Unlock not sent: " + label + " -- see the log.");
+            LOG("Achievements: unlock %s dropped -- it expired before the game thread ran it", label.c_str());
             return;
         }
+        bool sent = false;
+        if (simulateFailure)
+            LOG("Achievements: unlock %s not sent (simulated failure, no ProcessEvent)", label.c_str());
+        else
+            sent = SendAchievementUnlockGameThread(enumValue);
+        FinishUnlock(enumValue, seq, sent);
+        if (!sent)
         {
-            std::lock_guard<std::mutex> lk(g_achMutex);
-            g_achSent.insert(enumValue);
+            SetAchievementStatus("Unlock failed, see log.");
+            return;
         }
         SetAchievementStatus("Sent unlock: " + label + ".");
         // Let the next auto tick pick it up rather than making the user press
