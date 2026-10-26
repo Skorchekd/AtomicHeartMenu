@@ -1624,6 +1624,7 @@ void Menu::Render()
             // Rows by name, with the state they read now, so the pick is the row
             // the tab shows; -1 until one is picked.
             static int simRow = -1;
+            Achievements::ResolveList();   // the list may not be up if the tab was never opened
             char simPreview[160] = "Pick an achievement for Simulate send / Steam pin";
             ImGui::SetNextItemWidth(-FLT_MIN);
             for (int i = 0, n = Achievements::Count(); i < n; ++i)
@@ -1655,7 +1656,7 @@ void Menu::Render()
                 Achievements::SimulateSend(simRow);
             }
             ImGui::SameLine();
-            bool pinned = Achievements::GetSteamPinnedLocked() == simRow;
+            bool pinned = simRow >= 0 && Achievements::GetSteamPinnedLocked() == simRow;
             if (ImGui::Checkbox("Simulate Steam reports locked", &pinned))
             {
                 LOG("UI: simulate Steam reports locked -> %s (%d)", pinned ? "on" : "off", simRow);
@@ -1663,7 +1664,7 @@ void Menu::Render()
             }
             ImGui::EndDisabled();
             ImGui::TextDisabled("Unlock clicks while a box is ticked fail or stall without calling the "
-                                "game. Send and the Steam pin act on the row with that value.");
+                                "game. Send and the Steam pin act on the row picked above.");
 
             ImGui::Spacing();
             ImGui::SeparatorText("Crash guard");
