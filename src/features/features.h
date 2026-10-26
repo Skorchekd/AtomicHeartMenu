@@ -405,4 +405,35 @@ namespace Features
     std::string SafeObjectFullName(UE::UObject* o);
     std::string SafeClassName(UE::UObject* o);
     bool        IsStructLike(UE::UObject* object);
+
+    // ---- ProcessEvent params-size guard ------------------------------------
+    // A P_* struct is a stack buffer the game writes its out-params into, so a
+    // size a patch changed is memory corruption, not a wrong value. Each entry is
+    // judged against the game's UFunction::PropertiesSize at Prewarm (and by
+    // Debug -> Verify member offsets); call sites then read the cached verdict.
+    enum ParamsCheckFlags : unsigned
+    {
+        kParamsStrict        = 1u << 0, // oversized is drift too, not only undersized
+        kParamsRequireNative = 1u << 1, // a script function fails: its size includes locals
+    };
+    struct ParamsCheck
+    {
+        const char* funcName;   // full name, as passed to CachedFn; a string literal
+        int         ourSize;    // sizeof(the P_* struct we pass)
+        const char* structName;
+        unsigned    flags = 0;  // ParamsCheckFlags
+    };
+    enum class ParamsStatus { Ok, Mismatch, Unresolved };
+
+    // Adds entries to the table. Safe from a namespace-scope initializer.
+    void RegisterParamsChecks(const ParamsCheck* checks, int count);
+    // The verdict for one call. Ok and Mismatch are cached; Unresolved is checked
+    // again on the next call and must be refused like a mismatch. A function the
+    // table has no entry for at this size is a Mismatch.
+    ParamsStatus CheckParamsSize(const char* fnName, int ourSize);
+    // The cached verdict only; never resolves anything, so the render thread may ask.
+    ParamsStatus CachedParamsStatus(const char* fnName);
+    // Debug: make `fnName` report Mismatch (nullptr clears). Pass a string literal.
+    void        SetSimulatedParamsDrift(const char* fnName);
+    const char* SimulatedParamsDrift();
 }

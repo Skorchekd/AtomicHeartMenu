@@ -1018,12 +1018,28 @@ static void RenderAchievementListState()
 }
 
 // The count, where it came from, and the controls for re-reading it.
+// Shown whenever an achievement function failed its params check, list or no
+// list: it is the reason Unlock is disabled, so it comes before everything else.
+static void RenderSignatureDriftBanner()
+{
+    const char* drifted = Achievements::SignatureDrift();
+    if (!drifted)
+        return;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+    ImGui::TextWrapped("%s changed signature -- the game was probably updated. Calls to it are "
+                       "refused and Unlock is disabled until the menu is updated for this build.",
+                       drifted);
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+}
+
 static void RenderSteamStateBar()
 {
     const Achievements::Tally tally = Achievements::GetTally();
     ImGui::Text("%d/%d unlocked%s", tally.unlocked, tally.total,
                 tally.fromEngineCache ? " (engine cache)" : "");
-    if (tally.fromEngineCache)
+    // The drift banner outranks this one (RenderSignatureDriftBanner).
+    if (tally.fromEngineCache && !Achievements::SignatureDrift())
         ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f),
                            "Steam state unavailable -- showing engine cache");
 
@@ -1112,6 +1128,7 @@ static void RenderAchievementsTab()
                         "fly past a boss and the game's own unlock simply never fires.");
     ImGui::Spacing();
 
+    RenderSignatureDriftBanner();
     const int count = Achievements::Count();
     if (count <= 0)
     {
@@ -1555,6 +1572,30 @@ void Menu::Render()
             ImGui::EndDisabled();
             ImGui::TextDisabled("The Achievements tab then reads the engine cache, as if steam_api64 "
                                 "were missing that piece. Takes effect on the next read.");
+
+            const int drift = Achievements::GetDriftSimulation();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##achdrift", drift < 0
+                    ? "Simulate achievement signature drift: off"
+                    : Achievements::DriftChoiceName(drift)))
+            {
+                if (ImGui::Selectable("Off", drift < 0))
+                {
+                    LOG("UI: simulate achievement signature drift -> off");
+                    Achievements::SetDriftSimulation(-1);
+                }
+                for (int i = 0; i < Achievements::DriftChoiceCount(); ++i)
+                {
+                    if (ImGui::Selectable(Achievements::DriftChoiceName(i), drift == i))
+                    {
+                        LOG("UI: simulate achievement signature drift -> %s", Achievements::DriftChoiceName(i));
+                        Achievements::SetDriftSimulation(i);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Reports that function's params check as failed: its calls are refused "
+                                "and every Unlock is disabled, exactly as after a game patch.");
 
             ImGui::Spacing();
             ImGui::SeparatorText("Crash guard");

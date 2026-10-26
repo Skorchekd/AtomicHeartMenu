@@ -30,9 +30,9 @@ namespace Achievements
 {
     // ---- ProcessEvent param structs -----------------------------------------
     // Sizes and member offsets read off the running game with Debug -> Dump
-    // achievement API, and re-checked at injection by kParamsChecks against
-    // UFunction::PropertiesSize -- an undersized params block here would have the
-    // game write past the end of a local.
+    // achievement API, and re-checked at injection against UFunction::PropertiesSize
+    // (Features::RegisterParamsChecks; achievements.cpp registers them). A call
+    // whose check did not pass is refused rather than made.
     struct P_SendAchievementUnlock { uint8_t Achievement; };
     static_assert(sizeof(P_SendAchievementUnlock) == 0x01, "SendAchievementUnlockEvent params");
 
@@ -144,6 +144,18 @@ namespace Achievements
     enum class SteamSimulation { Off, DllMissing, EntryPointMissing };
     void SetSteamSimulation(SteamSimulation mode);
     SteamSimulation GetSteamSimulation();
+
+    // Short name of the first achievement function whose params check failed
+    // ("SendAchievementUnlockEvent"), or nullptr. While set, every Unlock is
+    // refused and the tab shows a banner. Cached only; safe every frame.
+    const char* SignatureDrift();
+
+    // Debug toggle: report one achievement function as drifted (-1 = off) so the
+    // refusal path can be exercised without a patched game.
+    int         DriftChoiceCount();
+    const char* DriftChoiceName(int index);
+    void        SetDriftSimulation(int index);
+    int         GetDriftSimulation();
 
     // The list is read from the live EAchievements UEnum, never hardcoded, so a
     // patch that adds or reorders entries needs no code change. Resolving it needs

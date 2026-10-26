@@ -36,6 +36,9 @@ namespace AH = Offsets::AH;
 
 // Shared with features.cpp (see features.h) rather than copied.
 using Features::CachedFn;
+using Features::CachedParamsStatus;
+using Features::CheckParamsSize;
+using Features::ParamsStatus;
 using Features::CachedObject;
 using Features::InstallProcessEventHook;
 using Features::IsStructLike;
@@ -247,6 +250,60 @@ namespace
         return st.queried && !st.steamReachable;
     }
 
+    // ---- Signature guard ----------------------------------------------------
+    // Every achievement params block is checked strictly: a size change either
+    // way means the signature moved. The unlock must also be native -- it cannot
+    // be taken back, and a script function's size proves nothing about its params.
+    const Features::ParamsCheck kAchParamsChecks[] =
+    {
+        { AH::Fn_SendAchievementUnlockEvent,      (int)sizeof(P_SendAchievementUnlock),           "P_SendAchievementUnlock",
+          Features::kParamsStrict | Features::kParamsRequireNative },
+        { AH::Fn_GetAchievementSubsystem,         (int)sizeof(P_GetAchievementSubsystem),         "P_GetAchievementSubsystem",         Features::kParamsStrict },
+        { AH::Fn_CacheAchievements,               (int)sizeof(P_CacheAchievements),               "P_CacheAchievements",               Features::kParamsStrict },
+        { AH::Fn_GetCachedAchievementProgress,    (int)sizeof(P_GetCachedAchievementProgress),    "P_GetCachedAchievementProgress",    Features::kParamsStrict },
+        { AH::Fn_ConvStringToName,                (int)sizeof(P_ConvStringToName),                "P_ConvStringToName",                Features::kParamsStrict },
+        { AH::Fn_GetCachedAchievementDescription, (int)sizeof(P_GetCachedAchievementDescription), "P_GetCachedAchievementDescription", Features::kParamsStrict },
+        { AH::Fn_ConvTextToString,                (int)sizeof(P_ConvTextToString),                "P_ConvTextToString",                Features::kParamsStrict },
+    };
+    const bool g_achParamsRegistered = (Features::RegisterParamsChecks(
+        kAchParamsChecks, (int)(sizeof(kAchParamsChecks) / sizeof(kAchParamsChecks[0]))), true);
+
+    // The functions the drift simulation can break, as the spec lists them.
+    const char* const kDriftChoices[] =
+    {
+        AH::Fn_SendAchievementUnlockEvent,
+        AH::Fn_GetCachedAchievementProgress,
+        AH::Fn_GetCachedAchievementDescription,
+        AH::Fn_ConvTextToString,
+    };
+    constexpr int kDriftChoiceCount = (int)(sizeof(kDriftChoices) / sizeof(kDriftChoices[0]));
+
+    // "SendAchievementUnlockEvent" out of the full path; points into the literal.
+    const char* ShortFnName(const char* fnPath)
+    {
+        const char* dot = std::strrchr(fnPath, '.');
+        return dot ? dot + 1 : fnPath;
+    }
+
+    // Asked before every achievement ProcessEvent. A refusal is logged once per
+    // function, and again only after that function has passed in between.
+    bool SignatureOk(const char* fnPath, int ourSize)
+    {
+        const bool ok = CheckParamsSize(fnPath, ourSize) == ParamsStatus::Ok;
+        static std::mutex                      s_mutex;
+        static std::unordered_set<const char*> s_refused;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(s_mutex);
+            if (ok) s_refused.erase(fnPath);
+            else    first = s_refused.insert(fnPath).second;
+        }
+        if (first)
+            LOG("Achievements: refused: %s (signature changed or not resolved -- see the ParamsCheck lines)",
+                ShortFnName(fnPath));
+        return ok;
+    }
+
     // ---- One engine call ----------------------------------------------------
     struct EngineFn
     {
@@ -276,10 +333,14 @@ namespace
         catch (...) { return false; }
     }
 
-    // Resolve, null-check and call. A call that could not be made says why, once
-    // per `what` (these run per id, per read). `what` must be a string literal.
-    bool CallEngine(const char* objectPath, const char* fnPath, void* params, const char* what)
+    // Signature-check, resolve, null-check and call. A call that could not be made
+    // says why, once per `what` (these run per id, per read). `what` must be a
+    // string literal.
+    template <typename P>
+    bool CallEngine(const char* objectPath, const char* fnPath, P* params, const char* what)
     {
+        if (!SignatureOk(fnPath, (int)sizeof(P)))
+            return false;
         const EngineFn target = ResolveEngineFn(objectPath, fnPath);
         if (!target)
         {
@@ -835,7 +896,11 @@ namespace
         P_ConvTextToString convParams{};
         std::memcpy(convParams.InText, descParams.Title, sizeof(convParams.InText));
         if (!CallEngine(AH::Obj_KismetTextLibrary, AH::Fn_ConvTextToString, &convParams, "Conv_TextToString"))
+        {
+            // Counted as not found, so the title retry budget applies.
+            out.found = false;
             return out;
+        }
         try { out.text = convParams.ReturnValue.ToString(); }
         catch (...) { out.text.clear(); }
         return out;
@@ -1102,7 +1167,8 @@ namespace
             if (!ctx.steam.Reachable())
             {
                 // The cache only matters as the fallback.
-                ctx.progress = ResolveEngineFn(AH::Obj_AchievementBPLibrary, AH::Fn_GetCachedAchievementProgress);
+                if (SignatureOk(AH::Fn_GetCachedAchievementProgress, (int)sizeof(P_GetCachedAchievementProgress)))
+                    ctx.progress = ResolveEngineFn(AH::Obj_AchievementBPLibrary, AH::Fn_GetCachedAchievementProgress);
                 if (!ctx.EngineReadable() && FirstTime("engine-progress-library"))
                     LOG("Achievements: engine progress read unavailable (lib=%p fn=%p) -- no cache fallback",
                         (void*)ctx.progress.object, (void*)ctx.progress.fn);
@@ -1238,9 +1304,9 @@ namespace
             if (row.state == Row::State::NoAnswer)
                 return "Nothing answered for this id: Steam is unavailable and the engine's cache "
                        "has no entry for it.";
-            return row.canUnlock
+            return !row.sent
                 ? "From the engine's cache, because Steam was unavailable. The cache has reported "
-                  "part-done achievements as unlocked, so it is not trusted: Unlock stays available."
+                  "part-done achievements as unlocked, so it is not trusted, and does not disable Unlock."
                 : "From the engine's cache, because Steam was unavailable. The cache has reported "
                   "part-done achievements as unlocked, so it is not trusted. Unlock is off only "
                   "because this menu already fired it this session.";
@@ -1259,12 +1325,15 @@ namespace
     }
 
     // A Steam-confirmed unlock disables the button; a cache "unlocked" is not
-    // trusted and does not. A row this menu already fired stays disabled either way.
-    void ApplyUnlockEnablement(Row& row)
+    // trusted and does not. A row this menu already fired stays disabled either way,
+    // and every row is disabled while any achievement function has drifted.
+    void ApplyUnlockEnablement(Row& row, bool signatureDrift)
     {
         const bool steamUnlocked = row.ConfirmedUnlocked();
-        row.canUnlock      = !steamUnlocked && !row.sent;
-        row.disabledReason = steamUnlocked ? "Already unlocked"
+        row.canUnlock      = !signatureDrift && !steamUnlocked && !row.sent;
+        row.disabledReason = signatureDrift ? "Refused: the game was updated and an achievement function's "
+                                              "signature changed (see the banner)"
+                           : steamUnlocked ? "Already unlocked"
                            : row.sent      ? "Sent, waiting for Steam"
                                            : "";
     }
@@ -1640,6 +1709,7 @@ unsigned int Achievements::SecondsSinceRefresh()
 
 bool Achievements::RowAt(int index, Row& out)
 {
+    const bool signatureDrift = SignatureDrift() != nullptr;
     std::lock_guard<std::mutex> lk(g_achMutex);
     if (index < 0 || index >= (int)g_achSlots.size())
         return false;
@@ -1663,7 +1733,7 @@ bool Achievements::RowAt(int index, Row& out)
     out.source = cacheState ? Row::Source::EngineCache : Row::Source::Steam;
     std::snprintf(out.stateLabel, sizeof(out.stateLabel), "%s%s", BaseStateLabel(out.state),
                   cacheState ? " (cache)" : "");
-    ApplyUnlockEnablement(out);
+    ApplyUnlockEnablement(out, signatureDrift);
     out.stateTooltip = StateTooltip(out, cacheState);
     return true;
 }
@@ -1691,6 +1761,38 @@ Achievements::SteamSimulation Achievements::GetSteamSimulation()
     return (SteamSimulation)g_achSteamSim.load();
 }
 
+const char* Achievements::SignatureDrift()
+{
+    for (const Features::ParamsCheck& check : kAchParamsChecks)
+        if (CachedParamsStatus(check.funcName) == ParamsStatus::Mismatch)
+            return ShortFnName(check.funcName);
+    return nullptr;
+}
+
+int Achievements::DriftChoiceCount()
+{
+    return kDriftChoiceCount;
+}
+
+const char* Achievements::DriftChoiceName(int index)
+{
+    return index >= 0 && index < kDriftChoiceCount ? ShortFnName(kDriftChoices[index]) : "";
+}
+
+void Achievements::SetDriftSimulation(int index)
+{
+    Features::SetSimulatedParamsDrift(index >= 0 && index < kDriftChoiceCount ? kDriftChoices[index] : nullptr);
+}
+
+int Achievements::GetDriftSimulation()
+{
+    const char* simulated = Features::SimulatedParamsDrift();
+    for (int i = 0; i < kDriftChoiceCount; ++i)
+        if (simulated == kDriftChoices[i])
+            return i;
+    return -1;
+}
+
 const char* Achievements::SteamReadSummary()
 {
     static std::string summary;
@@ -1714,6 +1816,13 @@ void Achievements::Unlock(int enumValue)
         return;
     }
 
+    if (const char* drifted = SignatureDrift())
+    {
+        LOG("Achievements: refused: unlock %d -- %s signature changed", enumValue, drifted);
+        SetAchievementStatus(std::string("Unlock refused: ") + drifted + " changed in a game update.");
+        return;
+    }
+
     std::string label = std::to_string(enumValue);
     {
         std::lock_guard<std::mutex> lk(g_achMutex);
@@ -1722,18 +1831,24 @@ void Achievements::Unlock(int enumValue)
     }
 
     LOG("Achievements: unlock requested -- %s (%d)", label.c_str(), enumValue);
-    QueueGameThread([enumValue]()
+    SetAchievementStatus("Unlock queued: " + label + ".");
+    QueueGameThread([enumValue, label]()
     {
         if (!SendAchievementUnlockGameThread(enumValue))
+        {
+            SetAchievementStatus("Unlock not sent: " + label + " -- see the log.");
             return;
-        std::lock_guard<std::mutex> lk(g_achMutex);
-        g_achSent.insert(enumValue);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_achMutex);
+            g_achSent.insert(enumValue);
+        }
+        SetAchievementStatus("Sent unlock: " + label + ".");
+        // Let the next auto tick pick it up rather than making the user press
+        // refresh. Steam may not have committed it that fast, but the recurring
+        // cadence will catch it either way.
+        g_achReadWanted.store(1);
     });
-    SetAchievementStatus("Sent unlock: " + label + ".");
-    // Let the next auto tick pick it up rather than making the user press refresh.
-    // Steam may not have committed it that fast, but the recurring cadence will
-    // catch it either way.
-    g_achReadWanted.store(1);
 }
 
 const char* Achievements::LastActionStatus()

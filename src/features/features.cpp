@@ -12,7 +12,6 @@
 // (Skorchekd) and to Dumper-7 (Encryqed), MinHook (Tsuda Kageyu), and Dear ImGui
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
 #include "features.h"
-#include "achievements.h"
 #include "../sdk/offsets.h"
 #include "../sdk/reflect.h"
 #include "../sdk/scanner.h"
@@ -9091,7 +9090,7 @@ namespace
     // it is handed, sized by the LIVE UFunction rather than by the P_* struct we
     // copied from a dump of build 18319896. A struct smaller than this build's
     // params block is not a wrong value, it is a smashed caller frame -- see the
-    // kParamsChecks note. So the buffer is sized from PropertiesSize, and any
+    // params-size table note (RegisterParamsChecks). So the buffer is sized from PropertiesSize, and any
     // difference is logged once per function because it means our struct is stale.
     template <typename P>
     bool CallWithParams(UObject* self, UFunction* fn, P& params, const char* what)
@@ -13935,40 +13934,234 @@ namespace
     // native has no locals, so it equals the params block, but a blueprint
     // function's does not and would be reported UNDERSIZED here for no reason.
     // offsets.h carries no O_UFunction_ParmsSize to compare against instead.
-    struct ParamsCheck
+    //
+    // Other modules add their own entries through Features::RegisterParamsChecks.
+    // The table is built on first use, so a registration from another file's
+    // namespace-scope initializer cannot run before it exists.
+    struct ParamsEntry
     {
-        const char* funcName;    // /Script/... full name, as passed to CachedFn
-        int         ourSize;     // sizeof(the P_* struct we pass)
-        const char* structName;
+        Features::ParamsCheck  check;
+        Features::ParamsStatus status   = Features::ParamsStatus::Unresolved;
+        bool                   native   = false;
+        int                    gameSize = -1;
+        std::string            reason;
     };
 
-    const ParamsCheck kParamsChecks[] =
+    std::mutex& ParamsMutex()
     {
-        // Weapon grant path -- issue #6.
-        { AH::Fn_InstantTakeWeapon,       (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (InstantTakeWeapon)" },
-        { AH::Fn_TakeWeapon,              (int)sizeof(P_TakeWeapon),        "P_TakeWeapon" },
-        { AH::Fn_EquipWeaponByDataAsset,  (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (EquipWeaponByDataAsset)" },
-        { AH::Fn_FindWeaponByDataAsset,   (int)sizeof(P_FindWeaponByDataAsset), "P_FindWeaponByDataAsset" },
-        // Fly / noclip path -- the one issue #3 ran through.
-        { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
-        { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
-        { AH::Fn_GetControlRotation,      (int)sizeof(P_GetControlRotation),"P_GetControlRotation" },
-        { AH::Fn_SetActorEnableCollision, (int)sizeof(P_BoolParam),         "P_BoolParam" },
-        { AH::Fn_SetActorScale3D,         (int)sizeof(FVector),             "FVector (SetActorScale3D)" },
-        { AH::Fn_SetMovementMode,         (int)sizeof(P_SetMovementMode),   "P_SetMovementMode" },
-        // Streaming assist.
-        { AH::Fn_InvalidateStreaming,     (int)sizeof(P_WorldContext),      "P_WorldContext" },
-        { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
-        { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
-        // Achievements.
-        { AH::Fn_SendAchievementUnlockEvent,   (int)sizeof(Achievements::P_SendAchievementUnlock),        "P_SendAchievementUnlock" },
-        { AH::Fn_GetAchievementSubsystem,      (int)sizeof(Achievements::P_GetAchievementSubsystem),       "P_GetAchievementSubsystem" },
-        { AH::Fn_CacheAchievements,            (int)sizeof(Achievements::P_CacheAchievements),            "P_CacheAchievements" },
-        { AH::Fn_GetCachedAchievementProgress, (int)sizeof(Achievements::P_GetCachedAchievementProgress), "P_GetCachedAchievementProgress" },
-        { AH::Fn_ConvStringToName,             (int)sizeof(Achievements::P_ConvStringToName),             "P_ConvStringToName" },
-        { AH::Fn_GetCachedAchievementDescription, (int)sizeof(Achievements::P_GetCachedAchievementDescription), "P_GetCachedAchievementDescription" },
-        { AH::Fn_ConvTextToString,             (int)sizeof(Achievements::P_ConvTextToString),             "P_ConvTextToString" },
-    };
+        static std::mutex m;
+        return m;
+    }
+
+    std::vector<ParamsEntry>& ParamsTable()
+    {
+        static std::vector<ParamsEntry> table = []
+        {
+            const Features::ParamsCheck builtIn[] =
+            {
+                // Weapon grant path -- issue #6.
+                { AH::Fn_InstantTakeWeapon,       (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (InstantTakeWeapon)" },
+                { AH::Fn_TakeWeapon,              (int)sizeof(P_TakeWeapon),        "P_TakeWeapon" },
+                { AH::Fn_EquipWeaponByDataAsset,  (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (EquipWeaponByDataAsset)" },
+                { AH::Fn_FindWeaponByDataAsset,   (int)sizeof(P_FindWeaponByDataAsset), "P_FindWeaponByDataAsset" },
+                // Fly / noclip path -- the one issue #3 ran through.
+                { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
+                { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
+                { AH::Fn_GetControlRotation,      (int)sizeof(P_GetControlRotation),"P_GetControlRotation" },
+                { AH::Fn_SetActorEnableCollision, (int)sizeof(P_BoolParam),         "P_BoolParam" },
+                { AH::Fn_SetActorScale3D,         (int)sizeof(FVector),             "FVector (SetActorScale3D)" },
+                { AH::Fn_SetMovementMode,         (int)sizeof(P_SetMovementMode),   "P_SetMovementMode" },
+                // Streaming assist.
+                { AH::Fn_InvalidateStreaming,     (int)sizeof(P_WorldContext),      "P_WorldContext" },
+                { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
+                { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
+            };
+            std::vector<ParamsEntry> out;
+            for (const Features::ParamsCheck& check : builtIn)
+                out.push_back(ParamsEntry{ check });
+            return out;
+        }();
+        return table;
+    }
+
+    // Function path of the debug drift simulation; nullptr when off. Always one
+    // of the string literals a caller passed in, so the pointer stays valid.
+    std::atomic<const char*> g_simulatedParamsDrift{ nullptr };
+
+    bool IsSimulatedDrift(const char* fnName)
+    {
+        const char* simulated = g_simulatedParamsDrift.load();
+        return simulated && std::strcmp(simulated, fnName) == 0;
+    }
+
+    bool FirstParamsWarning(const char* fnName)
+    {
+        static std::mutex                      s_mutex;
+        static std::unordered_set<std::string> s_seen;
+        std::lock_guard<std::mutex> lk(s_mutex);
+        return s_seen.insert(fnName).second;
+    }
+
+    ParamsEntry* FindParamsEntry(const char* fnName)
+    {
+        for (ParamsEntry& entry : ParamsTable())
+            if (std::strcmp(entry.check.funcName, fnName) == 0)
+                return &entry;
+        return nullptr;
+    }
+
+    // Reads the game's side of one entry. Resolves the function, so it can cost a
+    // GObjects scan the first time; callers must not hold ParamsMutex.
+    ParamsEntry EvaluateParams(const Features::ParamsCheck& check)
+    {
+        using Features::ParamsStatus;
+        ParamsEntry v{ check };
+        UFunction* fn = nullptr;
+        try { fn = CachedFn(check.funcName); } catch (...) { fn = nullptr; }
+        uint8_t* base = reinterpret_cast<uint8_t*>(fn);
+        if (!IsLiveObject(fn) ||
+            !Mem::IsReadable(base + Offsets::O_UStruct_PropertiesSize, 4) ||
+            !Mem::IsReadable(base + Offsets::O_UFunction_FunctionFlags, 4))
+        {
+            v.reason = "function not resolved";
+            return v;
+        }
+        v.native   = (*reinterpret_cast<uint32_t*>(base + Offsets::O_UFunction_FunctionFlags) & Offsets::FUNC_Native) != 0;
+        v.gameSize = *reinterpret_cast<int32_t*>(base + Offsets::O_UStruct_PropertiesSize);
+        if (!v.native)
+        {
+            const bool required = (check.flags & Features::kParamsRequireNative) != 0;
+            v.status = required ? ParamsStatus::Mismatch : ParamsStatus::Ok;
+            v.reason = required ? "NOT NATIVE -- its PropertiesSize includes script locals, so the params block cannot be verified"
+                                : "not checked (non-native)";
+            return v;
+        }
+        if (v.gameSize == check.ourSize)
+        {
+            v.status = ParamsStatus::Ok;
+            v.reason = "ok";
+        }
+        else if (check.ourSize < v.gameSize)
+        {
+            v.status = ParamsStatus::Mismatch;
+            v.reason = "UNDERSIZED -- STACK CORRUPTION: the game writes past the end of our buffer on every call";
+        }
+        else if (check.flags & Features::kParamsStrict)
+        {
+            v.status = ParamsStatus::Mismatch;
+            v.reason = "OVERSIZED -- the signature changed";
+        }
+        else
+        {
+            v.status = ParamsStatus::Ok;
+            v.reason = "oversized (wasteful, not unsafe)";
+        }
+        return v;
+    }
+
+    void StoreParamsVerdict(const ParamsEntry& verdict)
+    {
+        std::lock_guard<std::mutex> lk(ParamsMutex());
+        // A racing evaluation that lost its lookup (CachedFn throttled, pointer
+        // gone stale) must not erase a conclusive verdict stored meanwhile.
+        ParamsEntry* entry = FindParamsEntry(verdict.check.funcName);
+        if (entry && !(verdict.status == Features::ParamsStatus::Unresolved &&
+                       entry->status != Features::ParamsStatus::Unresolved))
+            *entry = verdict;
+    }
+
+    struct ParamsCounts { int ok = 0, mismatched = 0, unresolved = 0; };
+
+    // Re-checks every entry, stores the verdicts and logs one line each.
+    ParamsCounts RunParamsChecks(const char* tag)
+    {
+        std::vector<Features::ParamsCheck> checks;
+        {
+            std::lock_guard<std::mutex> lk(ParamsMutex());
+            for (const ParamsEntry& entry : ParamsTable())
+                checks.push_back(entry.check);
+        }
+        LOG("%s: checking %d ProcessEvent params-struct sizes against UFunction::PropertiesSize",
+            tag, (int)checks.size());
+
+        ParamsCounts counts;
+        for (const Features::ParamsCheck& check : checks)
+        {
+            const ParamsEntry v = EvaluateParams(check);
+            StoreParamsVerdict(v);
+            switch (v.status)
+            {
+            case Features::ParamsStatus::Ok:         ++counts.ok;         break;
+            case Features::ParamsStatus::Mismatch:   ++counts.mismatched; break;
+            case Features::ParamsStatus::Unresolved: ++counts.unresolved; break;
+            }
+            if (v.status == Features::ParamsStatus::Unresolved)
+                LOG("%s: %-34s function not resolved (%s unchecked)", tag, check.structName, check.funcName);
+            else
+                LOG("%s: %-34s %s -- ours 0x%X, game 0x%X, %s (%s)", tag, check.structName,
+                    v.reason.c_str(), check.ourSize, v.gameSize,
+                    v.native ? "native" : "NOT native", check.funcName);
+        }
+        return counts;
+    }
+}
+
+void Features::RegisterParamsChecks(const ParamsCheck* checks, int count)
+{
+    std::lock_guard<std::mutex> lk(ParamsMutex());
+    for (int i = 0; i < count; ++i)
+        if (!FindParamsEntry(checks[i].funcName))
+            ParamsTable().push_back(ParamsEntry{ checks[i] });
+}
+
+Features::ParamsStatus Features::CheckParamsSize(const char* fnName, int ourSize)
+{
+    if (IsSimulatedDrift(fnName))
+        return ParamsStatus::Mismatch;
+    ParamsCheck check{};
+    bool vouched = false;
+    {
+        std::lock_guard<std::mutex> lk(ParamsMutex());
+        const ParamsEntry* entry = FindParamsEntry(fnName);
+        vouched = entry && entry->check.ourSize == ourSize;
+        if (vouched)
+        {
+            if (entry->status != ParamsStatus::Unresolved)
+                return entry->status;
+            check = entry->check;
+        }
+    }
+    if (!vouched)
+    {
+        // Unregistered, or the caller passes a struct the table does not
+        // describe: nothing vouches for this call.
+        if (FirstParamsWarning(fnName))
+            LOG("ParamsCheck: %s called with a %d-byte params block the table does not vouch for -- refused",
+                fnName, ourSize);
+        return ParamsStatus::Mismatch;
+    }
+    const ParamsEntry v = EvaluateParams(check);
+    StoreParamsVerdict(v);
+    return v.status;
+}
+
+Features::ParamsStatus Features::CachedParamsStatus(const char* fnName)
+{
+    if (IsSimulatedDrift(fnName))
+        return ParamsStatus::Mismatch;
+    std::lock_guard<std::mutex> lk(ParamsMutex());
+    const ParamsEntry* entry = FindParamsEntry(fnName);
+    return entry ? entry->status : ParamsStatus::Unresolved;
+}
+
+void Features::SetSimulatedParamsDrift(const char* fnName)
+{
+    g_simulatedParamsDrift.store(fnName);
+}
+
+const char* Features::SimulatedParamsDrift()
+{
+    return g_simulatedParamsDrift.load();
 }
 
 namespace Features
@@ -14066,50 +14259,16 @@ namespace
         catch (...) { LOG("VerifyOffsets: exception (ignored)"); }
 
         // ---- params-struct sizes -------------------------------------------
-        int paramsOk = 0, paramsBad = 0, paramsUnresolved = 0;
-        try
-        {
-            LOG("VerifyParams: checking %d ProcessEvent params-struct sizes against UFunction::PropertiesSize",
-                (int)(sizeof(kParamsChecks) / sizeof(kParamsChecks[0])));
-            for (const ParamsCheck& check : kParamsChecks)
-            {
-                UFunction* fn = FindObjectFast(check.funcName);
-                if (!IsLiveObject(fn) ||
-                    !Mem::IsReadable((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize, 4))
-                {
-                    ++paramsUnresolved;
-                    LOG("VerifyParams: %-56s function not resolved (%s unchecked)",
-                        check.funcName, check.structName);
-                    continue;
-                }
-                int gameSize = *reinterpret_cast<int32_t*>((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize);
-                if (gameSize == check.ourSize)
-                {
-                    ++paramsOk;
-                    LOG("VerifyParams: %-34s ok 0x%X (%s)",
-                        check.structName, gameSize, check.funcName);
-                }
-                else
-                {
-                    ++paramsBad;
-                    LOG("VerifyParams: %-34s %s -- ours is 0x%X, the game's params block is 0x%X (%s)%s",
-                        check.structName,
-                        check.ourSize < gameSize ? "UNDERSIZED -- STACK CORRUPTION" : "oversized (wasteful, not unsafe)",
-                        check.ourSize, gameSize, check.funcName,
-                        check.ourSize < gameSize
-                            ? " <<< the game writes past the end of our buffer on every call"
-                            : "");
-                }
-            }
-        }
+        ParamsCounts params;
+        try { params = RunParamsChecks("VerifyParams"); }
         catch (...) { LOG("VerifyParams: exception (ignored)"); }
 
-        if (paramsBad)
+        if (params.mismatched)
             LOG("VerifyParams: DONE -- %d ok, %d MISMATCHED, %d unresolved. A mismatch where ours "
                 "is smaller corrupts the stack on every call to that function.",
-                paramsOk, paramsBad, paramsUnresolved);
+                params.ok, params.mismatched, params.unresolved);
         else
-            LOG("VerifyParams: DONE -- %d ok, 0 mismatched, %d unresolved.", paramsOk, paramsUnresolved);
+            LOG("VerifyParams: DONE -- %d ok, 0 mismatched, %d unresolved.", params.ok, params.unresolved);
 
         if (moved == 0 && unresolvedProp == 0 && unresolvedClass == 0)
             LOG("VerifyOffsets: DONE -- all %d reflected offsets match this build.", matched);
@@ -14365,6 +14524,10 @@ void Features::Prewarm()
         FindObjectFast(AH::Cls_Light);
         StartObjectNameIndex();
         LogNativeHookRvaSelfCheck();
+        // Every registered ProcessEvent params block, achievements included, is
+        // judged once here; callers then read the cached verdict.
+        const ParamsCounts params = RunParamsChecks("ParamsCheck");
+        LOG("ParamsCheck: %d ok, %d mismatched, %d unresolved", params.ok, params.mismatched, params.unresolved);
 
         LOG("Prewarm complete in %llums", GetTickCount64() - startMs);
     }
