@@ -73,11 +73,13 @@ namespace
     {
         UnlockPhase phase       = UnlockPhase::None;
         ULONGLONG   clickedMs   = 0;
-        int         readsSince  = 0;   // reads STARTED after the click
+        int         readsSince  = 0;   // Steam reads started after the click that completed
+        uint64_t    clickRead   = 0;   // g_achReadSeq at the click; later reads count
         uint64_t    seq         = 0;   // which click a queued call belongs to
     };
     std::unordered_map<int, UnlockTrack> g_achUnlocks;   // by EAchievements value
     uint64_t                             g_achUnlockSeq = 0;
+    uint64_t                             g_achReadSeq   = 0;   // bumped as each read starts
     constexpr ULONGLONG kAchPendingExpiryMs  = 10000;
     constexpr int       kAchUnconfirmedReads = 3;
 
@@ -1267,15 +1269,10 @@ namespace
     enum class QueueResult { Queued, InFlight, NoPump };
 
     // ---- Unlock tracking ----------------------------------------------------
-    // Reads only run while the tab is open, so counting read starts pauses the
-    // unconfirmed countdown while it is closed.
-    void CountReadStart()
+    uint64_t StartReadSeq()
     {
         std::lock_guard<std::mutex> lk(g_achMutex);
-        for (auto& [value, track] : g_achUnlocks)
-            if (track.phase == UnlockPhase::Pending || track.phase == UnlockPhase::Executing ||
-                track.phase == UnlockPhase::Sent)
-                ++track.readsSince;
+        return ++g_achReadSeq;
     }
 
     const AchievementSlot* FindSlot(int enumValue)
@@ -1287,7 +1284,10 @@ namespace
     }
 
     // After a read stored its states: confirm, give up on, or clear each unlock.
-    void SettleUnlocks()
+    // Only Steam settles a sent row. A read counts toward "not confirmed" when it
+    // started after the click and Steam answered it; reads only run while the tab
+    // is open, so the countdown pauses while it is closed.
+    void SettleUnlocks(uint64_t readSeq)
     {
         std::vector<std::pair<std::string, const char*>> notes;
         {
@@ -1295,8 +1295,13 @@ namespace
             for (auto& [value, track] : g_achUnlocks)
             {
                 const AchievementSlot* slot = FindSlot(value);
-                const bool unlocked = slot && IsUnlocked(slot->read);
+                const bool steamRead = slot && slot->read.steamReachable && slot->read.steamAnswered;
+                const bool unlocked  = steamRead && slot->read.steamAchieved;
                 const std::string name = slot ? slot->name : std::to_string(value);
+                if (steamRead && readSeq > track.clickRead &&
+                    (track.phase == UnlockPhase::Sent || track.phase == UnlockPhase::Pending ||
+                     track.phase == UnlockPhase::Executing))
+                    ++track.readsSince;
                 if ((track.phase == UnlockPhase::Sent || track.phase == UnlockPhase::Unconfirmed) && unlocked)
                 {
                     notes.emplace_back(name, track.phase == UnlockPhase::Sent
@@ -1350,6 +1355,12 @@ namespace
         auto it = g_achUnlocks.find(enumValue);
         if (it == g_achUnlocks.end() || it->second.seq != seq || it->second.phase != UnlockPhase::Pending)
             return false;
+        // Expiry runs from the tab, which may be closed: the age is checked here too.
+        if (GetTickCount64() - it->second.clickedMs > kAchPendingExpiryMs)
+        {
+            it->second.phase = UnlockPhase::Failed;
+            return false;
+        }
         it->second.phase = UnlockPhase::Executing;
         return true;
     }
@@ -1375,9 +1386,9 @@ namespace
 
         g_achReadWanted.store(0);
         const ULONGLONG queuedMs = GetTickCount64();
-        CountReadStart();
+        const uint64_t readSeq = StartReadSeq();
         LOG("achievements: state read start");
-        QueueGameThread([forced, queuedMs]()
+        QueueGameThread([forced, queuedMs, readSeq]()
         {
             if (forced && PrimeAchievementCacheGameThread())
             {
@@ -1387,7 +1398,7 @@ namespace
             }
             const bool readOk = RefreshAchievementStateGameThread(forced);
             if (readOk)
-                SettleUnlocks();
+                SettleUnlocks(readSeq);
             const ULONGLONG doneMs = GetTickCount64();
             g_achLastReadDoneMs.store(doneMs);
             if (readOk) g_achLastReadOkMs.store(doneMs);
@@ -1918,18 +1929,24 @@ int  Achievements::GetSteamPinnedLocked()             { return g_achPinnedLocked
 
 void Achievements::SimulateSend(int enumValue)
 {
+    bool found = false;
     {
         std::lock_guard<std::mutex> lk(g_achMutex);
-        if (!FindSlot(enumValue))
+        found = FindSlot(enumValue) != nullptr;
+        if (found)
         {
-            LOG("Achievements: simulate send %d ignored, no such achievement", enumValue);
-            return;
+            UnlockTrack& track = g_achUnlocks[enumValue];
+            track.phase      = UnlockPhase::Sent;
+            track.clickedMs  = GetTickCount64();
+            track.readsSince = 0;
+            track.clickRead  = g_achReadSeq;
+            track.seq        = ++g_achUnlockSeq;
         }
-        UnlockTrack& track = g_achUnlocks[enumValue];
-        track.phase      = UnlockPhase::Sent;
-        track.clickedMs  = GetTickCount64();
-        track.readsSince = 0;
-        track.seq        = ++g_achUnlockSeq;
+    }
+    if (!found)
+    {
+        LOG("Achievements: simulate send %d ignored, no such achievement", enumValue);
+        return;
     }
     LOG("Achievements: unlock %d marked sent (simulated, no ProcessEvent)", enumValue);
 }
@@ -2008,6 +2025,7 @@ void Achievements::Unlock(int enumValue)
             track.phase      = UnlockPhase::Pending;
             track.clickedMs  = GetTickCount64();
             track.readsSince = 0;
+            track.clickRead  = g_achReadSeq;
             track.seq        = ++g_achUnlockSeq;
             seq              = track.seq;
         }
@@ -2032,6 +2050,7 @@ void Achievements::Unlock(int enumValue)
         if (!ClaimPendingUnlock(enumValue, seq))
         {
             LOG("Achievements: unlock %s dropped -- it expired before the game thread ran it", label.c_str());
+            SetAchievementStatus("Unlock failed, see log.");
             return;
         }
         bool sent = false;
