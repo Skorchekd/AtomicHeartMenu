@@ -2018,7 +2018,7 @@ void Achievements::Unlock(int enumValue)
         return;
     }
 
-    LOG("Achievements: unlock requested -- %s (%d)", label.c_str(), enumValue);
+    LOG("Achievements: unlock %s (%d) queued", label.c_str(), enumValue);
     SetAchievementStatus("Unlock queued: " + label + ".");
     if (g_achSimStall.load())
     {
@@ -2039,6 +2039,8 @@ void Achievements::Unlock(int enumValue)
             LOG("Achievements: unlock %s not sent (simulated failure, no ProcessEvent)", label.c_str());
         else
             sent = SendAchievementUnlockGameThread(enumValue);
+        LOG("Achievements: unlock %s executed (game thread, tid %lu) result %s",
+            label.c_str(), GetCurrentThreadId(), sent ? "sent" : "failed");
         FinishUnlock(enumValue, seq, sent);
         if (!sent)
         {
@@ -2046,9 +2048,7 @@ void Achievements::Unlock(int enumValue)
             return;
         }
         SetAchievementStatus("Sent unlock: " + label + ".");
-        // Let the next auto tick pick it up rather than making the user press
-        // refresh. Steam may not have committed it that fast, but the recurring
-        // cadence will catch it either way.
+        // Read again on the next tick, not after the full cadence.
         g_achReadWanted.store(1);
     });
 }
