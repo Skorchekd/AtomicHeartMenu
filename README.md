@@ -120,9 +120,10 @@ src/
                        + ImGui DX12 backend, RTV/SRV heaps, command-queue capture
     wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggles menu
   menu/
-    menu.{h,cpp}       The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Achievements / Debug tabs)
+    menu.{h,cpp}       The ImGui window (sidebar pages: Player / Weapons / AI·Squad / Horde Rounds / Nora / World / Visuals / Rendering / Tools / Achievements / Agent tests / Diagnostics / Hook diagnostics)
   features/
     features.{h,cpp}   Per-frame cheat application (godmode, fly, speed, teleport...)
+    achievements.{h,cpp} Achievements page: game-event unlocks, Steam state read
   sdk/
     ue4.{h,cpp}        Minimal UE4 SDK: FName/UObject/GObjects/GWorld + ProcessEvent
     scanner.{h,cpp}    AOB / signature scanner for resolving engine globals
@@ -230,7 +231,7 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   fields, disables the inventory overweight bypass, and restores current-weapon/
   EBBarrel fields. **Refill ammo now** forces the same refill path once and does
   not own toggle restore state
-- **Misc → Instant puzzle resolve** - toggles Atomic Heart's own
+- **Tools → Instant puzzle resolve** - toggles Atomic Heart's own
   `DebugSubsystem.SetInstantPuzzleResolve` path AND continuously auto-completes
   the two interactive puzzle families the debug path does not cover:
   `BPC_MiniGameBase_C` minigames (dials/grids, electric lockpick - via
@@ -238,11 +239,11 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   (the CodeLock button grid, ColorsLockPick, CoinLock, UniversalLock - via
   `Unlock()`). Discovery (the GObjects sweep) runs on the **worker thread**, never
   the Present hook, so it does not freeze the game
-- **Misc → Solve / pass current puzzle** - pulses instant puzzle resolve, calls
+- **Tools → Solve / pass current puzzle** - pulses instant puzzle resolve, calls
   `DebugSubsystem.InstantLockUnlock` plus `DebugSubsystem.WinQTE`, and queues a
   one-shot minigame/lock completion pass (it pops within a frame or two; on a
   miss it also logs the live puzzle-class candidates for diagnosis)
-- **Misc → Unlock current lock / Win active QTE** - one-shot buttons for lock
+- **Tools → Unlock current lock / Win active QTE** - one-shot buttons for lock
   bypasses and active QTE passes
 - **Give weapon** - dropdown grants one weapon via `AAHPlayerCharacter::InstantTakeWeapon`
   and equips it; **Give all** paces one listed weapon per tick instead of granting
@@ -339,15 +340,15 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
 
   This is **not** a bypass - see the note under "Dump achievement API" below. It
   fires triggers that cheating made you skip.
-- **Debug → Dump nearby volumes** - stand where the game teleports you (e.g. the
+- **Diagnostics → Dump nearby volumes** - stand where the game teleports you (e.g. the
   lighthouse edge) and press it; it logs nearby volume/trigger classes to the log so
   the out-of-bounds teleporter can be identified and disabled precisely.
-- **Debug → dump objects** - logs the first 200 `GObjects` from a background
+- **Diagnostics → dump objects** - logs the first 200 `GObjects` from a background
   thread so the render hook does not block
-- **Debug → Verify member offsets** - diffs every reflected member offset in
+- **Diagnostics → Verify member offsets** - diffs every reflected member offset in
   `offsets.h` against the running game and names the ones a patch has moved; see
   "After a game patch" below
-- **Debug → Dump achievement API** - logs the game's own achievement path off the
+- **Diagnostics → Dump achievement API** - logs the game's own achievement path off the
   running game: every `UFunction`/class/struct/enum whose name contains `Achiev`,
   with full paths, params-block sizes and per-parameter type + offset, the
   `EAchievements` name→value table, and then the **complete** API of each class
@@ -360,7 +361,7 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   so it cannot freeze the game and **unlocks nothing**. Results go to
   `AtomicHeartMenu.log`. Re-run it after a game patch to re-check the signatures
   the Achievements tab calls.
-- **Debug → achievement simulations** - exercise the Achievements tab's failure
+- **Diagnostics → achievement simulations** - exercise the Achievements tab's failure
   paths without a broken game. None of them calls the game:
   - **Simulate Steam unavailable** (DLL missing / entry point missing) - reads fall
     back to the engine cache.
@@ -461,7 +462,7 @@ you can trigger from here once the SDK resolves.
   self-checks the hardcoded RVAs and logs any that have gone stale.
 - `VFUNC_PROCESSEVENT` (vtable index), the `SIG_*`/member offsets in `offsets.h`, and
   any hardcoded native-hook RVA are the first things to re-check after a game patch.
-  The three engine globals are handled for you where possible, and **Debug → Verify
+  The three engine globals are handled for you where possible, and **Diagnostics → Verify
   member offsets** checks the member layer against the running game - see "After a
   game patch" above.
 - Logging uses the game-directory `AtomicHeartMenu.log`, with a temporary-directory

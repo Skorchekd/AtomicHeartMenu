@@ -12402,9 +12402,11 @@ namespace
         });
         if (!queued)
         {
+            // Never ran, so it does not count toward the give-up limit.
             std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
             if (g_pendingEquip.asset == asset && g_pendingEquip.attempts == attempt)
             {
+                --g_pendingEquip.attempts;
                 g_pendingEquip.inFlight = false;
                 g_pendingEquip.nextAttemptMs = GetTickCount64() + kEquipRetryMs;
             }

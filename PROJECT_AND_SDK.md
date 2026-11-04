@@ -58,8 +58,9 @@ AtomicHeartMenu/
 │   ├── hooks/
 │   │   ├── dx12_hook.{h,cpp} Present/ResizeBuffers/ExecuteCommandLists hooks + ImGui DX12
 │   │   └── wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggle
-│   ├── menu/menu.{h,cpp}     The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Debug tabs)
+│   ├── menu/menu.{h,cpp}     The ImGui window (sidebar pages: Player / Weapons / AI·Squad / Horde Rounds / Nora / World / Visuals / Rendering / Tools / Achievements / Agent tests / Diagnostics / Hook diagnostics)
 │   ├── features/features.{h,cpp}  Per-frame cheat logic (god mode, fly, one-hit, …)
+│   ├── features/achievements.{h,cpp}  Achievements page: game-event unlocks, Steam state read
 │   └── sdk/                  *Minimal* hand-written UE4 runtime SDK (see §4)
 │       ├── ue4.{h,cpp}       FName/UObject/GObjects/GWorld + ProcessEvent + lookups
 │       ├── scanner.{h,cpp}   AOB scanner - the fallback when the static RVAs fail
@@ -136,7 +137,7 @@ matching therefore still comes up on its own. Recovering the numbers by hand:
 1. `python tools/find_globals.py` - static analysis of the shipping exe, no game
    running and no Dumper-7. Prints paste-ready constants for the three globals plus
    `ExpectedImageSize`, and flags whichever entry in `offsets.h` has gone stale.
-2. **Debug tab → Verify member offsets** - reads the member layer off the running
+2. **Diagnostics → Verify member offsets** - reads the member layer off the running
    game. Every `UPROPERTY` carries its own byte offset in the engine's reflection
    data, so a class's property list answers "where does `RootComponent` live on
    *this* build" directly. The button diffs those live offsets against the
@@ -333,7 +334,7 @@ when entry 0's `FName` is the enum's own `EName::Value` form - a wrong offset
 cannot fake that. The offset that won is reported so it can be promoted to a
 constant later.
 
-**Debug → Dump achievement API** is this pair applied end to end: sweep `GObjects`
+**Diagnostics → Dump achievement API** is this pair applied end to end: sweep `GObjects`
 for `Achiev`, describe every match, then follow each matched `UFunction`'s `Outer`
 (the class that declares it - a direct pointer, so no name lookup can resolve to
 the wrong class) and dump those classes in full. That last step is what reaches
@@ -397,7 +398,8 @@ entry leaves a slot behind, and reading it as live data would hand back rubbish.
 Two things keep this honest on a build we have no dump for:
 
 - **The layout is read, not derived.** `FMapProperty` carries an `FScriptMapLayout`
-  giving the key offset, value offset and element stride, so none of it is guessed
+  giving the value offset and element stride (the key always sits at offset 0, which
+  UE does not store), so none of it is guessed
   from type sizes and alignment rules. The one independent check available -
   every `MapProperty` on the subsystem reporting `size=80` - matches the
   `FScriptMap` arithmetic exactly (`0x38` sparse array + `0x10` hash allocator +

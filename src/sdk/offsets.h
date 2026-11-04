@@ -164,7 +164,7 @@ namespace Offsets
         constexpr int FMapProperty_KeyOffsetConst = 0;    // never stored; always zero
 
         // FScriptMap -- the map's VALUE, 0x50 bytes, confirmed against the live
-        // game: Debug -> Dump achievement API reports every MapProperty on
+        // game: Diagnostics -> Dump achievement API reports every MapProperty on
         // AHAchievementSubsystem as size=80. A TMap is a TSet of pairs, and a TSet
         // is a sparse array plus a hash, so iterating means walking the sparse
         // array's TArray and skipping the holes its bit array marks.
@@ -413,7 +413,7 @@ namespace Offsets
 
         // ===================================================================
         //  Achievements.  Verified against build 24534183 with
-        //  Debug -> Dump achievement API (read off the live game, not a dump).
+        //  Diagnostics -> Dump achievement API (read off the live game, not a dump).
         //
         //  The game's own path is an event, not a Steam write:
         //    GameplayEventUtils.SendAchievementUnlockEvent(EAchievements)

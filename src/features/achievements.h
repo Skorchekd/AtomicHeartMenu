@@ -29,7 +29,7 @@
 namespace Achievements
 {
     // ---- ProcessEvent param structs -----------------------------------------
-    // Sizes and member offsets read off the running game with Debug -> Dump
+    // Sizes and member offsets read off the running game with Diagnostics -> Dump
     // achievement API, and re-checked at injection against UFunction::PropertiesSize
     // (Features::RegisterParamsChecks; achievements.cpp registers them). A call
     // whose check did not pass is refused rather than made.

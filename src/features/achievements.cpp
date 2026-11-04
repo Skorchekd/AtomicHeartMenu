@@ -486,7 +486,7 @@ namespace
             // Retried every few seconds while the tab is open; say so once.
             if (ShouldLogFailure(g_achResolveLogged))
                 LOG_SDK("Achievements: EAchievements not readable (%s). The menu list stays "
-                        "empty rather than guessing values; run Debug -> Dump achievement API "
+                        "empty rather than guessing values; run Diagnostics -> Dump achievement API "
                         "to see why.", enumObject ? "enum found, values unreadable" : "enum not found");
             SetAchievementStatus("Achievement list unavailable -- see the log.");
             return false;
@@ -1511,6 +1511,8 @@ namespace
         });
         if (!queued)
         {
+            // Paced like a finished read, so a full queue is not retried every frame.
+            g_achLastReadDoneMs.store(GetTickCount64());
             g_achRefreshInFlight.store(0);
             return QueueResult::Refused;
         }

@@ -17,7 +17,6 @@
 #include <functional>
 #include <vector>
 #include <string>
-#include <functional>
 
 // Central feature state + per-frame application. The render hook calls
 // Features::Tick() once per presented frame (after the SDK is ready).
@@ -424,7 +423,7 @@ namespace Features
     // A P_* struct is a stack buffer the game writes its out-params into, so a
     // size a patch changed is memory corruption, not a wrong value. Each entry is
     // judged against the game's UFunction::PropertiesSize at Prewarm (and by
-    // Debug -> Verify member offsets); call sites then read the cached verdict.
+    // Diagnostics -> Verify member offsets); call sites then read the cached verdict.
     enum ParamsCheckFlags : unsigned
     {
         kParamsStrict        = 1u << 0, // oversized is drift too, not only undersized

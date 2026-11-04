@@ -895,6 +895,8 @@ static void RenderAchievementListState()
 {
     if (Achievements::ListResolveFailed())
     {
+        if (Achievements::SignatureDrift())
+            return;   // the drift banner above outranks this one
         ImGui::TextColored(ImVec4(0.80f, 0.45f, 0.35f, 1.0f), "Achievement list unavailable, see log");
         if (ImGui::Button("Retry", ImVec2(96, 0)))
         {
