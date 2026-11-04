@@ -163,8 +163,12 @@ namespace
         G::running = false;
         // Running achievement work returns through the ProcessEvent detour, so
         // the hooks outlast it: keep waiting rather than leave them behind.
-        while (!SafeRemoveHooks())
-            LOG("Achievement work still running -- waiting before removing the hooks.");
+        for (bool logged = false; !SafeRemoveHooks(); Sleep(100))
+        {
+            if (!logged)
+                LOG("Achievement work still running -- waiting before removing the hooks.");
+            logged = true;
+        }
         if (!UE::WaitForObjectNameIndex())
         {
             LOG("Name-index worker is still exiting; retaining the DLL to avoid unloading running code.");

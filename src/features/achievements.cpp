@@ -2250,6 +2250,11 @@ bool Achievements::Shutdown()
     while (g_achInFlight.load() > 0 && GetTickCount64() - startMs < kAchShutdownWaitMs)
         Sleep(10);
     const int outstanding = g_achInFlight.load();
-    LOG("achievements: drained %d pending, %d outstanding", dropped, outstanding);
+    // Eject calls this again while work is outstanding; only the first call and
+    // the one that finishes the drain are worth a line.
+    static bool s_logged = false;
+    if (!s_logged || outstanding == 0)
+        LOG("achievements: drained %d pending, %d outstanding", dropped, outstanding);
+    s_logged = true;
     return outstanding == 0;
 }
