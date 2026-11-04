@@ -89,6 +89,12 @@ namespace Offsets
     constexpr int      O_UFunction_FunctionFlags = 0xB8; // EFunctionFlags
     constexpr int      O_UFunction_ExecFunction  = 0xE0; // native impl ptr
     constexpr uint32_t FUNC_Native               = 0x00000400; // EFunctionFlags::FUNC_Native bit
+    // Two more EFunctionFlags worth decoding when a dump reports an unfamiliar
+    // function: Static decides HOW it is called (no instance -- dispatch on the
+    // class default object), Callable says the game itself exposes it to blueprint,
+    // which is the strongest signal that ProcessEvent can drive it safely.
+    constexpr uint32_t FUNC_Static               = 0x00002000;
+    constexpr uint32_t FUNC_BlueprintCallable    = 0x04000000;
 
     // ---- FField / FProperty reflection (UE4.25+; verified from Dumper-7) -----
     // The DATA members of a UStruct live in ChildProperties (a singly-linked
@@ -126,6 +132,65 @@ namespace Offsets
         constexpr int FArrayProperty_Inner      = 0x78; // FProperty*
         constexpr int FEnumProperty_Underlaying = 0x78; // FProperty* (numeric)
         constexpr int FEnumProperty_Enum        = 0x80; // UEnum*
+
+        // EPropertyFlags bits that describe a UFunction's parameters. A function's
+        // signature is exactly the CPF_Parm entries of its OWN ChildProperties, in
+        // declaration order, and the ProcessEvent params block we have to build is
+        // that same list laid out at each field's FProperty_Offset.
+        constexpr uint64_t CPF_ConstParm     = 0x0000000000000002;
+        constexpr uint64_t CPF_Parm          = 0x0000000000000080;
+        constexpr uint64_t CPF_OutParm       = 0x0000000000000100;
+        constexpr uint64_t CPF_ReturnParm    = 0x0000000000000400;
+        constexpr uint64_t CPF_ReferenceParm = 0x0000000008000000;
+
+        // FMapProperty (extends FProperty @0x78). KeyProp/ValueProp name the two
+        // halves; MapLayout carries the byte layout of one stored pair, so the
+        // stride never has to be guessed from type sizes and alignment rules.
+        //
+        // FScriptMapLayout does NOT store a key offset -- UE comments the field
+        // out because a key is always at zero within its pair -- so MapLayout
+        // opens directly on ValueOffset and the next int32 is already the set
+        // layout's HashNextIdOffset. Reading +0x88 as a key offset instead is
+        // what the first version of this got wrong; it was caught by the
+        // "key offset must be 0" check rather than by producing bad data.
+        //
+        // Confirmed against AchievementsMap on build 24534183, where the three
+        // int32s read 8 / 24 / 32 and close exactly: a 1-byte key padded to 8, a
+        // 16-byte value ending the pair at 24, plus two int32 hash fields = 32.
+        constexpr int FMapProperty_KeyProp        = 0x78; // FProperty*
+        constexpr int FMapProperty_ValueProp      = 0x80; // FProperty*
+        constexpr int FMapProperty_ValueOffset    = 0x88; // int32, value's offset in the pair
+        constexpr int FMapProperty_SparseElemSize = 0x9C; // int32, stride of one stored element
+        constexpr int FMapProperty_KeyOffsetConst = 0;    // never stored; always zero
+
+        // FScriptMap -- the map's VALUE, 0x50 bytes, confirmed against the live
+        // game: Diagnostics -> Dump achievement API reports every MapProperty on
+        // AHAchievementSubsystem as size=80. A TMap is a TSet of pairs, and a TSet
+        // is a sparse array plus a hash, so iterating means walking the sparse
+        // array's TArray and skipping the holes its bit array marks.
+        //   FScriptArray  Elements.Data       @0x00  { void* Data; int32 Num; int32 Max; }
+        //   TBitArray     Elements.AllocFlags @0x10  { uint32 Inline[4]; void* Secondary;
+        //                                              int32 NumBits; int32 MaxBits; }
+        constexpr int FScriptMap_ElementsData     = 0x00; // void*  (array of stored elements)
+        constexpr int FScriptMap_ElementsNum      = 0x08; // int32  (INCLUDING holes)
+        constexpr int FScriptMap_ElementsMax      = 0x0C; // int32
+        constexpr int FScriptMap_AllocFlagsInline = 0x10; // uint32[4] -- 128 bits inline
+        constexpr int FScriptMap_AllocFlagsHeap   = 0x20; // uint32*  (used when non-null)
+        constexpr int FScriptMap_AllocFlagsNumBits= 0x28; // int32
+        constexpr int FScriptMap_InlineFlagBits   = 128;  // 4 * 32, TInlineAllocator<4>
+        constexpr int FScriptMap_MaxEntries       = 65536; // runaway guard
+
+        // UEnum::Names -- TArray<TPair<FName,int64>> mapping every entry to its
+        // numeric value. Deliberately NOT a fixed offset: it sits behind UEnum's
+        // CppType FString, so its position tracks the engine build rather than the
+        // game's own classes, and we have no dump to static_assert it against.
+        // Reflect::DescribeEnumValues probes this window instead and accepts a hit
+        // only when entry 0's FName is the enum's own "EName::Value" form, which a
+        // wrong offset cannot fake. The discovered offset is logged so it can be
+        // promoted to a constant here once a dump confirms it.
+        constexpr int UEnum_NamesProbeFirst = 0x30;
+        constexpr int UEnum_NamesProbeLast  = 0x90;
+        constexpr int UEnum_NamesEntrySize  = 0x10; // TPair<FName(8), int64(8)>
     }
 
     // ProcessEvent: index into the UObject vtable. UE4.27 is commonly ~0x44.
@@ -345,6 +410,78 @@ namespace Offsets
         constexpr const char* Cls_UniversalLock            = "AtomicHeart.UniversalLock";
         constexpr const char* Fn_UniversalLock_CompleteAll      = "OnCompleteAllParts";      // short name (children walk)
         constexpr const char* Fn_UniversalLock_CompleteAllEvent = "OnCompleteAllPartsEvent"; // short name (children walk)
+
+        // ===================================================================
+        //  Achievements.  Verified against build 24534183 with
+        //  Diagnostics -> Dump achievement API (read off the live game, not a dump).
+        //
+        //  The game's own path is an event, not a Steam write:
+        //    GameplayEventUtils.SendAchievementUnlockEvent(EAchievements)
+        //      -> broadcast on EGameplayEventChannel::Achievement
+        //    UAHAchievementSubsystem::OnAchievementEvent
+        //      -> WriteAchievementProgress -> OnlineSubsystemSteam
+        //  Going in at the front door means the subsystem's own bookkeeping
+        //  (AchievementsMap, DelayedAchievements, the DLC and progress maps)
+        //  stays consistent with what Steam is told. The stock UE
+        //  AchievementWriteCallbackProxy.WriteAchievementProgress would write to
+        //  Steam directly by ID string and desync the two, so it is not used.
+        //
+        //  SendAchievementUnlockEvent is Static, so it is called on the CDO and
+        //  needs no subsystem instance. GetAchievementSubsystem hands back the
+        //  instance the id map is read from (a LOCAL PLAYER subsystem --
+        //  BP_AchievementSubsystem_C_0 under LocalPlayer_0, not a world or
+        //  game-instance one).
+        // ===================================================================
+        constexpr const char* Obj_GameplayEventUtils = "GameplayEventUtils /Script/AtomicHeart.Default__GameplayEventUtils";
+        constexpr const char* Obj_SubsystemUtils     = "SubsystemUtils /Script/AtomicHeart.Default__SubsystemUtils";
+        constexpr const char* Fn_SendAchievementUnlockEvent   = "Function /Script/AtomicHeart.GameplayEventUtils.SendAchievementUnlockEvent";
+        constexpr const char* Fn_GetAchievementSubsystem      = "Function /Script/AtomicHeart.SubsystemUtils.GetAchievementSubsystem";
+        // The achievement NAMES are never hardcoded: they are read from this live
+        // UEnum, so a patch that adds or reorders entries is picked up for free and
+        // a value can never drift out of step with its name. 85 entries on this
+        // build -- INVALID at 0 and EAchievements_MAX at the end are not
+        // achievements and are filtered out of the menu list.
+        constexpr const char* Obj_EAchievementsEnum  = "Enum /Script/AtomicHeart.EAchievements";
+        constexpr const char* EAchievementsPrefix    = "EAchievements::";
+
+        // Reading BACK what Steam has. Stock UE, keyed by the platform achievement
+        // ID (an FName), NOT by EAchievements -- so the ids come from the game's own
+        // AchievementsMap, whose values are read straight out of the map as FNames.
+        // That matters: the ids never have to be built from a string, which could
+        // not work anyway (the pool holds "EAchievements::KillTwins" as ONE name,
+        // so a standalone "KillTwins" need not exist in it at all).
+        //
+        // CacheAchievements primes the engine-side cache from the online subsystem
+        // and is ASYNC -- a read taken immediately after it can legitimately come
+        // back empty, which is reported rather than shown as "0% / locked".
+        constexpr const char* Obj_AchievementBPLibrary = "AchievementBlueprintLibrary /Script/OnlineSubsystemUtils.Default__AchievementBlueprintLibrary";
+        constexpr const char* Obj_AchievementQueryProxy = "AchievementQueryCallbackProxy /Script/OnlineSubsystemUtils.Default__AchievementQueryCallbackProxy";
+        constexpr const char* Fn_GetCachedAchievementProgress = "Function /Script/OnlineSubsystemUtils.AchievementBlueprintLibrary.GetCachedAchievementProgress";
+        constexpr const char* Fn_CacheAchievements            = "Function /Script/OnlineSubsystemUtils.AchievementQueryCallbackProxy.CacheAchievements";
+        // UAHAchievementSubsystem member: TMap<EAchievements, ...> holding each
+        // achievement's platform id. Resolved BY NAME through reflection, and the
+        // key/value types are checked at runtime before a byte of it is trusted --
+        // on build 24534183 the value is 16 bytes wide, i.e. an FString, not the
+        // FName the engine's own achievement API wants, so the id is converted.
+        constexpr const char* Prop_AchievementsMap    = "AchievementsMap";
+        // ...and the ids are FStrings, while the engine's achievement API is keyed
+        // by FName. TryGetFName cannot bridge that: it only FINDS names already in
+        // the pool, and the game never turns most of these strings into names, so
+        // 79 of 83 missed. Conv_StringToName both finds AND creates, which is
+        // exactly the difference that matters. Appending to the name pool is what
+        // the engine does constantly and costs the game nothing.
+        constexpr const char* Obj_KismetStringLibrary = "KismetStringLibrary /Script/Engine.Default__KismetStringLibrary";
+        constexpr const char* Fn_ConvStringToName     = "Function /Script/Engine.KismetStringLibrary.Conv_StringToName";
+
+        // The achievement's real Steam-facing name, so nothing has to be inferred
+        // from the internal EAchievements spelling -- "GoldenFever" and "Gold Rush"
+        // are not obviously the same achievement, and guessing at that mapping is
+        // how a wrong reading gets mistaken for a right one. Title comes back as an
+        // FText, which is a shared-pointer handle rather than characters, so
+        // Conv_TextToString does the conversion instead of us walking it.
+        constexpr const char* Fn_GetCachedAchievementDescription = "Function /Script/OnlineSubsystemUtils.AchievementBlueprintLibrary.GetCachedAchievementDescription";
+        constexpr const char* Obj_KismetTextLibrary   = "KismetTextLibrary /Script/Engine.Default__KismetTextLibrary";
+        constexpr const char* Fn_ConvTextToString     = "Function /Script/Engine.KismetTextLibrary.Conv_TextToString";
 
         // World / visuals helpers.
         // UGameplayStatics is a static-only class; call its functions on the CDO.

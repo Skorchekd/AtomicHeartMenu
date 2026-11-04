@@ -58,8 +58,9 @@ AtomicHeartMenu/
 │   ├── hooks/
 │   │   ├── dx12_hook.{h,cpp} Present/ResizeBuffers/ExecuteCommandLists hooks + ImGui DX12
 │   │   └── wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggle
-│   ├── menu/menu.{h,cpp}     The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Debug tabs)
+│   ├── menu/menu.{h,cpp}     The ImGui window (sidebar pages: Player / Weapons / AI·Squad / Horde Rounds / Nora / World / Visuals / Rendering / Tools / Achievements / Agent tests / Diagnostics / Hook diagnostics)
 │   ├── features/features.{h,cpp}  Per-frame cheat logic (god mode, fly, one-hit, …)
+│   ├── features/achievements.{h,cpp}  Achievements page: game-event unlocks, Steam state read
 │   └── sdk/                  *Minimal* hand-written UE4 runtime SDK (see §4)
 │       ├── ue4.{h,cpp}       FName/UObject/GObjects/GWorld + ProcessEvent + lookups
 │       ├── scanner.{h,cpp}   AOB scanner - the fallback when the static RVAs fail
@@ -136,7 +137,7 @@ matching therefore still comes up on its own. Recovering the numbers by hand:
 1. `python tools/find_globals.py` - static analysis of the shipping exe, no game
    running and no Dumper-7. Prints paste-ready constants for the three globals plus
    `ExpectedImageSize`, and flags whichever entry in `offsets.h` has gone stale.
-2. **Debug tab → Verify member offsets** - reads the member layer off the running
+2. **Diagnostics → Verify member offsets** - reads the member layer off the running
    game. Every `UPROPERTY` carries its own byte offset in the engine's reflection
    data, so a class's property list answers "where does `RootComponent` live on
    *this* build" directly. The button diffs those live offsets against the
@@ -302,6 +303,167 @@ To **call a function** instead of poking memory, resolve it once via
 with a param struct matching the dump's signature. Verify the parameter size in
 `dumped-sdk/CppSDK/SDK/*_parameters.hpp`; for example `K2_SetActorLocation` is
 `0x9C` bytes and contains an `FHitResult` of `0x88` bytes.
+
+### Calling a function you have NO dump for
+
+The worked example above starts from `dumped-sdk/`. When there is no dump - a new
+subsystem, a patch that moved things, or a machine that never ran Dumper-7 - the
+running game still carries the whole signature in its own reflection data, and
+`src/sdk/reflect.cpp` reads it:
+
+```cpp
+// Every parameter of a UFunction, in declaration order, straight off the game.
+for (const Reflect::FieldInfo& f : Reflect::DescribeStructFields(fn))
+    if (f.IsParm())
+        LOG("%s %s @0x%X size=%d", f.type.c_str(), f.name.c_str(), f.offset, f.size);
+```
+
+`FieldInfo` gives the type (`FFieldClass` name), what that type points at
+(`detail`: the enum/struct/class behind an `EnumProperty`/`StructProperty`/
+`ObjectProperty`), the byte `offset` **inside the params block**, the `size`, and
+the `EPropertyFlags`. `CPF_Parm` separates real parameters from the function's
+locals; `CPF_ReturnParm` / `CPF_OutParm` mark what the game writes back. Together
+with `UFunction::PropertiesSize` (the params-block size) that is everything needed
+to build a correct `ProcessEvent` call without a dump.
+
+`Reflect::DescribeEnumValues` does the same for a `UEnum`'s name→value table. Its
+offset is deliberately **not** a constant in `offsets.h`: `UEnum::Names` sits
+behind an `FString` whose position tracks the engine build, and there is no dump
+to `static_assert` it against. So it probes a window and accepts a candidate only
+when entry 0's `FName` is the enum's own `EName::Value` form - a wrong offset
+cannot fake that. The offset that won is reported so it can be promoted to a
+constant later.
+
+**Diagnostics → Dump achievement API** is this pair applied end to end: sweep `GObjects`
+for `Achiev`, describe every match, then follow each matched `UFunction`'s `Outer`
+(the class that declares it - a direct pointer, so no name lookup can resolve to
+the wrong class) and dump those classes in full. That last step is what reaches
+the achievement path's two subsystems, whose own names contain no "Achiev" at all.
+
+The path it found, now wired up as the Achievements tab:
+
+```
+GameplayEventUtils.SendAchievementUnlockEvent(EAchievements)   parms=0x1, Static
+      -> broadcast on EGameplayEventChannel::Achievement, payload AchievementsContext
+   UAHAchievementSubsystem::OnAchievementEvent
+      -> WriteAchievementProgress -> OnlineSubsystemSteam
+```
+
+Three things about that shape drove the implementation:
+
+- **It is Static**, so the unlock is dispatched on the CDO
+  (`/Script/AtomicHeart.Default__GameplayEventUtils`) and there is no instance to
+  find or to go stale between frames. Reading state needs the subsystem instance,
+  which is a **LocalPlayer** subsystem (`BP_AchievementSubsystem_C_0` under
+  `LocalPlayer_0`), so it is fetched fresh through
+  `SubsystemUtils.GetAchievementSubsystem` on every read rather than cached.
+- **The params block is one byte** - a single `EAchievements` at `@0x00`. All seven
+  achievement signatures are registered through `Features::RegisterParamsChecks`
+  and checked at injection against the live `UFunction::PropertiesSize`. For
+  achievements any size difference counts as drift, and a non-native
+  `SendAchievementUnlockEvent` does too, since the unlock cannot be taken back.
+  A call whose check failed is refused, every Unlock is disabled, and the tab
+  shows a banner naming the function - instead of a stack local quietly corrupted.
+- **Going in at the front door matters.** The stock UE
+  `AchievementWriteCallbackProxy.WriteAchievementProgress` would write to Steam
+  directly by ID string, skipping the subsystem's own maps (`AchievementsMap`,
+  `DelayedAchievements`, the DLC and progress maps) and desyncing the save from
+  Steam. The event does not.
+
+The achievement NAMES are never hardcoded: they come from the live `EAchievements`
+`UEnum` via `DescribeEnumValues`, so a value can never drift out of step with its
+name and a patch that adds entries is picked up for free.
+
+### Reading state back: TMap, and why the ids come out of one
+
+Unlocking is a write, and needs nothing but the enum. Reading back *what Steam
+holds* is the harder half, because the engine's own
+`AchievementBlueprintLibrary.GetCachedAchievementProgress` is keyed by the
+**platform achievement id** (an `FName`), not by `EAchievements`. The translation
+lives in `UAHAchievementSubsystem::AchievementsMap`, which on build 24534183 is a
+`TMap<EAchievements, FString>` - the live value property is a `StrProperty`.
+
+That decides the design: the ids come out of the map as strings and have to be
+turned into `FName`s. `TryGetFName` is tried first because it costs no
+`ProcessEvent`, but it can only *find* a name - and the game keeps these ids as
+strings, so most have never become names (the name pool holds
+`"EAchievements::KillTwins"` as a single name, not `"KillTwins"`).
+`KismetStringLibrary.Conv_StringToName` mints the missing ones on the game thread.
+Steam's flat API takes the id string as-is.
+
+So `Reflect::OpenMapProperty` reads a `TMap` generically. A `TMap` is a `TSet` of
+pairs and a `TSet` is a sparse array plus a hash, so iterating means walking the
+sparse array's `TArray` and skipping the holes its `TBitArray` marks - a removed
+entry leaves a slot behind, and reading it as live data would hand back rubbish.
+Two things keep this honest on a build we have no dump for:
+
+- **The layout is read, not derived.** `FMapProperty` carries an `FScriptMapLayout`
+  giving the value offset and element stride (the key always sits at offset 0, which
+  UE does not store), so none of it is guessed
+  from type sizes and alignment rules. The one independent check available -
+  every `MapProperty` on the subsystem reporting `size=80` - matches the
+  `FScriptMap` arithmetic exactly (`0x38` sparse array + `0x10` hash allocator +
+  `HashSize` + padding).
+- **It fails closed.** The layout is range-checked before a byte of map data is
+  trusted, and the caller then checks the map *is what it expects* - a 1-byte enum
+  key and an `FString` value - before reinterpreting anything. A patch that moves
+  the layout produces a logged error, not plausible-looking garbage.
+
+### Why the state is read from Steam, not from the engine
+
+`GetCachedAchievementProgress` looks like the right answer and is not. On build
+24534183 it returns only 0 or 100 - never a value in between - and it returns
+**100 for counting achievements that are merely part-done**. It reported "Gold
+Rush" (0/76 in Steam's own UI) and "Apple Pie 3826" (859/3826) as earned, while
+every counting achievement sitting at exactly zero read correctly. Two wrong out
+of 83, both with a non-zero counter: a pattern in the derived value, not a bad
+read of it.
+
+So the state comes from `steam_api64.dll` instead. It is already loaded in the
+process, its flat API is the same source the engine reads, and
+`SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime` answers with both the
+achieved flag and a unix timestamp. Whenever steam_api64 can be reached it is the
+only authority - an id it has no answer for reads **no answer**, never a cache
+guess. The engine cache is read only when steam_api64 cannot be reached at all,
+and those rows are marked **(cache)**; a cache "unlocked" is not trusted enough to
+disable Unlock.
+
+The interface pointer and every flat-API entry point are resolved with
+`GetProcAddress` and guarded with `Mem::IsExecutable` rather than `IsReadable` -
+a stale pointer that reads fine still DEP-faults on the call, after control has
+left our code where `catch(...)` cannot reach it.
+
+Verified end to end against a real profile: 52 of 83 unlocked, matching Steam
+exactly, with six spot-checked unlock timestamps matching Steam's own UI to the
+minute.
+
+One consequence worth keeping in mind:
+
+- **Names are never inferred.** The internal `EAchievements` spelling and the
+  Steam title are different strings - `GoldenFever` is "Gold Rush",
+  `progress100` is "The Motherland Does Not Forget its Heroes" - so the menu
+  shows Steam's own title, fetched through `GetCachedAchievementDescription` and
+  `Conv_TextToString`. Checking a read against a guessed name mapping is how a
+  wrong answer passes for right, and how a correct one gets blamed.
+
+`CacheAchievements` still primes the engine cache asynchronously (the titles come
+from it), so a first read can come back without names - reported as such rather
+than drawn as blank.
+
+Nothing gates that on cheat use. The authoritative check is the live reflection
+data, not the exe: `UAHAchievementSubsystem` (38 fields, 18 functions) and
+`UGameplayEventSubsystem` (21 functions) were dumped in full, and neither holds a
+cheats-used gate or a persisted "cheated" flag. There is no anti-tamper either (no
+Denuvo, EAC or BattlEye; a single stock `IsDebuggerPresent`). The failure mode
+with a trainer is a *missed* trigger, not a blocked one - which is what the
+Achievements tab exists to fix.
+
+A warning about method, learned the hard way here: **string-scanning the shipping
+exe has blind spots.** `AHAchievementSubsystem`, `GameplayEventUtils` and
+`AHBaseCharacter` all exist in the running game and are *not* findable in
+`AtomicHeart-Win64-Shipping.exe` with a plain string search, while
+`GameplayEventSubsystem`, `SubsystemUtils` and `DebugSubsystem` are. The absence
+of a string in the exe proves nothing. Ask the running game.
 
 ---
 

@@ -29,6 +29,7 @@ add_library(AtomicHeartMenu SHARED
     src/hooks/ai_movement_hooks.cpp
     src/menu/menu.cpp
     src/features/features.cpp
+    src/features/achievements.cpp
     src/features/bodyguards.cpp
     src/features/workbench.cpp
     src/features/test_harness.cpp

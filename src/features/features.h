@@ -392,4 +392,61 @@ namespace Features
 
     const WeaponEntry* WeaponList();
     int WeaponCount();
+
+    // ---- Engine helpers shared with achievements.cpp -----------------------
+    // Defined in features.cpp; the achievements module needs them and must not
+    // grow its own copies.
+
+    // Run `fn` on the game thread, from the ProcessEvent hook's drain. Nothing
+    // drains the queue until InstallProcessEventHook() has succeeded. `owner`
+    // tags the task for RemoveQueuedGameThread, which drops every still-queued
+    // task with that tag and returns how many it dropped. False, with `fn`
+    // dropped, when the queue is full or an unload is being prepared.
+    bool   QueueGameThread(std::function<void()> fn, const void* owner = nullptr);
+    size_t RemoveQueuedGameThread(const void* owner);
+    bool InstallProcessEventHook();
+
+    // Resolve and cache a UFunction by full name / a UObject by name.
+    UE::UFunction* CachedFn(const char* fullName);
+    UE::UObject*   CachedObject(const char* name);
+
+    // Name and reflection helpers that never fault: empty / false on an
+    // unreadable object.
+    std::string LowerCopy(std::string s);
+    std::string SafeFNameToString(const UE::FName& name);
+    std::string SafeObjectName(UE::UObject* o);
+    std::string SafeObjectFullName(UE::UObject* o);
+    std::string SafeClassName(UE::UObject* o);
+    bool        IsStructLike(UE::UObject* object);
+
+    // ---- ProcessEvent params-size guard ------------------------------------
+    // A P_* struct is a stack buffer the game writes its out-params into, so a
+    // size a patch changed is memory corruption, not a wrong value. Each entry is
+    // judged against the game's UFunction::PropertiesSize at Prewarm (and by
+    // Diagnostics -> Verify member offsets); call sites then read the cached verdict.
+    enum ParamsCheckFlags : unsigned
+    {
+        kParamsStrict        = 1u << 0, // oversized is drift too, not only undersized
+        kParamsRequireNative = 1u << 1, // a script function fails: its size includes locals
+    };
+    struct ParamsCheck
+    {
+        const char* funcName;   // full name, as passed to CachedFn; a string literal
+        int         ourSize;    // sizeof(the P_* struct we pass)
+        const char* structName;
+        unsigned    flags = 0;  // ParamsCheckFlags
+    };
+    enum class ParamsStatus { Ok, Mismatch, Unresolved };
+
+    // Adds entries to the table. Safe from a namespace-scope initializer.
+    void RegisterParamsChecks(const ParamsCheck* checks, int count);
+    // The verdict for one call. Ok and Mismatch are cached; Unresolved is checked
+    // again on the next call and must be refused like a mismatch. A function the
+    // table has no entry for at this size is a Mismatch.
+    ParamsStatus CheckParamsSize(const char* fnName, int ourSize);
+    // The cached verdict only; never resolves anything, so the render thread may ask.
+    ParamsStatus CachedParamsStatus(const char* fnName);
+    // Debug: make `fnName` report Mismatch (nullptr clears). Pass a string literal.
+    void        SetSimulatedParamsDrift(const char* fnName);
+    const char* SimulatedParamsDrift();
 }

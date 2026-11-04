@@ -120,9 +120,10 @@ src/
                        + ImGui DX12 backend, RTV/SRV heaps, command-queue capture
     wndproc_hook.{h,cpp}  Window subclass: feeds input to ImGui, INSERT toggles menu
   menu/
-    menu.{h,cpp}       The ImGui window (themed: Player / Weapons / AI·Squad / World / Visuals / Render / Misc / Debug tabs)
+    menu.{h,cpp}       The ImGui window (sidebar pages: Player / Weapons / AI·Squad / Horde Rounds / Nora / World / Visuals / Rendering / Tools / Achievements / Agent tests / Diagnostics / Hook diagnostics)
   features/
     features.{h,cpp}   Per-frame cheat application (godmode, fly, speed, teleport...)
+    achievements.{h,cpp} Achievements page: game-event unlocks, Steam state read
   sdk/
     ue4.{h,cpp}        Minimal UE4 SDK: FName/UObject/GObjects/GWorld + ProcessEvent
     scanner.{h,cpp}    AOB / signature scanner for resolving engine globals
@@ -230,7 +231,7 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   fields, disables the inventory overweight bypass, and restores current-weapon/
   EBBarrel fields. **Refill ammo now** forces the same refill path once and does
   not own toggle restore state
-- **Misc → Instant puzzle resolve** - toggles Atomic Heart's own
+- **Tools → Instant puzzle resolve** - toggles Atomic Heart's own
   `DebugSubsystem.SetInstantPuzzleResolve` path AND continuously auto-completes
   the two interactive puzzle families the debug path does not cover:
   `BPC_MiniGameBase_C` minigames (dials/grids, electric lockpick - via
@@ -238,11 +239,11 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   (the CodeLock button grid, ColorsLockPick, CoinLock, UniversalLock - via
   `Unlock()`). Discovery (the GObjects sweep) runs on the **worker thread**, never
   the Present hook, so it does not freeze the game
-- **Misc → Solve / pass current puzzle** - pulses instant puzzle resolve, calls
+- **Tools → Solve / pass current puzzle** - pulses instant puzzle resolve, calls
   `DebugSubsystem.InstantLockUnlock` plus `DebugSubsystem.WinQTE`, and queues a
   one-shot minigame/lock completion pass (it pops within a frame or two; on a
   miss it also logs the live puzzle-class candidates for diagnosis)
-- **Misc → Unlock current lock / Win active QTE** - one-shot buttons for lock
+- **Tools → Unlock current lock / Win active QTE** - one-shot buttons for lock
   bypasses and active QTE passes
 - **Give weapon** - dropdown grants one weapon via `AAHPlayerCharacter::InstantTakeWeapon`
   and equips it; **Give all** paces one listed weapon per tick instead of granting
@@ -292,14 +293,96 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
     that aren't verified yet.)
 - **Visuals → RGB gun** - rainbow/recolor your equipped weapon via its mesh material
   parameters (same engine path as chams; no GPU pipeline hook).
-- **Debug → Dump nearby volumes** - stand where the game teleports you (e.g. the
+- **Achievements tab** - fires the game's **own** achievement event
+  (`GameplayEventUtils.SendAchievementUnlockEvent`), so `UAHAchievementSubsystem`
+  does its normal bookkeeping and tells Steam itself, exactly as a real unlock
+  would. One achievement at a time: a filterable list (by Steam title or internal
+  name, with **Hide unlocked**), an **N/83 unlocked** count, and a per-row
+  **Unlock**. There is no unlock-all and no progress editing. Names and values are
+  read from the live `EAchievements` enum rather than hardcoded, so a patch that
+  adds or reorders entries needs no code change.
+
+  The list **refreshes itself** every 3 s while the tab is open (never while it is
+  closed); a read is ~1ms of game thread once the display names are cached, and it
+  is single-flight. **Refresh now** forces one and also re-runs the engine's async
+  achievement query, which is what to press if names look stale right after
+  injecting. Each row shows Steam's own display name - "Gold Rush", not the
+  internal `GoldenFever` - with the internal name, value and unlock date in the
+  tooltip; a row whose name has not arrived yet says **title pending**.
+
+  The state comes from **`steam_api64.dll` directly**
+  (`SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime`), not from the engine's
+  cached layer: the engine's `GetCachedAchievementProgress` answers **100 for
+  counting achievements that are merely part-done** - it reported "Gold Rush"
+  (0/76) and "Apple Pie 3826" (859/3826) as earned. The engine cache is used only
+  when steam_api64 cannot be reached at all; those rows are marked **(cache)**,
+  an amber line says so, and a cache "unlocked" never disables Unlock. Verified
+  end to end: 52 of 83, matching the Steam profile exactly.
+
+  Row states are kept deliberately distinct, because "we could not ask" must never
+  look like "you do not have it": **unlocked** / **locked** are what Steam
+  answered, **?** means not read yet, and **no answer** means nothing answered for
+  that id. After a click the row reads **sent** until Steam reports it unlocked;
+  if 3 reads later Steam still says locked it reads **sent, not confirmed** and
+  Unlock is available again. A click the game thread does not run within 10 s, or
+  a call that fails, shows **Unlock failed, see log**.
+
+  Unlock is disabled with the reason on hover when Steam reports the achievement
+  unlocked, while a click is queued, while a sent row waits for Steam, and on
+  **signature drift**: every achievement call's params block is checked at
+  injection against the game's own `UFunction`, and if a patch changed one, calls
+  to it are refused and a red banner names it.
+
+  Every unlock logs a `queued` line and an `executed (game thread, tid N) result R`
+  line. On eject, queued achievement work is dropped and running work is waited
+  for before the hooks come out and the DLL unloads: `achievements: drained N pending,
+  0 outstanding`.
+
+  This is **not** a bypass - see the note under "Dump achievement API" below. It
+  fires triggers that cheating made you skip.
+- **Diagnostics → Dump nearby volumes** - stand where the game teleports you (e.g. the
   lighthouse edge) and press it; it logs nearby volume/trigger classes to the log so
   the out-of-bounds teleporter can be identified and disabled precisely.
-- **Debug → dump objects** - logs the first 200 `GObjects` from a background
+- **Diagnostics → dump objects** - logs the first 200 `GObjects` from a background
   thread so the render hook does not block
-- **Debug → Verify member offsets** - diffs every reflected member offset in
+- **Diagnostics → Verify member offsets** - diffs every reflected member offset in
   `offsets.h` against the running game and names the ones a patch has moved; see
   "After a game patch" below
+- **Diagnostics → Dump achievement API** - logs the game's own achievement path off the
+  running game: every `UFunction`/class/struct/enum whose name contains `Achiev`,
+  with full paths, params-block sizes and per-parameter type + offset, the
+  `EAchievements` name→value table, and then the **complete** API of each class
+  that declares one of those functions (which is how the two subsystems involved
+  are reached - their own names never say "Achiev"). A class only earns that full
+  dump when it is *about* achievements - its own name says so, or it declares more
+  than one matched function - so one incidental match no longer drags a whole
+  engine library into the log; skipped owners are still named with their match
+  count. Read-only reflection on a worker thread: it never calls `ProcessEvent`,
+  so it cannot freeze the game and **unlocks nothing**. Results go to
+  `AtomicHeartMenu.log`. Re-run it after a game patch to re-check the signatures
+  the Achievements tab calls.
+- **Diagnostics → achievement simulations** - exercise the Achievements tab's failure
+  paths without a broken game. None of them calls the game:
+  - **Simulate Steam unavailable** (DLL missing / entry point missing) - reads fall
+    back to the engine cache.
+  - **Simulate achievement signature drift** - reports one achievement function's
+    params check as failed.
+  - **Simulate unlock failure** / **Simulate stalled game thread** - the next
+    Unlock clicks fail, or never run and expire after 10 s.
+  - **Simulate send** and **Simulate Steam reports locked** - act on the row
+    picked in the dropdown: mark it sent, or pin Steam's answer for it to locked.
+
+  **Nothing in the menu blocks achievements.** `UAHAchievementSubsystem` (38
+  fields, 18 functions) and `UGameplayEventSubsystem` (21 functions) were dumped
+  in full off the running game and neither holds a cheats-used gate or any
+  persisted "cheated" flag; there is no anti-tamper either, and Atomic Heart is
+  single-player, so Steam never sees a modified session as anything but a normal
+  one. What cheats *do* cost you is the trigger: achievements fire from gameplay
+  events (`UnlockBossAchievement`, `UnlockDialogAchievement`,
+  `IncrementAppleAchievement`, ...), so flying past a boss simply means the event
+  never happens. Instant puzzle resolve is the case to watch, since it completes
+  minigames and locks by a path the normal solve callback does not run through.
+  The Achievements tab is the fix for exactly that.
 
 Runtime function names include `/Script/...`; keep the function constants in
 `offsets.h` in that format or `FindFunction()` will miss them.
@@ -379,7 +462,7 @@ you can trigger from here once the SDK resolves.
   self-checks the hardcoded RVAs and logs any that have gone stale.
 - `VFUNC_PROCESSEVENT` (vtable index), the `SIG_*`/member offsets in `offsets.h`, and
   any hardcoded native-hook RVA are the first things to re-check after a game patch.
-  The three engine globals are handled for you where possible, and **Debug → Verify
+  The three engine globals are handled for you where possible, and **Diagnostics → Verify
   member offsets** checks the member layer against the running game - see "After a
   game patch" above.
 - Logging uses the game-directory `AtomicHeartMenu.log`, with a temporary-directory

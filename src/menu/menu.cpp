@@ -16,6 +16,7 @@
 #include "../core/exception_guard.h"
 #include "../core/globals.h"
 #include "../core/log.h"
+#include "../features/achievements.h"
 #include "../features/features.h"
 #include "../features/workbench.h"
 #include "../features/bodyguards.h"
@@ -26,6 +27,8 @@
 #include <Windows.h>
 #include <cfloat>
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <vector>
 #include <string>
 
@@ -817,6 +820,225 @@ static void RenderHookTestingTab()
     ImGui::Text("Hook roster: %d    Global squad: %d", Features::HookAiCount(), Features::AiSquadCount());
 }
 
+// ---- Achievements tab ------------------------------------------------------------
+static ImVec4 StateLabelColor(Achievements::Row::State state)
+{
+    using State = Achievements::Row::State;
+    switch (state)
+    {
+    case State::Unlocked: return ImVec4(0.35f, 0.80f, 0.45f, 1.0f);
+    case State::Sent:     return ImVec4(0.45f, 0.65f, 0.95f, 1.0f);
+    case State::Unconfirmed: return ImVec4(0.95f, 0.75f, 0.25f, 1.0f);
+    case State::NoAnswer: return ImVec4(0.80f, 0.45f, 0.35f, 1.0f);
+    case State::Locked:
+    case State::Unknown:  break;
+    }
+    return ImVec4(0.60f, 0.60f, 0.60f, 1.0f);
+}
+
+// `labelWidth` is the widest state label, so every row's name starts at the same x.
+static void RenderAchievementRow(const Achievements::Row& row, float labelWidth)
+{
+    ImGui::PushID(7000 + row.enumValue);
+    const float rowX = ImGui::GetCursorPosX();
+    ImGui::BeginDisabled(!row.canUnlock);
+    if (ImGui::Button("Unlock", ImVec2(64, 0)))
+    {
+        LOG("UI: unlock achievement %s (%d)", row.name, row.enumValue);
+        Achievements::Unlock(row.enumValue);
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    {
+        const char* who = row.title[0] ? row.title : row.name;
+        if (row.canUnlock) ImGui::SetTooltip("Unlock %s", who);
+        else               ImGui::SetTooltip("%s\n%s", who, row.disabledReason);
+    }
+    ImGui::SameLine();
+
+    ImGui::TextColored(StateLabelColor(row.state), "%s", row.stateLabel);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", row.stateTooltip);
+    ImGui::SameLine(rowX + 64.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f + labelWidth);
+
+    ImGui::Text("%3d  %s", row.enumValue, row.title[0] ? row.title : row.name);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("EAchievements::%s  (value %d)\nSteam: %s\nUnlocked: %s",
+                          row.name, row.enumValue,
+                          row.title[0] ? row.title : "title pending", row.unlockText);
+    if (row.titlePending)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("title pending");
+    }
+    if (row.unlockFailed)
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Unlock failed, see log");
+    }
+    ImGui::PopID();
+}
+
+// Either spelling matches -- people search for what Steam showed them, not for
+// the internal enum name. `needleLower` is already lowercase.
+static bool RowMatchesFilter(const Achievements::Row& row, const std::string& needleLower)
+{
+    if (needleLower.empty())
+        return true;
+    std::string hay = row.name;
+    if (row.title[0]) { hay += ' '; hay += row.title; }
+    return Features::LowerCopy(hay).find(needleLower) != std::string::npos;
+}
+
+// What stands in for the list while there is none to show.
+static void RenderAchievementListState()
+{
+    if (Achievements::ListResolveFailed())
+    {
+        if (Achievements::SignatureDrift())
+            return;   // the drift banner above outranks this one
+        ImGui::TextColored(ImVec4(0.80f, 0.45f, 0.35f, 1.0f), "Achievement list unavailable, see log");
+        if (ImGui::Button("Retry", ImVec2(96, 0)))
+        {
+            LOG("UI: retry achievement list");
+            Achievements::RetryResolve();
+        }
+        return;
+    }
+    ImGui::TextDisabled(G::sdkReady.load()
+                            ? "Reading EAchievements off the running game..."
+                            : "SDK not resolved -- achievements need the engine globals.");
+}
+
+// The count, where it came from, and the controls for re-reading it.
+// Shown whenever an achievement function failed its params check, list or no
+// list: it is the reason Unlock is disabled, so it comes before everything else.
+static void RenderSignatureDriftBanner()
+{
+    const char* drifted = Achievements::SignatureDrift();
+    if (!drifted)
+        return;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+    ImGui::TextWrapped("%s changed signature -- the game was probably updated. Calls to it are "
+                       "refused and Unlock is disabled until the menu is updated for this build.",
+                       drifted);
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+}
+
+static void RenderSteamStateBar()
+{
+    const Achievements::Tally tally = Achievements::GetTally();
+    ImGui::Text("%d/%d unlocked%s", tally.unlocked, tally.total,
+                tally.fromEngineCache ? " (engine cache)" : "");
+    // The drift banner outranks this one (RenderSignatureDriftBanner).
+    if (tally.fromEngineCache && !Achievements::SignatureDrift())
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f),
+                           "Steam state unavailable -- showing engine cache");
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(Achievements::ReadInFlight());
+    if (ImGui::Button("Refresh now", ImVec2(110, 0)))
+    {
+        LOG("UI: refresh achievement state");
+        Achievements::RefreshState();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("This refreshes itself every few seconds while the tab is\n"
+                          "open; the button also re-runs the engine's achievement\n"
+                          "query, which is what to press if names or states look\n"
+                          "stale after a fresh injection.");
+    ImGui::SameLine();
+    const unsigned int age = Achievements::SecondsSinceRefresh();
+    if (age == Achievements::kNeverRefreshed)
+        ImGui::TextDisabled("Reading...");
+    else
+        ImGui::TextDisabled("Updated %us ago (auto every %us)",
+                            age, Achievements::AutoRefreshSeconds());
+    ImGui::TextDisabled("%s", Achievements::SteamReadSummary());
+}
+
+static void RenderAchievementList(int count)
+{
+    static char achFilter[64] = "";
+    static bool hideUnlocked  = false;
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##achfilter", "type to filter: kill, playthrough, craft...",
+                             achFilter, sizeof(achFilter));
+    ImGui::Checkbox("Hide unlocked", &hideUnlocked);
+    ImGui::Spacing();
+
+    // Filter once per frame; only the rows in view are then drawn.
+    const std::string needle = Features::LowerCopy(achFilter);
+    std::vector<int> visible;
+    visible.reserve((size_t)count);
+    for (int i = 0; i < count; ++i)
+    {
+        Achievements::Row row;
+        if (!Achievements::RowAt(i, row))
+            continue;
+        if (hideUnlocked && row.ConfirmedUnlocked())
+            continue;
+        if (RowMatchesFilter(row, needle))
+            visible.push_back(i);
+    }
+
+    const float labelWidth = std::max(ImGui::CalcTextSize("no answer (cache)").x,
+                                      ImGui::CalcTextSize("sent, not confirmed").x);
+    ImGui::BeginChild("achlist", ImVec2(0, 300), ImGuiChildFlags_Borders);
+    ImGuiListClipper clipper;
+    clipper.Begin((int)visible.size(), ImGui::GetFrameHeightWithSpacing());
+    while (clipper.Step())
+    {
+        for (int v = clipper.DisplayStart; v < clipper.DisplayEnd; ++v)
+        {
+            Achievements::Row row;
+            if (Achievements::RowAt(visible[(size_t)v], row))
+                RenderAchievementRow(row, labelWidth);
+        }
+    }
+    if (visible.empty())
+        ImGui::TextDisabled("Nothing matches the filter.");
+    ImGui::EndChild();
+    ImGui::TextDisabled("%d of %d shown.  Hover a state for what it means, or a name for its "
+                        "id and unlock date.", (int)visible.size(), count);
+}
+
+static void RenderAchievementsTab()
+{
+    // Both idempotent and cheap on most frames: the first resolves the live
+    // EAchievements enum on a worker thread, the second re-reads Steam on a slow
+    // cadence so the list stays current without anyone pressing anything.
+    Achievements::ResolveList();
+    Achievements::AutoRefresh();
+
+    ImGui::TextWrapped("Fires the game's OWN achievement event, so Atomic Heart tells Steam "
+                       "itself and its bookkeeping stays consistent -- the same path a real "
+                       "unlock takes.");
+    ImGui::TextDisabled("Nothing here is a bypass: the game has no cheats-used gate and "
+                        "never blocks achievements. What cheats cost you is the TRIGGER -- "
+                        "fly past a boss and the game's own unlock simply never fires.");
+    ImGui::Spacing();
+
+    RenderSignatureDriftBanner();
+    const int count = Achievements::Count();
+    if (count <= 0)
+    {
+        RenderAchievementListState();
+    }
+    else
+    {
+        RenderSteamStateBar();
+        RenderAchievementList(count);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextWrapped("Status: %s", Achievements::LastActionStatus());
+}
+
 void Menu::Render()
 {
     auto& f = Features::Get();
@@ -866,12 +1088,12 @@ void Menu::Render()
 
     static int page = 0;
     static const char* pages[] = { "Player", "Weapons", "AI / Squad", "Horde Rounds", "Nora", "World",
-        "Visuals", "Rendering", "Tools", "Agent tests", "Diagnostics", "Hook diagnostics" };
+        "Visuals", "Rendering", "Tools", "Achievements", "Agent tests", "Diagnostics", "Hook diagnostics" };
     const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
     ImGui::BeginChild("navigation", ImVec2(174 * uiScale, -footer), true);
     for (int i = 0; i < IM_ARRAYSIZE(pages); ++i)
     {
-        if (i == 9) { ImGui::Spacing(); ImGui::SeparatorText("Development"); }
+        if (i == 10) { ImGui::Spacing(); ImGui::SeparatorText("Development"); }
         if (ImGui::Selectable(pages[i], page == i, 0, ImVec2(0, 25 * uiScale))) page = i;
     }
     ImGui::EndChild();
@@ -1245,10 +1467,15 @@ void Menu::Render()
 
         if (page == 9)
         {
-            TestHarness::Draw();
+            RenderAchievementsTab();
         }
 
         if (page == 10)
+        {
+            TestHarness::Draw();
+        }
+
+        if (page == 11)
         {
             ImGui::TextWrapped("Confirm the SDK is wired, then find classes/functions to cheat on.");
             ImGui::Spacing();
@@ -1293,6 +1520,130 @@ void Menu::Render()
                 LOG("UI: member offset verification requested");
                 Features::DebugVerifyMemberOffsets();
             }
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Achievement API");
+            ImGui::TextWrapped("Reads the game's own achievement path off the running game: every "
+                               "UFunction/class/struct/enum named \"Achiev*\" with full paths, "
+                               "params-block sizes and per-parameter offsets, the EAchievements "
+                               "name->value table, and the full API of the subsystems that own it. "
+                               "Read-only reflection on a worker thread -- it never calls "
+                               "ProcessEvent and unlocks nothing. Results go to AtomicHeartMenu.log.");
+            if (ImGui::Button("Dump achievement API", ImVec2(-FLT_MIN, 0)))
+            {
+                LOG("UI: achievement API dump requested");
+                Achievements::DebugDumpApi();
+            }
+
+            using Sim = Achievements::SteamSimulation;
+            Sim sim = Achievements::GetSteamSimulation();
+            bool simOn = sim != Sim::Off;
+            if (ImGui::Checkbox("Simulate Steam unavailable", &simOn))
+            {
+                sim = simOn ? Sim::DllMissing : Sim::Off;
+                LOG("UI: simulate Steam unavailable -> %s", simOn ? "on" : "off");
+                Achievements::SetSteamSimulation(sim);
+            }
+            ImGui::BeginDisabled(!simOn);
+            if (ImGui::RadioButton("DLL missing", sim == Sim::DllMissing))
+            {
+                LOG("UI: simulate Steam unavailable -> DLL missing");
+                Achievements::SetSteamSimulation(Sim::DllMissing);
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Entry point missing", sim == Sim::EntryPointMissing))
+            {
+                LOG("UI: simulate Steam unavailable -> entry point missing");
+                Achievements::SetSteamSimulation(Sim::EntryPointMissing);
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("The Achievements tab then reads the engine cache, as if steam_api64 "
+                                "were missing that piece. Takes effect on the next read.");
+
+            const int drift = Achievements::GetDriftSimulation();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##achdrift", drift < 0
+                    ? "Simulate achievement signature drift: off"
+                    : Achievements::DriftChoiceName(drift)))
+            {
+                if (ImGui::Selectable("Off", drift < 0))
+                {
+                    LOG("UI: simulate achievement signature drift -> off");
+                    Achievements::SetDriftSimulation(-1);
+                }
+                for (int i = 0; i < Achievements::DriftChoiceCount(); ++i)
+                {
+                    if (ImGui::Selectable(Achievements::DriftChoiceName(i), drift == i))
+                    {
+                        LOG("UI: simulate achievement signature drift -> %s", Achievements::DriftChoiceName(i));
+                        Achievements::SetDriftSimulation(i);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Reports that function's params check as failed: its calls are refused "
+                                "and every Unlock is disabled, exactly as after a game patch.");
+
+            bool simFail = Achievements::GetSimulateUnlockFailure();
+            if (ImGui::Checkbox("Simulate unlock failure", &simFail))
+            {
+                LOG("UI: simulate unlock failure -> %s", simFail ? "on" : "off");
+                Achievements::SetSimulateUnlockFailure(simFail);
+            }
+            ImGui::SameLine();
+            bool simStall = Achievements::GetSimulateStalledGameThread();
+            if (ImGui::Checkbox("Simulate stalled game thread", &simStall))
+            {
+                LOG("UI: simulate stalled game thread -> %s", simStall ? "on" : "off");
+                Achievements::SetSimulateStalledGameThread(simStall);
+            }
+            // Rows by name, with the state they read now, so the pick is the row
+            // the tab shows; -1 until one is picked.
+            static int simRow = -1;
+            static int simIndex = -1;   // simRow's list position, so the preview reads one row
+            Achievements::ResolveList();   // the list may not be up if the tab was never opened
+            char simPreview[160] = "Pick an achievement for Simulate send / Steam pin";
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            {
+                Achievements::Row row;
+                if (Achievements::RowAt(simIndex, row) && row.enumValue == simRow)
+                    std::snprintf(simPreview, sizeof(simPreview), "%s (%s) -- %s",
+                                  row.title[0] ? row.title : row.name, row.name, row.stateLabel);
+            }
+            if (ImGui::BeginCombo("##achsimrow", simPreview))
+            {
+                for (int i = 0, n = Achievements::Count(); i < n; ++i)
+                {
+                    Achievements::Row row;
+                    if (!Achievements::RowAt(i, row))
+                        continue;
+                    char label[160];
+                    std::snprintf(label, sizeof(label), "%s (%s) -- %s##%d",
+                                  row.title[0] ? row.title : row.name, row.name, row.stateLabel, row.enumValue);
+                    if (ImGui::Selectable(label, row.enumValue == simRow))
+                    {
+                        simRow   = row.enumValue;
+                        simIndex = i;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::BeginDisabled(simRow < 0);
+            if (ImGui::Button("Simulate send"))
+            {
+                LOG("UI: simulate send -> %d", simRow);
+                Achievements::SimulateSend(simRow);
+            }
+            ImGui::SameLine();
+            bool pinned = simRow >= 0 && Achievements::GetSteamPinnedLocked() == simRow;
+            if (ImGui::Checkbox("Simulate Steam reports locked", &pinned))
+            {
+                LOG("UI: simulate Steam reports locked -> %s (%d)", pinned ? "on" : "off", simRow);
+                Achievements::SetSteamPinnedLocked(pinned ? simRow : -1);
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Unlock clicks while a box is ticked fail or stall without calling the "
+                                "game. Send and the Steam pin act on the row picked above.");
 
             ImGui::Spacing();
             ImGui::SeparatorText("Crash guard");
@@ -1352,7 +1703,7 @@ void Menu::Render()
             }
         }
 
-        if (page == 11)
+        if (page == 12)
         {
             RenderHookTestingTab();
         }

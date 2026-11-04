@@ -38,6 +38,21 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
+.mcp.json
+
+/.claude/
+/.dev-team-reports/*
+!/.dev-team-reports/test-improve/
+memory/
+reports/
+metrics/
+plans/
+.pr-review-passed
+
+# CodeGraph / Repowise local indexes
+.codegraph/
+.repowise/
+
 # Local SDK captures, tool builds, and save backups
 /work/
 __pycache__/

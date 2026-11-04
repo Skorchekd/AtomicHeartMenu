@@ -46,6 +46,19 @@
 using namespace UE;
 namespace AH = Offsets::AH;
 
+// Defined in namespace Features (declared in features.h) so achievements.cpp can
+// share them; the rest of this file keeps calling them unqualified.
+using Features::CachedFn;
+using Features::CachedObject;
+using Features::InstallProcessEventHook;
+using Features::IsStructLike;
+using Features::LowerCopy;
+using Features::QueueGameThread;
+using Features::SafeClassName;
+using Features::SafeFNameToString;
+using Features::SafeObjectFullName;
+using Features::SafeObjectName;
+
 // Defined at file scope below (after the anonymous namespace), but called from inside
 // it (hkProcessEvent) -- declare it here so the anon-namespace call resolves to this
 // one definition. Per-frame, game-thread squad walk (RequestDirectMove emulation).
@@ -249,7 +262,14 @@ namespace
     std::atomic<unsigned long> g_renderThreadId{ 0 };
     std::atomic<unsigned long> g_gameThreadId{ 0 };
     std::mutex                g_gtQueueMutex;
-    std::vector<std::function<void()>> g_gtQueue;
+    // `owner` tags a task so its module can take back what has not run yet
+    // (RemoveQueuedGameThread); nullptr for untagged work.
+    struct GameThreadTask
+    {
+        std::function<void()> fn;
+        const void*           owner = nullptr;
+    };
+    std::vector<GameThreadTask> g_gtQueue;
     std::atomic<bool>         g_gtHasWork{ false };
     std::atomic<bool>         g_preparingUnload{ false };
     std::atomic<int> g_testFlyAxis{0};
@@ -373,7 +393,6 @@ namespace
     bool HookTwinDeathPipelineShouldSwallow(void* obj, void* fn, void* params);
     void HookTwinForensicsProcessEvent(void* obj, void* fn, void* params);
     void UpdateHookTwinForensics();
-    std::string SafeObjectFullName(UObject* o);
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params);
 
     bool HookFriendshipShouldForce(void* fn, void* params);
@@ -619,7 +638,7 @@ namespace
                 // stays smooth. Safe callsites occur many times per frame, so anything
                 // left over still runs within the same frame, just spread out.
                 constexpr size_t kMaxTasksPerBorrow = 3;
-                std::vector<std::function<void()>> tasks;
+                std::vector<GameThreadTask> tasks;
                 {
                     std::lock_guard<std::mutex> lk(g_gtQueueMutex);
                     size_t take = (std::min)(g_gtQueue.size(), kMaxTasksPerBorrow);
@@ -630,7 +649,7 @@ namespace
                 }
                 // Tasks call ProcessEvent themselves; those re-enter this hook at
                 // t_peDepth > 0 and are correctly skipped by the outermost check.
-                for (auto& task : tasks) { try { task(); } catch (...) {} }
+                for (auto& task : tasks) { try { task.fn(); } catch (...) {} }
             }
         }
         const ULONGLONG dispatchStart = onGameThread ? GetTickCount64() : 0;
@@ -652,7 +671,10 @@ namespace
             }
         }
     }
+}
 
+namespace Features
+{
     bool InstallProcessEventHook()
     {
         static std::mutex installMutex;
@@ -702,14 +724,32 @@ namespace
         return true;
     }
 
-    void QueueGameThread(std::function<void()> fn)
+    bool QueueGameThread(std::function<void()> fn, const void* owner)
     {
         std::lock_guard<std::mutex> lk(g_gtQueueMutex);
-        if (g_preparingUnload.load() || g_gtQueue.size() >= 128) return;
-        g_gtQueue.push_back(std::move(fn));
+        if (g_preparingUnload.load() || g_gtQueue.size() >= 128) return false;
+        g_gtQueue.push_back(GameThreadTask{ std::move(fn), owner });
         g_gtHasWork = true;
+        return true;
     }
 
+    size_t RemoveQueuedGameThread(const void* owner)
+    {
+        std::vector<GameThreadTask> removed;   // destroyed after the lock is released
+        {
+            std::lock_guard<std::mutex> lk(g_gtQueueMutex);
+            auto keep = std::stable_partition(g_gtQueue.begin(), g_gtQueue.end(),
+                [owner](const GameThreadTask& task) { return task.owner != owner; });
+            removed.assign(std::make_move_iterator(keep), std::make_move_iterator(g_gtQueue.end()));
+            g_gtQueue.erase(keep, g_gtQueue.end());
+            g_gtHasWork = !g_gtQueue.empty();
+        }
+        return removed.size();
+    }
+}
+
+namespace
+{
     constexpr float kNormalDamageMultiplier = 1.0f;
     constexpr float kGodDamageMultiplier = 0.0f;
     constexpr float kOneHitDamageMultiplier = 1000.0f;
@@ -726,6 +766,7 @@ namespace
 
     GiveAllState g_giveAll;
     std::atomic<int> g_giveAllOk{ 0 };
+    std::atomic<int> g_giveAllInFlight{ 0 };   // grants queued but not yet run
 
     // A fault inside game code leaves the engine part-way through an inventory
     // mutation, and a second grant on top of a half-written container is how one
@@ -743,6 +784,7 @@ namespace
         std::string label;
         int         attempts = 0;
         ULONGLONG   nextAttemptMs = 0;
+        bool        inFlight = false;   // an attempt is queued or running on the pump
     };
     std::mutex   g_pendingEquipMutex;
     PendingEquip g_pendingEquip;
@@ -894,7 +936,10 @@ namespace
 
     // Bounds how often one name can cost a full GObjects scan.
     constexpr ULONGLONG kFnRescanThrottleMs = 5000;
+}
 
+namespace Features
+{
     // Cache resolved UFunction* by full name so we only walk GObjects once.
     UFunction* CachedFn(const char* fullName)
     {
@@ -984,7 +1029,10 @@ namespace
         }
         return obj;
     }
+}
 
+namespace
+{
     UFunction* CachedClassFn(const char* className, const char* shortName)
     {
         static std::unordered_map<std::string, UFunction*> cache;
@@ -1094,6 +1142,7 @@ namespace
     static_assert(sizeof(P_ObjectReturn) == 0x08, "object return params must match Dumper-7");
     static_assert(sizeof(P_WorldContext) == 0x08, "world context params must match Dumper-7");
     static_assert(sizeof(P_BoolParam) == 0x01, "single bool params must match Dumper-7");
+
     struct P_GetControlRotation { FRotator ReturnValue; };
     struct P_IntReturn { int32_t ReturnValue; };
     struct P_GetCurrentWeapon { void* ReturnValue; };
@@ -1461,7 +1510,7 @@ namespace
         // <Package>.<Name>" with the package spelled in full, the same shape the
         // Fn_* constants use. Drop the "/Script/" and the needle never matches and
         // the lookup returns null forever, in silence.
-        UObject* lib = CachedObject("SubsystemUtils /Script/AtomicHeart.Default__SubsystemUtils");
+        UObject* lib = CachedObject(AH::Obj_SubsystemUtils);
         UFunction* fn = CachedFn(AH::Fn_GetAHWorldStreamingSubsystem);
         if (lib && fn)
         {
@@ -9110,7 +9159,7 @@ namespace
     // it is handed, sized by the LIVE UFunction rather than by the P_* struct we
     // copied from a dump of build 18319896. A struct smaller than this build's
     // params block is not a wrong value, it is a smashed caller frame -- see the
-    // kParamsChecks note. So the buffer is sized from PropertiesSize, and any
+    // params-size table note (RegisterParamsChecks). So the buffer is sized from PropertiesSize, and any
     // difference is logged once per function because it means our struct is stale.
     template <typename P>
     bool CallWithParams(UObject* self, UFunction* fn, P& params, const char* what)
@@ -10109,13 +10158,6 @@ namespace
         return true;
     }
 
-    std::string LowerCopy(std::string s)
-    {
-        for (char& c : s)
-            c = (char)std::tolower((unsigned char)c);
-        return s;
-    }
-
     bool ContainsAnyTerm(const std::string& text)
     {
         std::string s = LowerCopy(text);
@@ -10128,11 +10170,6 @@ namespace
             if (s.find(t) != std::string::npos)
                 return true;
         return false;
-    }
-
-    std::string SafeFNameToString(const FName& name)
-    {
-        try { return name.ToString(); } catch (...) { return {}; }
     }
 
     bool ReadFNameAt(void* base, int offset, FName& out)
@@ -10149,6 +10186,21 @@ namespace
     {
         void* p = ReadPtrField(base, offset);
         return Mem::IsReadable(p, 0x30) ? static_cast<UObject*>(p) : nullptr;
+    }
+}
+
+namespace Features
+{
+    std::string LowerCopy(std::string s)
+    {
+        for (char& c : s)
+            c = (char)std::tolower((unsigned char)c);
+        return s;
+    }
+
+    std::string SafeFNameToString(const FName& name)
+    {
+        try { return name.ToString(); } catch (...) { return {}; }
     }
 
     std::string SafeObjectName(UObject* o)
@@ -10173,7 +10225,10 @@ namespace
         }
         catch (...) { return {}; }
     }
+}
 
+namespace
+{
     void TrackAiDeathEventFromProcessEvent(void* obj, void* fn, void* params)
     {
         if (!fn)
@@ -12301,7 +12356,7 @@ namespace
         int attempt = 0;
         {
             std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
-            if (!g_pendingEquip.asset)
+            if (!g_pendingEquip.asset || g_pendingEquip.inFlight)
                 return;
             if (g_giveWeaponFaulted.load())
             {
@@ -12324,10 +12379,10 @@ namespace
             asset = g_pendingEquip.asset;
             label = g_pendingEquip.label;
             attempt = ++g_pendingEquip.attempts;
-            g_pendingEquip.nextAttemptMs = nowMs + kEquipRetryMs;
+            g_pendingEquip.inFlight = true;
         }
 
-        QueueGameThread([asset, label, attempt]()
+        const bool queued = QueueGameThread([asset, label, attempt]()
         {
             try { TryPendingEquipGameThread(asset, label, attempt); }
             catch (...)
@@ -12337,7 +12392,25 @@ namespace
                     "trustworthy from here -- expect a freeze; restart the game.", label.c_str());
                 ClearPendingEquip();
             }
+            // The retry interval runs from when this attempt ran, not when it was queued.
+            std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
+            if (g_pendingEquip.asset == asset && g_pendingEquip.attempts == attempt)
+            {
+                g_pendingEquip.inFlight = false;
+                g_pendingEquip.nextAttemptMs = GetTickCount64() + kEquipRetryMs;
+            }
         });
+        if (!queued)
+        {
+            // Never ran, so it does not count toward the give-up limit.
+            std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
+            if (g_pendingEquip.asset == asset && g_pendingEquip.attempts == attempt)
+            {
+                --g_pendingEquip.attempts;
+                g_pendingEquip.inFlight = false;
+                g_pendingEquip.nextAttemptMs = GetTickCount64() + kEquipRetryMs;
+            }
+        }
     }
 
     // Decides when the next grant is due and hands it over; the grant itself runs
@@ -12362,8 +12435,10 @@ namespace
         int count = Features::WeaponCount();
         if (g_giveAll.index >= count)
         {
-            LOG("GiveAllWeapons complete: %d/%d granted, the rest skipped for lack of "
-                "content in this install", g_giveAllOk.load(), count);
+            if (g_giveAllInFlight.load() > 0)
+                return;   // the last grants are still on the pump
+            LOG("GiveAllWeapons complete: %d/%d granted; the GiveWeapon lines above say "
+                "why any were not", g_giveAllOk.load(), count);
             g_giveAll = {};
             return;
         }
@@ -12373,11 +12448,22 @@ namespace
         // Stamped before the queue, not after the grant, so the 75 ms paces
         // dispatch intervals rather than drifting with the pump's pickup delay.
         g_giveAll.lastStepMs = GetTickCount64();
-        QueueGameThread([i, equip]()
+        ++g_giveAllInFlight;
+        const bool queued = QueueGameThread([i, equip]()
         {
-            if (GiveWeaponInternal(i, equip))
-                ++g_giveAllOk;
+            try
+            {
+                if (GiveWeaponInternal(i, equip))
+                    ++g_giveAllOk;
+            }
+            catch (...) {}
+            --g_giveAllInFlight;
         });
+        if (!queued)
+        {
+            --g_giveAllInFlight;
+            LOG("GiveAllWeapons: grant %d not queued (game-thread queue full or unloading)", i);
+        }
     }
 
     bool HasPawnFeatureWork(const Features::State& st)
@@ -12701,12 +12787,7 @@ bool Features::QueueGameAction(std::function<void()> action)
 {
     if (!G::sdkReady.load() || !G::running.load() || !action || !InstallProcessEventHook())
         return false;
-    std::lock_guard<std::mutex> lock(g_gtQueueMutex);
-    if (g_preparingUnload.load() || g_gtQueue.size() >= 128)
-        return false;
-    g_gtQueue.push_back(std::move(action));
-    g_gtHasWork = true;
-    return true;
+    return QueueGameThread(std::move(action));
 }
 
 bool Features::PrepareUnload()
@@ -12720,14 +12801,14 @@ bool Features::PrepareUnload()
     auto result = std::make_shared<std::atomic<int>>(0);
     {
         std::lock_guard<std::mutex> lock(g_gtQueueMutex);
-        g_gtQueue.push_back([result]()
+        g_gtQueue.push_back(GameThreadTask{ [result]()
         {
             int pending = 0;
             if (!result->compare_exchange_strong(pending, 1)) return;
             bool ok = false;
             try { ok = Workbench::CleanupGameThread(); } catch (...) {}
             result->store(ok ? 2 : 3);
-        });
+        } });
         g_gtHasWork = true;
     }
     const ULONGLONG deadline = GetTickCount64() + 2500;
@@ -13993,33 +14074,247 @@ namespace
     // native has no locals, so it equals the params block, but a blueprint
     // function's does not and would be reported UNDERSIZED here for no reason.
     // offsets.h carries no O_UFunction_ParmsSize to compare against instead.
-    struct ParamsCheck
+    //
+    // Other modules add their own entries through Features::RegisterParamsChecks.
+    // The table is built on first use, so a registration from another file's
+    // namespace-scope initializer cannot run before it exists.
+    struct ParamsEntry
     {
-        const char* funcName;    // /Script/... full name, as passed to CachedFn
-        int         ourSize;     // sizeof(the P_* struct we pass)
-        const char* structName;
+        Features::ParamsCheck  check;
+        Features::ParamsStatus status   = Features::ParamsStatus::Unresolved;
+        bool                   native   = false;
+        int                    gameSize = -1;
+        std::string            reason;
     };
 
-    const ParamsCheck kParamsChecks[] =
+    std::mutex& ParamsMutex()
     {
-        // Weapon grant path -- issue #6.
-        { AH::Fn_InstantTakeWeapon,       (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (InstantTakeWeapon)" },
-        { AH::Fn_TakeWeapon,              (int)sizeof(P_TakeWeapon),        "P_TakeWeapon" },
-        { AH::Fn_EquipWeaponByDataAsset,  (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (EquipWeaponByDataAsset)" },
-        { AH::Fn_FindWeaponByDataAsset,   (int)sizeof(P_FindWeaponByDataAsset), "P_FindWeaponByDataAsset" },
-        // Fly / noclip path -- the one issue #3 ran through.
-        { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
-        { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
-        { AH::Fn_GetControlRotation,      (int)sizeof(P_GetControlRotation),"P_GetControlRotation" },
-        { AH::Fn_SetActorEnableCollision, (int)sizeof(P_BoolParam),         "P_BoolParam" },
-        { AH::Fn_SetActorScale3D,         (int)sizeof(FVector),             "FVector (SetActorScale3D)" },
-        { AH::Fn_SetMovementMode,         (int)sizeof(P_SetMovementMode),   "P_SetMovementMode" },
-        // Streaming assist.
-        { AH::Fn_InvalidateStreaming,     (int)sizeof(P_WorldContext),      "P_WorldContext" },
-        { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
-        { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
-    };
+        static std::mutex m;
+        return m;
+    }
 
+    std::vector<ParamsEntry>& ParamsTable()
+    {
+        static std::vector<ParamsEntry> table = []
+        {
+            const Features::ParamsCheck builtIn[] =
+            {
+                // Weapon grant path -- issue #6.
+                { AH::Fn_InstantTakeWeapon,       (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (InstantTakeWeapon)" },
+                { AH::Fn_TakeWeapon,              (int)sizeof(P_TakeWeapon),        "P_TakeWeapon" },
+                { AH::Fn_EquipWeaponByDataAsset,  (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (EquipWeaponByDataAsset)" },
+                { AH::Fn_FindWeaponByDataAsset,   (int)sizeof(P_FindWeaponByDataAsset), "P_FindWeaponByDataAsset" },
+                // Fly / noclip path -- the one issue #3 ran through.
+                { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
+                { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
+                { AH::Fn_GetControlRotation,      (int)sizeof(P_GetControlRotation),"P_GetControlRotation" },
+                { AH::Fn_SetActorEnableCollision, (int)sizeof(P_BoolParam),         "P_BoolParam" },
+                { AH::Fn_SetActorScale3D,         (int)sizeof(FVector),             "FVector (SetActorScale3D)" },
+                { AH::Fn_SetMovementMode,         (int)sizeof(P_SetMovementMode),   "P_SetMovementMode" },
+                // Streaming assist.
+                { AH::Fn_InvalidateStreaming,     (int)sizeof(P_WorldContext),      "P_WorldContext" },
+                { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
+                { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
+            };
+            std::vector<ParamsEntry> out;
+            for (const Features::ParamsCheck& check : builtIn)
+                out.push_back(ParamsEntry{ check });
+            return out;
+        }();
+        return table;
+    }
+
+    // Function path of the debug drift simulation; nullptr when off. Always one
+    // of the string literals a caller passed in, so the pointer stays valid.
+    std::atomic<const char*> g_simulatedParamsDrift{ nullptr };
+
+    bool IsSimulatedDrift(const char* fnName)
+    {
+        const char* simulated = g_simulatedParamsDrift.load();
+        return simulated && std::strcmp(simulated, fnName) == 0;
+    }
+
+    bool FirstParamsWarning(const char* fnName)
+    {
+        static std::mutex                      s_mutex;
+        static std::unordered_set<std::string> s_seen;
+        std::lock_guard<std::mutex> lk(s_mutex);
+        return s_seen.insert(fnName).second;
+    }
+
+    ParamsEntry* FindParamsEntry(const char* fnName)
+    {
+        for (ParamsEntry& entry : ParamsTable())
+            if (std::strcmp(entry.check.funcName, fnName) == 0)
+                return &entry;
+        return nullptr;
+    }
+
+    // Reads the game's side of one entry. Resolves the function, so it can cost a
+    // GObjects scan the first time; callers must not hold ParamsMutex.
+    ParamsEntry EvaluateParams(const Features::ParamsCheck& check)
+    {
+        using Features::ParamsStatus;
+        ParamsEntry v{ check };
+        UFunction* fn = nullptr;
+        try { fn = CachedFn(check.funcName); } catch (...) { fn = nullptr; }
+        uint8_t* base = reinterpret_cast<uint8_t*>(fn);
+        if (!IsLiveObject(fn) ||
+            !Mem::IsReadable(base + Offsets::O_UStruct_PropertiesSize, 4) ||
+            !Mem::IsReadable(base + Offsets::O_UFunction_FunctionFlags, 4))
+        {
+            v.reason = "function not resolved";
+            return v;
+        }
+        v.native   = (*reinterpret_cast<uint32_t*>(base + Offsets::O_UFunction_FunctionFlags) & Offsets::FUNC_Native) != 0;
+        v.gameSize = *reinterpret_cast<int32_t*>(base + Offsets::O_UStruct_PropertiesSize);
+        if (!v.native)
+        {
+            const bool required = (check.flags & Features::kParamsRequireNative) != 0;
+            v.status = required ? ParamsStatus::Mismatch : ParamsStatus::Ok;
+            v.reason = required ? "NOT NATIVE -- its PropertiesSize includes script locals, so the params block cannot be verified"
+                                : "not checked (non-native)";
+            return v;
+        }
+        if (v.gameSize == check.ourSize)
+        {
+            v.status = ParamsStatus::Ok;
+            v.reason = "ok";
+        }
+        else if (check.ourSize < v.gameSize)
+        {
+            v.status = ParamsStatus::Mismatch;
+            v.reason = "UNDERSIZED -- STACK CORRUPTION: the game writes past the end of our buffer on every call";
+        }
+        else if (check.flags & Features::kParamsStrict)
+        {
+            v.status = ParamsStatus::Mismatch;
+            v.reason = "OVERSIZED -- the signature changed";
+        }
+        else
+        {
+            v.status = ParamsStatus::Ok;
+            v.reason = "oversized (wasteful, not unsafe)";
+        }
+        return v;
+    }
+
+    void StoreParamsVerdict(const ParamsEntry& verdict)
+    {
+        std::lock_guard<std::mutex> lk(ParamsMutex());
+        // A racing evaluation that lost its lookup (CachedFn throttled, pointer
+        // gone stale) must not erase a conclusive verdict stored meanwhile.
+        ParamsEntry* entry = FindParamsEntry(verdict.check.funcName);
+        if (entry && !(verdict.status == Features::ParamsStatus::Unresolved &&
+                       entry->status != Features::ParamsStatus::Unresolved))
+            *entry = verdict;
+    }
+
+    struct ParamsCounts { int ok = 0, mismatched = 0, unresolved = 0; };
+
+    // Re-checks every entry, stores the verdicts and logs one line each.
+    ParamsCounts RunParamsChecks(const char* tag)
+    {
+        std::vector<Features::ParamsCheck> checks;
+        {
+            std::lock_guard<std::mutex> lk(ParamsMutex());
+            for (const ParamsEntry& entry : ParamsTable())
+                checks.push_back(entry.check);
+        }
+        LOG("%s: checking %d ProcessEvent params-struct sizes against UFunction::PropertiesSize",
+            tag, (int)checks.size());
+
+        ParamsCounts counts;
+        for (const Features::ParamsCheck& check : checks)
+        {
+            const ParamsEntry v = EvaluateParams(check);
+            StoreParamsVerdict(v);
+            switch (v.status)
+            {
+            case Features::ParamsStatus::Ok:         ++counts.ok;         break;
+            case Features::ParamsStatus::Mismatch:   ++counts.mismatched; break;
+            case Features::ParamsStatus::Unresolved: ++counts.unresolved; break;
+            }
+            if (v.status == Features::ParamsStatus::Unresolved)
+                LOG("%s: %-34s function not resolved (%s unchecked)", tag, check.structName, check.funcName);
+            else
+                LOG("%s: %-34s %s -- ours 0x%X, game 0x%X, %s (%s)", tag, check.structName,
+                    v.reason.c_str(), check.ourSize, v.gameSize,
+                    v.native ? "native" : "NOT native", check.funcName);
+        }
+        return counts;
+    }
+}
+
+void Features::RegisterParamsChecks(const ParamsCheck* checks, int count)
+{
+    std::lock_guard<std::mutex> lk(ParamsMutex());
+    for (int i = 0; i < count; ++i)
+        if (!FindParamsEntry(checks[i].funcName))
+            ParamsTable().push_back(ParamsEntry{ checks[i] });
+}
+
+Features::ParamsStatus Features::CheckParamsSize(const char* fnName, int ourSize)
+{
+    if (IsSimulatedDrift(fnName))
+        return ParamsStatus::Mismatch;
+    ParamsCheck check{};
+    bool vouched = false;
+    {
+        std::lock_guard<std::mutex> lk(ParamsMutex());
+        const ParamsEntry* entry = FindParamsEntry(fnName);
+        vouched = entry && entry->check.ourSize == ourSize;
+        if (vouched)
+        {
+            if (entry->status != ParamsStatus::Unresolved)
+                return entry->status;
+            check = entry->check;
+        }
+    }
+    if (!vouched)
+    {
+        // Unregistered, or the caller passes a struct the table does not
+        // describe: nothing vouches for this call. A registered function is
+        // marked, so the cached verdict (and the UI reading it) shows the drift.
+        {
+            std::lock_guard<std::mutex> lk(ParamsMutex());
+            if (ParamsEntry* entry = FindParamsEntry(fnName))
+            {
+                entry->status = ParamsStatus::Mismatch;
+                entry->reason = "called with a params block the table does not describe";
+            }
+        }
+        if (FirstParamsWarning(fnName))
+            LOG("ParamsCheck: %s called with a %d-byte params block the table does not vouch for -- refused",
+                fnName, ourSize);
+        return ParamsStatus::Mismatch;
+    }
+    const ParamsEntry v = EvaluateParams(check);
+    StoreParamsVerdict(v);
+    return v.status;
+}
+
+Features::ParamsStatus Features::CachedParamsStatus(const char* fnName)
+{
+    if (IsSimulatedDrift(fnName))
+        return ParamsStatus::Mismatch;
+    std::lock_guard<std::mutex> lk(ParamsMutex());
+    const ParamsEntry* entry = FindParamsEntry(fnName);
+    return entry ? entry->status : ParamsStatus::Unresolved;
+}
+
+void Features::SetSimulatedParamsDrift(const char* fnName)
+{
+    g_simulatedParamsDrift.store(fnName);
+}
+
+const char* Features::SimulatedParamsDrift()
+{
+    return g_simulatedParamsDrift.load();
+}
+
+namespace Features
+{
     // The table entries are NEEDLES: FindObjectFast matches them as substrings
     // among the objects sharing the last name token, so "Engine.Level" would also
     // accept any object named Level whose path contains it. Walking UStruct fields
@@ -14040,7 +14335,10 @@ namespace
             return true;
         return meta.size() >= 5 && meta.compare(meta.size() - 5, 5, "Class") == 0;
     }
+}
 
+namespace
+{
     DWORD WINAPI VerifyOffsetsThread(LPVOID)
     {
         int matched = 0, moved = 0, unresolvedProp = 0, unresolvedClass = 0;
@@ -14110,50 +14408,16 @@ namespace
         catch (...) { LOG("VerifyOffsets: exception (ignored)"); }
 
         // ---- params-struct sizes -------------------------------------------
-        int paramsOk = 0, paramsBad = 0, paramsUnresolved = 0;
-        try
-        {
-            LOG("VerifyParams: checking %d ProcessEvent params-struct sizes against UFunction::PropertiesSize",
-                (int)(sizeof(kParamsChecks) / sizeof(kParamsChecks[0])));
-            for (const ParamsCheck& check : kParamsChecks)
-            {
-                UFunction* fn = FindObjectFast(check.funcName);
-                if (!IsLiveObject(fn) ||
-                    !Mem::IsReadable((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize, 4))
-                {
-                    ++paramsUnresolved;
-                    LOG("VerifyParams: %-56s function not resolved (%s unchecked)",
-                        check.funcName, check.structName);
-                    continue;
-                }
-                int gameSize = *reinterpret_cast<int32_t*>((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize);
-                if (gameSize == check.ourSize)
-                {
-                    ++paramsOk;
-                    LOG("VerifyParams: %-34s ok 0x%X (%s)",
-                        check.structName, gameSize, check.funcName);
-                }
-                else
-                {
-                    ++paramsBad;
-                    LOG("VerifyParams: %-34s %s -- ours is 0x%X, the game's params block is 0x%X (%s)%s",
-                        check.structName,
-                        check.ourSize < gameSize ? "UNDERSIZED -- STACK CORRUPTION" : "oversized (wasteful, not unsafe)",
-                        check.ourSize, gameSize, check.funcName,
-                        check.ourSize < gameSize
-                            ? " <<< the game writes past the end of our buffer on every call"
-                            : "");
-                }
-            }
-        }
+        ParamsCounts params;
+        try { params = RunParamsChecks("VerifyParams"); }
         catch (...) { LOG("VerifyParams: exception (ignored)"); }
 
-        if (paramsBad)
+        if (params.mismatched)
             LOG("VerifyParams: DONE -- %d ok, %d MISMATCHED, %d unresolved. A mismatch where ours "
                 "is smaller corrupts the stack on every call to that function.",
-                paramsOk, paramsBad, paramsUnresolved);
+                params.ok, params.mismatched, params.unresolved);
         else
-            LOG("VerifyParams: DONE -- %d ok, 0 mismatched, %d unresolved.", paramsOk, paramsUnresolved);
+            LOG("VerifyParams: DONE -- %d ok, 0 mismatched, %d unresolved.", params.ok, params.unresolved);
 
         if (moved == 0 && unresolvedProp == 0 && unresolvedClass == 0)
             LOG("VerifyOffsets: DONE -- all %d reflected offsets match this build.", matched);
@@ -14409,6 +14673,10 @@ void Features::Prewarm()
         FindObjectFast(AH::Cls_Light);
         StartObjectNameIndex();
         LogNativeHookRvaSelfCheck();
+        // Every registered ProcessEvent params block, achievements included, is
+        // judged once here; callers then read the cached verdict.
+        const ParamsCounts params = RunParamsChecks("ParamsCheck");
+        LOG("ParamsCheck: %d ok, %d mismatched, %d unresolved", params.ok, params.mismatched, params.unresolved);
 
         LOG("Prewarm complete in %llums", GetTickCount64() - startMs);
     }
@@ -14711,7 +14979,7 @@ int Features::GiveAllWeapons(bool equipLast)
 
     try
     {
-        if (g_giveAll.active)
+        if (g_giveAll.active || g_giveAllInFlight.load() > 0)
         {
             LOG("GiveAllWeapons already running: index=%d ok=%d/%d", g_giveAll.index, g_giveAllOk.load(), WeaponCount());
             return g_giveAllOk.load();

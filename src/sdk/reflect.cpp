@@ -72,6 +72,37 @@ namespace
 
     bool TypeIs(const std::string& t, const char* name) { return t == name; }
 
+    // The type STRING says "EnumProperty"; this says which enum. Same idea for
+    // object/class/struct/array properties, whose FFieldClass name alone is not
+    // enough to build a params block from.
+    std::string PropTypeDetail(uint8_t* prop, const std::string& type, int depth = 0)
+    {
+        auto pointee = [&](int off) -> std::string
+        {
+            if (!Mem::IsReadable(prop + off, sizeof(void*))) return {};
+            return SafeName(Rd<UObject*>(prop + off));
+        };
+
+        if (type == "ObjectProperty"     || type == "ClassProperty"     ||
+            type == "WeakObjectProperty" || type == "SoftObjectProperty" ||
+            type == "LazyObjectProperty" || type == "InterfaceProperty")
+            return pointee(R::FObjectProperty_PropClass);
+        if (type == "StructProperty") return pointee(R::FStructProperty_Struct);
+        if (type == "EnumProperty")   return pointee(R::FEnumProperty_Enum);
+        if (type == "ByteProperty")   return pointee(R::FByteProperty_Enum);
+        if (type == "ArrayProperty" && depth < 2)
+        {
+            if (!Mem::IsReadable(prop + R::FArrayProperty_Inner, sizeof(void*))) return {};
+            uint8_t* inner = Rd<uint8_t*>(prop + R::FArrayProperty_Inner);
+            if (!Mem::IsReadable(inner, R::FField_Name + sizeof(FName))) return {};
+            std::string innerType   = PropTypeName(inner);
+            std::string innerDetail = PropTypeDetail(inner, innerType, depth + 1);
+            if (innerType.empty()) return {};
+            return innerDetail.empty() ? innerType : innerType + "<" + innerDetail + ">";
+        }
+        return {};
+    }
+
     void WriteFloat(std::ostream& os, float v)
     {
         if (std::isfinite(v)) os << v; else os << "\"nan\"";
@@ -413,4 +444,226 @@ void Reflect::DumpObjectJson(std::ostream& os, UObject* obj, const Options& opts
     if (!Mem::IsReadable(cls, 0x30)) { os << "{}"; return; }
     int budget = opts.maxProps;
     DumpStructValue(os, cls, reinterpret_cast<uint8_t*>(obj), opts, opts.structDepth, budget);
+}
+
+std::vector<Reflect::FieldInfo> Reflect::DescribeStructFields(UObject* structOrClass, int maxFields)
+{
+    std::vector<FieldInfo> out;
+    try
+    {
+        if (!Mem::IsReadable(structOrClass, Offsets::O_UStruct_ChildProps + sizeof(void*)))
+            return out;
+        if (maxFields < 0) maxFields = 0;
+        out.reserve((size_t)(maxFields < 32 ? maxFields : 32));
+
+        uint8_t* prop = *reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(structOrClass) + Offsets::O_UStruct_ChildProps);
+
+        for (int n = 0; prop && n < maxFields; ++n)
+        {
+            // A short read here is a broken FField list, not an empty one -- stop
+            // rather than describe fields we cannot fully see.
+            if (!Mem::IsReadable(prop, R::FProperty_Offset + 4))
+                break;
+
+            FieldInfo f;
+            f.name = SafeFName(Rd<FName>(prop + R::FField_Name));
+            f.type = PropTypeName(prop);
+            f.detail = PropTypeDetail(prop, f.type);
+            f.offset = Rd<int32_t>(prop + R::FProperty_Offset);
+            f.flags  = Rd<uint64_t>(prop + R::FProperty_PropertyFlags);
+            const int32_t elementSize = Rd<int32_t>(prop + R::FProperty_ElementSize);
+            const int32_t arrayDim    = Rd<int32_t>(prop + R::FProperty_ArrayDim);
+            f.size = (elementSize > 0 && arrayDim > 0 && arrayDim < 0x10000)
+                       ? elementSize * arrayDim : elementSize;
+            out.push_back(std::move(f));
+
+            prop = Mem::IsReadable(prop + R::FField_Next, sizeof(void*))
+                     ? Rd<uint8_t*>(prop + R::FField_Next) : nullptr;
+        }
+    }
+    catch (...) { /* partial list is still useful; report what we read */ }
+    return out;
+}
+
+std::vector<Reflect::EnumValue> Reflect::DescribeEnumValues(UObject* uenum, int* outNamesOffset,
+                                                            int maxValues)
+{
+    std::vector<EnumValue> out;
+    if (outNamesOffset) *outNamesOffset = -1;
+    try
+    {
+        if (!Mem::IsReadable(uenum, 0x30) || maxValues <= 0)
+            return out;
+
+        // UE4 stores enum entries fully qualified ("EAchievements::KillTwins"), so
+        // the enum's own name is a signature only the real Names array carries.
+        const std::string self = SafeName(uenum);
+        if (self.empty()) return out;
+        const std::string prefix = self + "::";
+
+        for (int off = R::UEnum_NamesProbeFirst; off <= R::UEnum_NamesProbeLast; off += 8)
+        {
+            uint8_t* at = reinterpret_cast<uint8_t*>(uenum) + off;
+            if (!Mem::IsReadable(at, 16)) continue;
+
+            uint8_t*      data  = Rd<uint8_t*>(at);
+            const int32_t count = Rd<int32_t>(at + 8);
+            const int32_t max   = Rd<int32_t>(at + 12);
+            if (!data || count <= 0 || count > maxValues || max < count) continue;
+            if (!Mem::IsReadable(data, (size_t)count * R::UEnum_NamesEntrySize)) continue;
+
+            // Validation: a wrong offset can produce a plausible-looking TArray, but
+            // not one whose first entry names this very enum.
+            const std::string first = SafeFName(Rd<FName>(data));
+            if (first.compare(0, prefix.size(), prefix) != 0) continue;
+
+            out.reserve((size_t)count);
+            for (int i = 0; i < count; ++i)
+            {
+                uint8_t* entry = data + (size_t)i * R::UEnum_NamesEntrySize;
+                EnumValue v;
+                v.name  = SafeFName(Rd<FName>(entry));
+                v.value = Rd<int64_t>(entry + 8);
+                if (v.name.empty()) continue;
+                out.push_back(std::move(v));
+            }
+            if (outNamesOffset) *outNamesOffset = off;
+            return out;
+        }
+    }
+    catch (...) { out.clear(); }
+    return out;
+}
+
+// ---- TMap reading -------------------------------------------------------------
+bool Reflect::MapView::IsValidIndex(int index) const
+{
+    if (!valid || index < 0 || index >= count) return false;
+    if (!allocFlags || index >= allocBits) return false;
+    // TBitArray packs 32 slots per uint32; a clear bit is a hole left by a removal.
+    const uint32_t word = allocFlags[index >> 5];
+    return (word & (1u << (index & 31))) != 0;
+}
+
+uint8_t* Reflect::MapView::KeyAt(int index) const
+{
+    if (!IsValidIndex(index)) return nullptr;
+    return elements + (size_t)index * stride + keyOffset;
+}
+
+uint8_t* Reflect::MapView::ValueAt(int index) const
+{
+    if (!IsValidIndex(index)) return nullptr;
+    return elements + (size_t)index * stride + valueOffset;
+}
+
+namespace
+{
+    // Shared by both entry points: everything past "where is the map and what
+    // describes it" is identical whether the TMap sits on a class or inside a
+    // nested struct.
+    Reflect::MapView OpenMapFromField(uint8_t* prop, uint8_t* mapStorage)
+    {
+        Reflect::MapView view;
+
+        if (!prop || !mapStorage)        { view.error = "property not reflected"; return view; }
+        if (PropTypeName(prop) != "MapProperty") { view.error = "property is not a TMap"; return view; }
+        if (!Mem::IsReadable(prop, R::FMapProperty_SparseElemSize + 4))
+        {                                  view.error = "map property truncated"; return view; }
+
+        // The layout comes from the property itself -- no guessing at alignment.
+        // The key offset is the one part NOT stored: UE omits it because a key is
+        // always at zero within its pair.
+        const int32_t keyOffset   = R::FMapProperty_KeyOffsetConst;
+        const int32_t valueOffset = Rd<int32_t>(prop + R::FMapProperty_ValueOffset);
+        const int32_t stride      = Rd<int32_t>(prop + R::FMapProperty_SparseElemSize);
+
+        uint8_t* keyProp   = Mem::IsReadable(prop + R::FMapProperty_KeyProp, sizeof(void*))
+                               ? Rd<uint8_t*>(prop + R::FMapProperty_KeyProp) : nullptr;
+        uint8_t* valueProp = Mem::IsReadable(prop + R::FMapProperty_ValueProp, sizeof(void*))
+                               ? Rd<uint8_t*>(prop + R::FMapProperty_ValueProp) : nullptr;
+        if (!Mem::IsReadable(keyProp, R::FProperty_Offset + 4) ||
+            !Mem::IsReadable(valueProp, R::FProperty_Offset + 4))
+        {                                  view.error = "key/value property unreadable"; return view; }
+
+        view.keyType   = PropTypeName(keyProp);
+        view.valueType = PropTypeName(valueProp);
+        view.keySize   = Rd<int32_t>(keyProp   + R::FProperty_ElementSize);
+        view.valueSize = Rd<int32_t>(valueProp + R::FProperty_ElementSize);
+
+        // A layout a patch has moved shows up here as nonsense, not as bad data.
+        // The type names go into the message too, so a rejected map can be told
+        // apart from a map whose value is simply not the type the caller expected.
+        if (stride <= 0 || stride > 4096 ||
+            valueOffset < view.keySize || valueOffset >= stride ||
+            view.keySize <= 0 || view.valueSize <= 0 ||
+            valueOffset + view.valueSize > stride)
+        {
+            char why[256];
+            std::snprintf(why, sizeof(why),
+                          "layout failed validation: TMap<%s(%d), %s(%d)> val@%d stride=%d",
+                          view.keyType.c_str(), view.keySize,
+                          view.valueType.c_str(), view.valueSize, valueOffset, stride);
+            view.error = why;
+            return view;
+        }
+
+        if (!Mem::IsReadable(mapStorage, 0x30)) { view.error = "map storage unreadable"; return view; }
+
+        uint8_t*      elements = Rd<uint8_t*>(mapStorage + R::FScriptMap_ElementsData);
+        const int32_t num      = Rd<int32_t>(mapStorage + R::FScriptMap_ElementsNum);
+        const int32_t maxNum   = Rd<int32_t>(mapStorage + R::FScriptMap_ElementsMax);
+        const int32_t numBits  = Rd<int32_t>(mapStorage + R::FScriptMap_AllocFlagsNumBits);
+
+        if (num == 0) { view.valid = true; return view; }  // empty is not an error
+        if (num < 0 || num > R::FScriptMap_MaxEntries || maxNum < num || numBits < num)
+        {                                  view.error = "element count implausible"; return view; }
+        if (!Mem::IsReadable(elements, (size_t)num * stride))
+        {                                  view.error = "element storage unreadable"; return view; }
+
+        // TInlineAllocator: the bits live inline until they outgrow it, at which
+        // point the secondary pointer takes over. Non-null means "use the heap one".
+        const uint32_t* flags = nullptr;
+        uint8_t* heap = Mem::IsReadable(mapStorage + R::FScriptMap_AllocFlagsHeap, sizeof(void*))
+                          ? Rd<uint8_t*>(mapStorage + R::FScriptMap_AllocFlagsHeap) : nullptr;
+        const size_t flagBytes = ((size_t)numBits + 31) / 32 * 4;
+        if (heap)
+        {
+            // A non-null secondary pointer means the heap copy is the live one; if
+            // it cannot be read, the inline bits are stale and must not stand in.
+            if (!Mem::IsReadable(heap, flagBytes))
+            {                                  view.error = "allocation flags unreadable"; return view; }
+            flags = reinterpret_cast<const uint32_t*>(heap);
+        }
+        else if (numBits <= R::FScriptMap_InlineFlagBits &&
+                 Mem::IsReadable(mapStorage + R::FScriptMap_AllocFlagsInline, flagBytes))
+            flags = reinterpret_cast<const uint32_t*>(mapStorage + R::FScriptMap_AllocFlagsInline);
+        if (!flags)                      { view.error = "allocation flags unreadable"; return view; }
+
+        view.elements    = elements;
+        view.count       = num;
+        view.stride      = stride;
+        view.keyOffset   = keyOffset;
+        view.valueOffset = valueOffset;
+        view.allocFlags  = flags;
+        view.allocBits   = numBits;
+        view.valid       = true;
+        return view;
+    }
+}
+
+Reflect::MapView Reflect::OpenMapProperty(UObject* container, const char* propName)
+{
+    MapView view;
+    try
+    {
+        if (!Mem::IsReadable(container, 0x30)) { view.error = "container unreadable"; return view; }
+        int32_t  mapOffset = -1;
+        uint8_t* prop      = FindPropertyField(container, propName, &mapOffset);
+        if (!prop || mapOffset < 0) { view.error = "property not reflected"; return view; }
+        return OpenMapFromField(prop, reinterpret_cast<uint8_t*>(container) + mapOffset);
+    }
+    catch (...) { view.valid = false; view.error = "exception while opening map"; }
+    return view;
 }
